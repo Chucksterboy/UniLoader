@@ -61,13 +61,14 @@ const defaultAppSettings: AppSettings = {
   nexusApiKey: ""
 };
 
-const appDisplayVersion = "v0.4";
+const appDisplayVersion = "v0.5";
 
 type ViewMode = "manager" | "discover" | "transfer" | "settings";
 type ModSortMode = "newest" | "oldest";
 type OnlineSortMode = "downloads" | "newest" | "oldest";
 type TransferMode = "import" | "export" | null;
 type NoticeKind = "success" | "warning" | "error";
+type StartupSplashPhase = "intro" | "exiting" | "hidden";
 
 interface Notice {
   motionId: number;
@@ -102,9 +103,12 @@ interface MotionPresence<T> {
 const motionDurationMs = 180;
 const discoverPageSize = 20;
 const nexusApiKeysUrl = "https://www.nexusmods.com/settings/api-keys";
+const startupSplashPulseMs = 2700;
+const startupSplashFadeMs = 420;
 
 export function App() {
   const [activeView, setActiveView] = useState<ViewMode>("manager");
+  const [startupSplashPhase, setStartupSplashPhase] = useState<StartupSplashPhase>("intro");
   const [appSettings, setAppSettings] = useState<AppSettings>(defaultAppSettings);
   const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo | null>(null);
   const [profiles, setProfiles] = useState<GameProfile[]>([]);
@@ -193,6 +197,22 @@ export function App() {
 
   useEffect(() => {
     void checkForUpdates(false);
+  }, []);
+
+  useEffect(() => {
+    const exitTimeoutId = window.setTimeout(
+      () => setStartupSplashPhase("exiting"),
+      startupSplashPulseMs
+    );
+    const hideTimeoutId = window.setTimeout(
+      () => setStartupSplashPhase("hidden"),
+      startupSplashPulseMs + startupSplashFadeMs
+    );
+
+    return () => {
+      window.clearTimeout(exitTimeoutId);
+      window.clearTimeout(hideTimeoutId);
+    };
   }, []);
 
   useEffect(() => {
@@ -326,7 +346,7 @@ export function App() {
     } catch (caughtError) {
       const message = String(caughtError);
       setUpdateInfo({
-        currentVersion: "0.4.0",
+        currentVersion: "0.5.0",
         updateAvailable: false,
         status: "error",
         message
@@ -1101,6 +1121,7 @@ export function App() {
 
   return (
     <>
+    {startupSplashPhase !== "hidden" ? <StartupSplash phase={startupSplashPhase} /> : null}
     <main className={renderedView === "manager" ? "app-shell" : "app-shell settings-shell"}>
       <div
         className="window-drag-region"
@@ -1797,6 +1818,20 @@ function UniLoaderMark() {
   );
 }
 
+function StartupSplash({ phase }: { phase: StartupSplashPhase }) {
+  return (
+    <div
+      aria-label="UniLoader starting"
+      className={phase === "exiting" ? "startup-splash exiting" : "startup-splash"}
+      role="status"
+    >
+      <div className="startup-splash-mark">
+        <UniLoaderMark />
+      </div>
+    </div>
+  );
+}
+
 interface DiscoverViewProps {
   hasLoaded: boolean;
   installingModId: string;
@@ -2456,7 +2491,7 @@ function humanizeModName(rawName: string): string {
     .split("/")
     .filter(Boolean)
     .pop() ?? rawName;
-  const withoutExtension = baseName.replace(/\.(zip|7z|rar|pak|dll|lua)$/i, "");
+  const withoutExtension = baseName.replace(/\.(zip|7z|rar|pak|dll|lua|as)$/i, "");
   const withoutUnrealPakSuffix = withoutExtension.replace(/([_-])P$/i, "");
   const words = withoutUnrealPakSuffix
     .replace(/[^a-zA-Z0-9]+/g, " ")
@@ -2491,6 +2526,7 @@ function polishModName(rawName: string, mod?: InstalledModRecord): string {
     .replace(/\bBepInExPack\b/gi, "BepInEx Pack")
     .replace(/\bUe\s+4\s+Ss\b/gi, "UE4SS")
     .replace(/\bRe\s+Framework\b/gi, "REFramework")
+    .replace(/\s+(as|lua|dll|pak|zip|rar|7z)$/i, "")
     .replace(/\s+\d+\s+\d+\s+\d+(?:\s+\d+)?$/g, "")
     .trim();
 

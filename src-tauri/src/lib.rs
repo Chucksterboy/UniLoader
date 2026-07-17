@@ -11,6 +11,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Manager};
 use uuid::Uuid;
 use zip::write::SimpleFileOptions;
@@ -2125,6 +2126,20 @@ fn download_update_installer(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .on_page_load(|webview, payload| {
+            if !matches!(payload.event(), PageLoadEvent::Finished) {
+                return;
+            }
+
+            let window = webview.window();
+            if window.label() != "main" {
+                return;
+            }
+
+            let _ = window.show();
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+        })
         .setup(|app| {
             setup_tray(app)?;
             Ok(())
@@ -7276,6 +7291,8 @@ fn polish_mod_display_name(name: &str) -> String {
         .map(|word| word.to_string())
         .collect::<Vec<_>>();
 
+    trim_known_file_extension_tail(&mut words);
+
     if words.len() > 1 && looks_like_mod_author_prefix(&words[0]) {
         words.remove(0);
     }
@@ -7295,6 +7312,27 @@ fn polish_mod_display_name(name: &str) -> String {
     name = replace_ascii_case_insensitive(&name, "Re Framework", "REFramework");
 
     name.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn trim_known_file_extension_tail(words: &mut Vec<String>) {
+    if words.len() <= 1 {
+        return;
+    }
+
+    let Some(last_word) = words.last() else {
+        return;
+    };
+
+    if is_known_file_extension_word(last_word) {
+        words.pop();
+    }
+}
+
+fn is_known_file_extension_word(word: &str) -> bool {
+    matches!(
+        word.to_lowercase().as_str(),
+        "as" | "lua" | "dll" | "pak" | "zip" | "rar" | "7z"
+    )
 }
 
 fn looks_like_mod_author_prefix(word: &str) -> bool {
@@ -8232,26 +8270,26 @@ mod tests {
     #[test]
     fn update_checker_prefers_setup_exe_assets() {
         let release = GithubReleaseResponse {
-            tag_name: "v0.4".to_string(),
-            html_url: Some("https://github.com/Chucksterboy/UniLoader/releases/tag/v0.4".to_string()),
+            tag_name: "v0.5".to_string(),
+            html_url: Some("https://github.com/Chucksterboy/UniLoader/releases/tag/v0.5".to_string()),
             assets: vec![
                 GithubReleaseAsset {
-                    name: "UniLoader_0.4.0_x64_en-US.msi".to_string(),
+                    name: "UniLoader_0.5.0_x64_en-US.msi".to_string(),
                     browser_download_url:
-                        "https://github.com/Chucksterboy/UniLoader/releases/download/v0.4/UniLoader_0.4.0_x64_en-US.msi"
+                        "https://github.com/Chucksterboy/UniLoader/releases/download/v0.5/UniLoader_0.5.0_x64_en-US.msi"
                             .to_string(),
                 },
                 GithubReleaseAsset {
-                    name: "UniLoader_0.4.0_x64-setup.exe".to_string(),
+                    name: "UniLoader_0.5.0_x64-setup.exe".to_string(),
                     browser_download_url:
-                        "https://github.com/Chucksterboy/UniLoader/releases/download/v0.4/UniLoader_0.4.0_x64-setup.exe"
+                        "https://github.com/Chucksterboy/UniLoader/releases/download/v0.5/UniLoader_0.5.0_x64-setup.exe"
                             .to_string(),
                 },
             ],
         };
 
         let asset = select_update_installer_asset(&release).unwrap();
-        assert_eq!(asset.name, "UniLoader_0.4.0_x64-setup.exe");
+        assert_eq!(asset.name, "UniLoader_0.5.0_x64-setup.exe");
     }
 
     #[test]
@@ -8610,6 +8648,10 @@ mod tests {
         assert_eq!(
             humanize_mod_display_name("LingerChanceIndicator.AS"),
             "Linger Chance Indicator"
+        );
+        assert_eq!(
+            humanize_mod_display_name("World Map Compass as"),
+            "World Map Compass"
         );
     }
 
