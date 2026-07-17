@@ -60,8 +60,8 @@ UniLoader displays its current app version in the bottom-left rail. On startup, 
 To publish an installer build, push a version tag:
 
 ```powershell
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.2.1
+git push origin v0.2.1
 ```
 
 The GitHub Actions release workflow builds the Windows installer as a draft release. Publish the draft release when the installer has been checked.

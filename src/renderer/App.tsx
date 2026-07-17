@@ -50,7 +50,7 @@ const defaultAppSettings: AppSettings = {
   minimizeToTrayOnClose: false
 };
 
-const appDisplayVersion = "v0.1";
+const appDisplayVersion = "v0.2";
 
 type ViewMode = "manager" | "transfer" | "settings";
 type ModSortMode = "newest" | "oldest";
@@ -291,7 +291,7 @@ export function App() {
     } catch (caughtError) {
       const message = String(caughtError);
       setUpdateInfo({
-        currentVersion: "0.1.0",
+        currentVersion: "0.2.0",
         updateAvailable: false,
         status: "error",
         message

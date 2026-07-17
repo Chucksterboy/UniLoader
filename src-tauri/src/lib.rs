@@ -4371,7 +4371,7 @@ fn thunderstore_client() -> Result<Client, String> {
 
 fn provider_client() -> Result<Client, String> {
     Client::builder()
-        .user_agent("UniLoader/0.1")
+        .user_agent("UniLoader/0.2")
         .timeout(Duration::from_secs(45))
         .build()
         .map_err(error_to_string)
