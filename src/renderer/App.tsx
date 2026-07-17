@@ -61,7 +61,7 @@ const defaultAppSettings: AppSettings = {
   nexusApiKey: ""
 };
 
-const appDisplayVersion = "v0.3";
+const appDisplayVersion = "v0.4";
 
 type ViewMode = "manager" | "discover" | "transfer" | "settings";
 type ModSortMode = "newest" | "oldest";
@@ -125,6 +125,7 @@ export function App() {
   const [isDiscoveringMods, setIsDiscoveringMods] = useState(false);
   const [installingOnlineModId, setInstallingOnlineModId] = useState<string>("");
   const [isCheckingForUpdate, setIsCheckingForUpdate] = useState(false);
+  const [isDownloadingUpdate, setIsDownloadingUpdate] = useState(false);
   const [isTransferringProfile, setIsTransferringProfile] = useState(false);
   const [status, setStatus] = useState<string>("Ready");
   const [notice, setNoticeState] = useState<Notice | null>(null);
@@ -325,7 +326,7 @@ export function App() {
     } catch (caughtError) {
       const message = String(caughtError);
       setUpdateInfo({
-        currentVersion: "0.3.0",
+        currentVersion: "0.4.0",
         updateAvailable: false,
         status: "error",
         message
@@ -342,19 +343,52 @@ export function App() {
     }
   }
 
-  function showUpdateDetails() {
+  async function showUpdateDetails() {
     if (updateInfo?.updateAvailable) {
+      if (!updateInfo.installerUrl) {
+        setNotice({
+          kind: "error",
+          title: "Installer unavailable",
+          detail: updateInfo.releaseUrl
+            ? `${updateInfo.message} No installer asset was found on the latest release.`
+            : updateInfo.message
+        });
+        return;
+      }
+
+      setIsDownloadingUpdate(true);
+      setStatus("Downloading update");
       setNotice({
         kind: "warning",
-        title: `UniLoader ${updateInfo.latestVersion ? `v${updateInfo.latestVersion}` : "update"} available`,
-        detail: updateInfo.releaseUrl
-          ? `${updateInfo.message} Release: ${updateInfo.releaseUrl}`
-          : updateInfo.message
+        title: "Downloading update",
+        detail: `UniLoader ${updateInfo.latestVersion ? `v${updateInfo.latestVersion}` : "update"} installer is downloading now.`
       });
+      try {
+        const installerPath = await api.downloadUpdateInstaller(
+          updateInfo.installerUrl,
+          updateInfo.installerName
+        );
+        setStatus("Installer launched");
+        setNotice({
+          kind: "success",
+          title: "Installer launched",
+          detail: `Downloaded to ${installerPath}. UniLoader will close so the installer can update it.`
+        });
+      } catch (caughtError) {
+        setStatus("Update download failed");
+        setError(String(caughtError));
+        setNotice({
+          kind: "error",
+          title: "Update download failed",
+          detail: String(caughtError)
+        });
+      } finally {
+        setIsDownloadingUpdate(false);
+      }
       return;
     }
 
-    void checkForUpdates(true);
+    await checkForUpdates(true);
   }
 
   async function refreshSelectedProfile() {
@@ -1118,8 +1152,9 @@ export function App() {
         <div className="rail-footer">
           <UpdateRailIndicator
             isChecking={isCheckingForUpdate}
+            isDownloading={isDownloadingUpdate}
             updateInfo={updateInfo}
-            onClick={showUpdateDetails}
+            onClick={() => void showUpdateDetails()}
           />
           <div className="rail-status" title={status} />
           <span className="app-version" title={`UniLoader ${appDisplayVersion}`}>
@@ -1657,13 +1692,19 @@ function WindowControls({ onClose, onMaximize, onMinimize }: WindowControlsProps
 
 interface UpdateRailIndicatorProps {
   isChecking: boolean;
+  isDownloading: boolean;
   updateInfo: AppUpdateInfo | null;
   onClick(): void;
 }
 
-function UpdateRailIndicator({ isChecking, updateInfo, onClick }: UpdateRailIndicatorProps) {
+function UpdateRailIndicator({
+  isChecking,
+  isDownloading,
+  updateInfo,
+  onClick
+}: UpdateRailIndicatorProps) {
   const shouldShow =
-    isChecking || updateInfo?.updateAvailable || updateInfo?.status === "error";
+    isChecking || isDownloading || updateInfo?.updateAvailable || updateInfo?.status === "error";
 
   if (!shouldShow) {
     return null;
@@ -1671,8 +1712,10 @@ function UpdateRailIndicator({ isChecking, updateInfo, onClick }: UpdateRailIndi
 
   const tone = updateInfo?.updateAvailable ? "available" : "warning";
   const title = updateInfo?.updateAvailable
-    ? `Update available${updateInfo.latestVersion ? `: v${updateInfo.latestVersion}` : ""}`
-    : isChecking
+    ? `Download UniLoader ${updateInfo.latestVersion ? `v${updateInfo.latestVersion}` : "update"}`
+    : isDownloading
+      ? "Downloading update"
+      : isChecking
       ? "Checking for updates"
       : updateInfo?.message ?? "Update check needs attention";
 
@@ -1680,11 +1723,12 @@ function UpdateRailIndicator({ isChecking, updateInfo, onClick }: UpdateRailIndi
     <button
       aria-label={title}
       className={`rail-update-button ${tone}`}
+      disabled={isChecking || isDownloading}
       onClick={onClick}
       title={title}
       type="button"
     >
-      <Download size={16} />
+      <Download className={isChecking || isDownloading ? "spin-icon" : ""} size={16} />
     </button>
   );
 }

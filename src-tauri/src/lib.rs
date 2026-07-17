@@ -624,6 +624,8 @@ pub struct AppUpdateInfo {
     latest_version: Option<String>,
     update_available: bool,
     release_url: Option<String>,
+    installer_url: Option<String>,
+    installer_name: Option<String>,
     status: String,
     message: String,
 }
@@ -695,6 +697,8 @@ fn check_app_update() -> AppUpdateInfo {
                 latest_version: None,
                 update_available: false,
                 release_url: None,
+                installer_url: None,
+                installer_name: None,
                 status: "error".to_string(),
                 message: format!("Could not prepare update checker: {error}"),
             };
@@ -713,6 +717,8 @@ fn check_app_update() -> AppUpdateInfo {
                 latest_version: None,
                 update_available: false,
                 release_url: None,
+                installer_url: None,
+                installer_name: None,
                 status: "error".to_string(),
                 message: format!("Could not check for updates: {error}"),
             };
@@ -725,6 +731,8 @@ fn check_app_update() -> AppUpdateInfo {
             latest_version: None,
             update_available: false,
             release_url: None,
+            installer_url: None,
+            installer_name: None,
             status: "unavailable".to_string(),
             message: "No GitHub release has been published yet.".to_string(),
         };
@@ -737,6 +745,8 @@ fn check_app_update() -> AppUpdateInfo {
             latest_version: None,
             update_available: false,
             release_url: None,
+            installer_url: None,
+            installer_name: None,
             status: "error".to_string(),
             message: format!("GitHub update check failed with HTTP {status}."),
         };
@@ -750,6 +760,8 @@ fn check_app_update() -> AppUpdateInfo {
                 latest_version: None,
                 update_available: false,
                 release_url: None,
+                installer_url: None,
+                installer_name: None,
                 status: "error".to_string(),
                 message: format!("GitHub release response was not readable: {error}"),
             };
@@ -758,11 +770,14 @@ fn check_app_update() -> AppUpdateInfo {
 
     let latest_version = release.tag_name.trim_start_matches('v').to_string();
     let update_available = is_newer_version(&latest_version, &current_version);
+    let installer_asset = select_update_installer_asset(&release);
     AppUpdateInfo {
         current_version: current_version.clone(),
         latest_version: Some(latest_version.clone()),
         update_available,
-        release_url: release.html_url,
+        release_url: release.html_url.clone(),
+        installer_url: installer_asset.map(|asset| asset.browser_download_url.clone()),
+        installer_name: installer_asset.map(|asset| asset.name.clone()),
         status: if update_available {
             "available"
         } else {
@@ -770,7 +785,15 @@ fn check_app_update() -> AppUpdateInfo {
         }
         .to_string(),
         message: if update_available {
-            format!("UniLoader v{latest_version} is available.")
+            if installer_asset.is_some() {
+                format!(
+                    "UniLoader v{latest_version} is available. Click to download the installer."
+                )
+            } else {
+                format!(
+                    "UniLoader v{latest_version} is available, but no installer asset was found."
+                )
+            }
         } else {
             format!("UniLoader v{current_version} is current.")
         },
@@ -2069,6 +2092,36 @@ fn open_external_url(url: String) -> Result<(), String> {
     open_url_in_shell(&url)
 }
 
+#[tauri::command]
+fn download_update_installer(
+    app: AppHandle,
+    url: String,
+    file_name: Option<String>,
+) -> Result<String, String> {
+    let trimmed_url = validated_http_url(&url)?;
+    let safe_name = update_installer_file_name(&trimmed_url, file_name.as_deref())?;
+    let download_dir = update_download_dir()?;
+    fs::create_dir_all(&download_dir).map_err(error_to_string)?;
+    let destination = download_dir.join(safe_name);
+    if destination.exists() {
+        fs::remove_file(&destination).map_err(error_to_string)?;
+    }
+    let client = Client::builder()
+        .timeout(Duration::from_secs(240))
+        .build()
+        .map_err(error_to_string)?;
+
+    download_url_to_file(&client, &trimmed_url, &destination)?;
+    launch_update_installer(&destination)?;
+
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(900));
+        app.exit(0);
+    });
+
+    Ok(destination.to_string_lossy().to_string())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -2115,6 +2168,7 @@ pub fn run() {
             remove_mod,
             open_profile_game_folder,
             open_external_url,
+            download_update_installer,
             check_app_update,
             get_store_path
         ])
@@ -7112,13 +7166,14 @@ fn primary_mapping_source(plan: &InstallPlan) -> Option<String> {
 fn humanize_mod_display_name(raw_name: &str) -> String {
     let normalized_path = normalize_archive_path(raw_name);
     let file_name = basename(&normalized_path);
-    let without_extension = file_name
-        .strip_suffix(".zip")
-        .or_else(|| file_name.strip_suffix(".7z"))
-        .or_else(|| file_name.strip_suffix(".rar"))
-        .or_else(|| file_name.strip_suffix(".pak"))
-        .or_else(|| file_name.strip_suffix(".dll"))
-        .or_else(|| file_name.strip_suffix(".lua"))
+    let lower_file_name = file_name.to_lowercase();
+    let without_extension = [".zip", ".7z", ".rar", ".pak", ".dll", ".lua", ".as"]
+        .iter()
+        .find_map(|extension| {
+            lower_file_name
+                .ends_with(extension)
+                .then(|| &file_name[..file_name.len() - extension.len()])
+        })
         .unwrap_or(&file_name);
     let without_unreal_suffix = without_extension
         .strip_suffix("_P")
@@ -8008,6 +8063,46 @@ fn version_parts(version: &str) -> Vec<u64> {
         .collect()
 }
 
+fn select_update_installer_asset(release: &GithubReleaseResponse) -> Option<&GithubReleaseAsset> {
+    release
+        .assets
+        .iter()
+        .filter_map(|asset| update_installer_asset_score(&asset.name).map(|score| (score, asset)))
+        .max_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.name.cmp(&right.1.name))
+        })
+        .map(|(_, asset)| asset)
+}
+
+fn update_installer_asset_score(name: &str) -> Option<i32> {
+    let lower_name = name.to_lowercase();
+    if !lower_name.starts_with("uniloader") {
+        return None;
+    }
+
+    let mut score = if lower_name.ends_with("_x64-setup.exe")
+        || lower_name.ends_with("-x64-setup.exe")
+        || lower_name.ends_with("-setup.exe")
+    {
+        100
+    } else if lower_name.ends_with(".msi") {
+        70
+    } else {
+        return None;
+    };
+
+    if lower_name.contains("x64") {
+        score += 8;
+    }
+    if lower_name.contains("setup") {
+        score += 6;
+    }
+
+    Some(score)
+}
+
 fn open_folder_in_shell(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
@@ -8034,14 +8129,7 @@ fn open_folder_in_shell(path: &Path) -> Result<(), String> {
 }
 
 fn open_url_in_shell(url: &str) -> Result<(), String> {
-    let trimmed_url = url.trim();
-    if !(trimmed_url.starts_with("https://") || trimmed_url.starts_with("http://")) {
-        return Err("Only http and https links can be opened.".to_string());
-    }
-
-    if trimmed_url.chars().any(char::is_control) {
-        return Err("Link contains invalid control characters.".to_string());
-    }
+    let trimmed_url = validated_http_url(url)?;
 
     #[cfg(target_os = "windows")]
     {
@@ -8068,6 +8156,67 @@ fn open_url_in_shell(url: &str) -> Result<(), String> {
     }
 }
 
+fn validated_http_url(url: &str) -> Result<String, String> {
+    let trimmed_url = url.trim();
+    if !(trimmed_url.starts_with("https://") || trimmed_url.starts_with("http://")) {
+        return Err("Only http and https links can be opened.".to_string());
+    }
+
+    if trimmed_url.chars().any(char::is_control) {
+        return Err("Link contains invalid control characters.".to_string());
+    }
+
+    Ok(trimmed_url.to_string())
+}
+
+fn update_download_dir() -> Result<PathBuf, String> {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(user_profile) = std::env::var_os("USERPROFILE") {
+            return Ok(PathBuf::from(user_profile).join("Downloads"));
+        }
+    }
+
+    if let Some(home) = std::env::var_os("HOME") {
+        return Ok(PathBuf::from(home).join("Downloads"));
+    }
+
+    Ok(std::env::temp_dir())
+}
+
+fn update_installer_file_name(url: &str, file_name: Option<&str>) -> Result<String, String> {
+    let raw_name = file_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            url.rsplit('/')
+                .next()
+                .and_then(|part| part.split('?').next())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "UniLoader-update-setup.exe".to_string());
+    let safe_name = sanitize_file_segment(&raw_name);
+    let lower_name = safe_name.to_lowercase();
+
+    if !(lower_name.ends_with(".exe") || lower_name.ends_with(".msi")) {
+        return Err("Update asset must be a Windows .exe or .msi installer.".to_string());
+    }
+
+    Ok(safe_name)
+}
+
+fn launch_update_installer(path: &Path) -> Result<(), String> {
+    if !path.is_file() {
+        return Err("Downloaded installer was not found.".to_string());
+    }
+
+    Command::new(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(error_to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8078,6 +8227,31 @@ mod tests {
         assert!(is_newer_version("v1.0.0", "0.9.9"));
         assert!(!is_newer_version("0.1.0", "0.1.0"));
         assert!(!is_newer_version("0.1.0", "0.2.0"));
+    }
+
+    #[test]
+    fn update_checker_prefers_setup_exe_assets() {
+        let release = GithubReleaseResponse {
+            tag_name: "v0.4".to_string(),
+            html_url: Some("https://github.com/Chucksterboy/UniLoader/releases/tag/v0.4".to_string()),
+            assets: vec![
+                GithubReleaseAsset {
+                    name: "UniLoader_0.4.0_x64_en-US.msi".to_string(),
+                    browser_download_url:
+                        "https://github.com/Chucksterboy/UniLoader/releases/download/v0.4/UniLoader_0.4.0_x64_en-US.msi"
+                            .to_string(),
+                },
+                GithubReleaseAsset {
+                    name: "UniLoader_0.4.0_x64-setup.exe".to_string(),
+                    browser_download_url:
+                        "https://github.com/Chucksterboy/UniLoader/releases/download/v0.4/UniLoader_0.4.0_x64-setup.exe"
+                            .to_string(),
+                },
+            ],
+        };
+
+        let asset = select_update_installer_asset(&release).unwrap();
+        assert_eq!(asset.name, "UniLoader_0.4.0_x64-setup.exe");
     }
 
     #[test]
@@ -8428,6 +8602,14 @@ mod tests {
         assert_eq!(
             humanize_mod_display_name("denikson-BepInExPack_Valheim-5.4.2333.zip"),
             "BepInEx Pack Valheim"
+        );
+        assert_eq!(
+            humanize_mod_display_name("InventoryTrashButton.as"),
+            "Inventory Trash Button"
+        );
+        assert_eq!(
+            humanize_mod_display_name("LingerChanceIndicator.AS"),
+            "Linger Chance Indicator"
         );
     }
 

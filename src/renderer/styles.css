@@ -414,6 +414,12 @@ svg {
   }
 }
 
+@keyframes icon-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .rail-update-button {
   display: grid;
   place-items: center;
@@ -458,6 +464,15 @@ svg {
 .rail-update-button:hover {
   border-color: rgba(167, 220, 255, 0.78);
   color: var(--blue-soft);
+}
+
+.rail-update-button:disabled {
+  cursor: wait;
+  opacity: 0.82;
+}
+
+.spin-icon {
+  animation: icon-spin 900ms linear infinite;
 }
 
 .sidebar {

@@ -33,6 +33,8 @@ export const desktopApi: DesktopApi = {
   toggleMaximizeWindow: () => getCurrentWindow().toggleMaximize(),
   closeWindow: () => getCurrentWindow().close(),
   startWindowDrag: () => getCurrentWindow().startDragging(),
+  downloadUpdateInstaller: (url: string, fileName?: string) =>
+    invoke<string>("download_update_installer", { url, fileName }),
   listProfiles: () => invoke<GameProfile[]>("list_profiles"),
   createProfile: (input: CreateProfileInput) =>
     invoke<GameProfile>("create_profile", { input }),

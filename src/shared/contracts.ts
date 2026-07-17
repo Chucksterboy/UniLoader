@@ -211,6 +211,8 @@ export interface AppUpdateInfo {
   latestVersion?: string;
   updateAvailable: boolean;
   releaseUrl?: string;
+  installerUrl?: string;
+  installerName?: string;
   status: AppUpdateStatus;
   message: string;
 }
@@ -317,6 +319,7 @@ export interface DesktopApi {
   toggleMaximizeWindow(): Promise<void>;
   closeWindow(): Promise<void>;
   startWindowDrag(): Promise<void>;
+  downloadUpdateInstaller(url: string, fileName?: string): Promise<string>;
   listProfiles(): Promise<GameProfile[]>;
   createProfile(input: CreateProfileInput): Promise<GameProfile>;
   renameProfile(profileId: string, name: string): Promise<GameProfile>;
