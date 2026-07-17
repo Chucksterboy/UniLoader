@@ -1,0 +1,29 @@
+[package]
+name = "uniloader"
+version = "0.1.0"
+description = "UniLoader cross-game mod manager"
+authors = ["UniLoader"]
+edition = "2021"
+
+[lib]
+name = "uniloader_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "uniloader"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rars = "0.4.2"
+sevenz-rust2 = "0.21"
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+zip = "2"

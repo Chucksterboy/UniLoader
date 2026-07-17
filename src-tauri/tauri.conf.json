@@ -1,0 +1,35 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "UniLoader",
+  "version": "0.1.0",
+  "identifier": "com.uniloader.desktop",
+  "build": {
+    "beforeDevCommand": "pnpm vite --host 127.0.0.1",
+    "beforeBuildCommand": "pnpm run build:web",
+    "devUrl": "http://127.0.0.1:5173",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "UniLoader",
+        "width": 1260,
+        "height": 820,
+        "minWidth": 980,
+        "minHeight": 680,
+        "decorations": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.ico",
+      "icons/icon.png"
+    ]
+  }
+}

@@ -1,0 +1,198 @@
+[
+  {
+    "id": "valheim",
+    "displayName": "Valheim",
+    "engine": "unity-mono",
+    "executableNames": ["valheim.exe"],
+    "pathMarkers": ["valheim_data"],
+    "bootstrapRuntimes": ["bepinex"],
+    "configRoots": ["BepInEx/config"],
+    "runtimeDependencies": {
+      "bepinex": {
+        "id": "thunderstore:denikson-BepInExPack_Valheim",
+        "name": "denikson/BepInExPack_Valheim",
+        "provider": "thunderstore",
+        "source": "thunderstore:denikson/BepInExPack_Valheim",
+        "notes": "Valheim-specific BepInEx pack."
+      }
+    }
+  },
+  {
+    "id": "windrose",
+    "displayName": "Windrose",
+    "engine": "unreal",
+    "executableNames": ["windrose.exe"],
+    "pathMarkers": ["r5/content/paks"],
+    "configRoots": ["Binaries/Win64/Mods", "R5/Binaries/Win64/Mods"]
+  },
+  {
+    "id": "re2",
+    "displayName": "Resident Evil 2",
+    "engine": "re-engine",
+    "executableNames": ["re2.exe"],
+    "bootstrapRuntimes": ["reframework"],
+    "configRoots": ["reframework", "REFramework.ini", "dinput8.ini"],
+    "runtimeDependencies": {
+      "reframework": {
+        "id": "runtime:reframework",
+        "name": "REFramework",
+        "provider": "github-release",
+        "source": "github-release:praydog/REFramework#RE2.zip",
+        "notes": "Official REFramework asset for Resident Evil 2."
+      }
+    }
+  },
+  {
+    "id": "re3",
+    "displayName": "Resident Evil 3",
+    "engine": "re-engine",
+    "executableNames": ["re3.exe"],
+    "bootstrapRuntimes": ["reframework"],
+    "configRoots": ["reframework", "REFramework.ini", "dinput8.ini"],
+    "runtimeDependencies": {
+      "reframework": {
+        "id": "runtime:reframework",
+        "name": "REFramework",
+        "provider": "github-release",
+        "source": "github-release:praydog/REFramework#RE3.zip",
+        "notes": "Official REFramework asset for Resident Evil 3."
+      }
+    }
+  },
+  {
+    "id": "re4",
+    "displayName": "Resident Evil 4",
+    "engine": "re-engine",
+    "executableNames": ["re4.exe"],
+    "bootstrapRuntimes": ["reframework"],
+    "configRoots": ["reframework", "REFramework.ini", "dinput8.ini"],
+    "runtimeDependencies": {
+      "reframework": {
+        "id": "runtime:reframework",
+        "name": "REFramework",
+        "provider": "github-release",
+        "source": "github-release:praydog/REFramework#RE4.zip",
+        "notes": "Official REFramework asset for Resident Evil 4."
+      }
+    }
+  },
+  {
+    "id": "re7",
+    "displayName": "Resident Evil 7",
+    "engine": "re-engine",
+    "executableNames": ["re7.exe"],
+    "bootstrapRuntimes": ["reframework"],
+    "configRoots": ["reframework", "REFramework.ini", "dinput8.ini"],
+    "runtimeDependencies": {
+      "reframework": {
+        "id": "runtime:reframework",
+        "name": "REFramework",
+        "provider": "github-release",
+        "source": "github-release:praydog/REFramework#RE7.zip",
+        "notes": "Official REFramework asset for Resident Evil 7."
+      }
+    }
+  },
+  {
+    "id": "re8",
+    "displayName": "Resident Evil Village",
+    "engine": "re-engine",
+    "executableNames": ["re8.exe"],
+    "bootstrapRuntimes": ["reframework"],
+    "configRoots": ["reframework", "REFramework.ini", "dinput8.ini"],
+    "runtimeDependencies": {
+      "reframework": {
+        "id": "runtime:reframework",
+        "name": "REFramework",
+        "provider": "github-release",
+        "source": "github-release:praydog/REFramework#RE8.zip",
+        "notes": "Official REFramework asset for Resident Evil Village."
+      }
+    }
+  },
+  {
+    "id": "dd2",
+    "displayName": "Dragon's Dogma 2",
+    "engine": "re-engine",
+    "executableNames": ["dd2.exe"],
+    "bootstrapRuntimes": ["reframework"],
+    "configRoots": ["reframework", "REFramework.ini", "dinput8.ini"],
+    "runtimeDependencies": {
+      "reframework": {
+        "id": "runtime:reframework",
+        "name": "REFramework",
+        "provider": "github-release",
+        "source": "github-release:praydog/REFramework#DD2.zip",
+        "notes": "Official REFramework asset for Dragon's Dogma 2."
+      }
+    }
+  },
+  {
+    "id": "dmc5",
+    "displayName": "Devil May Cry 5",
+    "engine": "re-engine",
+    "executableNames": ["dmc5.exe", "devilmaycry5.exe"],
+    "bootstrapRuntimes": ["reframework"],
+    "configRoots": ["reframework", "REFramework.ini", "dinput8.ini"],
+    "runtimeDependencies": {
+      "reframework": {
+        "id": "runtime:reframework",
+        "name": "REFramework",
+        "provider": "github-release",
+        "source": "github-release:praydog/REFramework#DMC5.zip",
+        "notes": "Official REFramework asset for Devil May Cry 5."
+      }
+    }
+  },
+  {
+    "id": "mhrise",
+    "displayName": "Monster Hunter Rise",
+    "engine": "re-engine",
+    "executableNames": ["mhrise.exe", "monsterhunterrise.exe"],
+    "bootstrapRuntimes": ["reframework"],
+    "configRoots": ["reframework", "REFramework.ini", "dinput8.ini"],
+    "runtimeDependencies": {
+      "reframework": {
+        "id": "runtime:reframework",
+        "name": "REFramework",
+        "provider": "github-release",
+        "source": "github-release:praydog/REFramework#MHRISE.zip",
+        "notes": "Official REFramework asset for Monster Hunter Rise."
+      }
+    }
+  },
+  {
+    "id": "mhwilds",
+    "displayName": "Monster Hunter Wilds",
+    "engine": "re-engine",
+    "executableNames": ["mhwilds.exe", "monsterhunterwilds.exe"],
+    "bootstrapRuntimes": ["reframework"],
+    "configRoots": ["reframework", "REFramework.ini", "dinput8.ini"],
+    "runtimeDependencies": {
+      "reframework": {
+        "id": "runtime:reframework",
+        "name": "REFramework",
+        "provider": "github-release",
+        "source": "github-release:praydog/REFramework#MHWILDS.zip",
+        "notes": "Official REFramework asset for Monster Hunter Wilds."
+      }
+    }
+  },
+  {
+    "id": "sf6",
+    "displayName": "Street Fighter 6",
+    "engine": "re-engine",
+    "executableNames": ["sf6.exe", "streetfighter6.exe"],
+    "bootstrapRuntimes": ["reframework"],
+    "configRoots": ["reframework", "REFramework.ini", "dinput8.ini"],
+    "runtimeDependencies": {
+      "reframework": {
+        "id": "runtime:reframework",
+        "name": "REFramework",
+        "provider": "github-release",
+        "source": "github-release:praydog/REFramework#SF6.zip",
+        "notes": "Official REFramework asset for Street Fighter 6."
+      }
+    }
+  }
+]
