@@ -4,7 +4,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -12,7 +12,8 @@ use std::time::Duration;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager};
 use uuid::Uuid;
-use zip::ZipArchive;
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 const MAX_SCAN_DEPTH: usize = 4;
 const MAX_SCAN_ENTRIES: usize = 3000;
@@ -354,6 +355,62 @@ pub struct ProfileRefreshResult {
     warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileGameFolderUpdateResult {
+    profile: GameProfile,
+    detection: GameDetectionResult,
+    installed_mods: Vec<InstalledModRecord>,
+    deployed_files: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileExportResult {
+    output_path: String,
+    profile_name: String,
+    exported_mods: usize,
+    exported_config_files: usize,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileImportResult {
+    profile: GameProfile,
+    installed_mods: Vec<InstalledModRecord>,
+    deployed_files: Vec<String>,
+    config_files_written: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileBundleManifest {
+    schema_version: u32,
+    exported_at: String,
+    profile: GameProfile,
+    mods: Vec<ProfileBundleMod>,
+    config_files: Vec<ProfileBundleConfigFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileBundleMod {
+    record: InstalledModRecord,
+    source_relative_path: String,
+    source_is_directory: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileBundleConfigFile {
+    mod_id: String,
+    bundle_path: String,
+    target_relative_path: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -390,6 +447,13 @@ struct ProbeEntry {
 struct RoutePreparation {
     expected_mod_folders: Vec<String>,
     created_mod_folders: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct RedeployProfileModsResult {
+    installed_mods: Vec<InstalledModRecord>,
+    deployed_files: Vec<String>,
     warnings: Vec<String>,
 }
 
@@ -690,6 +754,16 @@ fn refresh_profile(app: AppHandle, profile_id: String) -> Result<ProfileRefreshR
 }
 
 #[tauri::command]
+fn update_profile_game_folder(
+    app: AppHandle,
+    profile_id: String,
+    game_path: String,
+) -> Result<ProfileGameFolderUpdateResult, String> {
+    let root = store_root(&app)?;
+    update_profile_game_folder_impl(&root, &profile_id, &game_path)
+}
+
+#[tauri::command]
 fn bootstrap_profile_dependencies(
     app: AppHandle,
     profile_id: String,
@@ -739,6 +813,26 @@ fn bootstrap_profile_dependencies(
     })
 }
 
+#[tauri::command]
+fn export_profile_bundle(
+    app: AppHandle,
+    profile_id: String,
+    output_path: String,
+) -> Result<ProfileExportResult, String> {
+    let root = store_root(&app)?;
+    export_profile_bundle_impl(&root, &profile_id, Path::new(&output_path))
+}
+
+#[tauri::command]
+fn import_profile_bundle(
+    app: AppHandle,
+    bundle_path: String,
+    game_path: String,
+) -> Result<ProfileImportResult, String> {
+    let root = store_root(&app)?;
+    import_profile_bundle_impl(&root, Path::new(&bundle_path), Path::new(&game_path))
+}
+
 fn profile_dependency_candidates(
     root: &Path,
     profile: &GameProfile,
@@ -764,6 +858,702 @@ fn profile_dependency_candidates(
     }
 
     Ok(dependencies)
+}
+
+fn update_profile_game_folder_impl(
+    root: &Path,
+    profile_id: &str,
+    game_path: &str,
+) -> Result<ProfileGameFolderUpdateResult, String> {
+    let detection = detect_game_setup_impl(Path::new(game_path))?;
+    let profiles_file = profiles_path(root);
+    let mut profiles = read_store::<GameProfile>(&profiles_file).map_err(error_to_string)?;
+    let profile_index = profiles
+        .items
+        .iter()
+        .position(|profile| profile.id == profile_id)
+        .ok_or_else(|| format!("Profile not found: {}", profile_id))?;
+
+    let mut profile = profiles.items[profile_index].clone();
+    profile.game_path = game_path.to_string();
+    profile.game_id = detection.game_id.clone();
+    profile.engine = detection.engine.clone();
+    profile.loader = detection.loader.clone();
+    profile.updated_at = now_string();
+    profiles.items[profile_index] = profile.clone();
+    write_store(&profiles_file, &profiles).map_err(error_to_string)?;
+
+    let mut warnings = install_profile_bootstrap_dependencies(root, &profile);
+    let mut redeploy_result = redeploy_enabled_profile_mods(root, &profile)?;
+    warnings.append(&mut redeploy_result.warnings);
+
+    Ok(ProfileGameFolderUpdateResult {
+        profile,
+        detection,
+        installed_mods: redeploy_result.installed_mods,
+        deployed_files: redeploy_result.deployed_files,
+        warnings,
+    })
+}
+
+fn export_profile_bundle_impl(
+    root: &Path,
+    profile_id: &str,
+    output_path: &Path,
+) -> Result<ProfileExportResult, String> {
+    let profile = get_profile(root, profile_id)?;
+    let discovered_config_files = discover_profile_config_files(&profile);
+    let installed_mods = read_store::<InstalledModRecord>(&installed_mods_path(root))
+        .map_err(error_to_string)?
+        .items
+        .into_iter()
+        .filter(|record| record.profile_id == profile_id)
+        .collect::<Vec<_>>();
+
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent).map_err(error_to_string)?;
+    }
+
+    let output = File::create(output_path).map_err(error_to_string)?;
+    let mut zip = ZipWriter::new(output);
+    let mut manifest = ProfileBundleManifest {
+        schema_version: 1,
+        exported_at: now_string(),
+        profile: profile.clone(),
+        mods: Vec::new(),
+        config_files: Vec::new(),
+    };
+    let mut warnings = Vec::new();
+    let mut seen_config_bundle_paths = HashSet::new();
+
+    for mut record in installed_mods {
+        let source_path = Path::new(&record.archive_path);
+        if !source_path.exists() {
+            warnings.push(format!(
+                "Skipped {} because its managed package source is missing.",
+                display_record_name(&record)
+            ));
+            continue;
+        }
+
+        let (source_relative_path, source_is_directory) = if source_path.is_dir() {
+            ("source".to_string(), true)
+        } else {
+            let file_name = source_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(sanitize_file_segment)
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "source.zip".to_string());
+            (file_name, false)
+        };
+        let package_entry = format!(
+            "packages/{}/{}",
+            sanitize_file_segment(&record.id),
+            source_relative_path
+        );
+
+        if source_is_directory {
+            add_directory_to_zip(&mut zip, source_path, &package_entry)?;
+        } else {
+            add_file_to_zip(&mut zip, source_path, &package_entry)?;
+        }
+
+        record.config_files =
+            resolved_config_files_for_record(&profile, &record, &discovered_config_files);
+        for config_file in &record.config_files {
+            let config_path = Path::new(config_file);
+            if !config_path.is_file() {
+                continue;
+            }
+            let Ok(relative_path) = config_path.strip_prefix(Path::new(&profile.game_path)) else {
+                warnings.push(format!(
+                    "Skipped config outside game folder: {}",
+                    config_path.to_string_lossy()
+                ));
+                continue;
+            };
+            let relative_config_path = to_portable_path(relative_path);
+            let bundle_path = format!(
+                "configs/{}/{}",
+                sanitize_file_segment(&record.id),
+                relative_config_path
+            );
+            if seen_config_bundle_paths.insert(bundle_path.clone()) {
+                add_file_to_zip(&mut zip, config_path, &bundle_path)?;
+                manifest.config_files.push(ProfileBundleConfigFile {
+                    mod_id: record.id.clone(),
+                    bundle_path,
+                    target_relative_path: relative_config_path,
+                });
+            }
+        }
+
+        manifest.mods.push(ProfileBundleMod {
+            record,
+            source_relative_path,
+            source_is_directory,
+        });
+    }
+
+    let manifest_content = serde_json::to_vec_pretty(&manifest).map_err(error_to_string)?;
+    add_bytes_to_zip(&mut zip, "manifest.json", &manifest_content)?;
+    zip.finish().map_err(error_to_string)?;
+
+    Ok(ProfileExportResult {
+        output_path: output_path.to_string_lossy().to_string(),
+        profile_name: profile.name,
+        exported_mods: manifest.mods.len(),
+        exported_config_files: manifest.config_files.len(),
+        warnings,
+    })
+}
+
+fn import_profile_bundle_impl(
+    root: &Path,
+    bundle_path: &Path,
+    game_path: &Path,
+) -> Result<ProfileImportResult, String> {
+    if !bundle_path.is_file() {
+        return Err(format!(
+            "Profile bundle does not exist: {}",
+            bundle_path.to_string_lossy()
+        ));
+    }
+    if !game_path.is_dir() {
+        return Err(format!(
+            "Game folder does not exist: {}",
+            game_path.to_string_lossy()
+        ));
+    }
+
+    let bundle_file = File::open(bundle_path).map_err(error_to_string)?;
+    let mut zip = ZipArchive::new(bundle_file).map_err(error_to_string)?;
+    let manifest = read_bundle_manifest(&mut zip)?;
+    if manifest.schema_version != 1 {
+        return Err(format!(
+            "Unsupported profile bundle version: {}",
+            manifest.schema_version
+        ));
+    }
+    let exported_profile = manifest.profile.clone();
+    let bundle_mods = manifest.mods;
+    let bundle_config_files = manifest.config_files;
+
+    let detection = detect_game_setup_impl(game_path)?;
+    let imported_at = now_string();
+    let mut profile = exported_profile;
+    profile.id = Uuid::new_v4().to_string();
+    profile.name = unique_profile_name(root, &profile.name)?;
+    profile.game_path = game_path.to_string_lossy().to_string();
+    profile.game_id = detection.game_id.clone();
+    profile.engine = detection.engine.clone();
+    profile.loader = detection.loader.clone();
+    profile.created_at = imported_at.clone();
+    profile.updated_at = imported_at;
+
+    let profiles_file = profiles_path(root);
+    let mut profiles = read_store::<GameProfile>(&profiles_file).map_err(error_to_string)?;
+    profiles.items.push(profile.clone());
+    write_store(&profiles_file, &profiles).map_err(error_to_string)?;
+    fs::create_dir_all(profile_dir(root, &profile.id)).map_err(error_to_string)?;
+
+    let mut warnings = install_profile_bootstrap_dependencies(root, &profile);
+    let mut id_map = HashMap::new();
+    let mut installed_mods = Vec::new();
+    let mut deployed_files = Vec::new();
+
+    for bundle_mod in bundle_mods {
+        let old_mod_id = bundle_mod.record.id.clone();
+        let new_mod_id = Uuid::new_v4().to_string();
+        let package_source = extract_profile_package_source(
+            &mut zip,
+            &old_mod_id,
+            &new_mod_id,
+            &profile,
+            root,
+            &bundle_mod,
+        )?;
+
+        let mut record = bundle_mod.record;
+        record.id = new_mod_id.clone();
+        record.profile_id = profile.id.clone();
+        record.archive_path = package_source.to_string_lossy().to_string();
+        record.installed_at = now_string();
+        record.files_written = Vec::new();
+        record.backups_written = Vec::new();
+        record.config_files = Vec::new();
+        record.dependencies = record
+            .dependencies
+            .iter()
+            .map(|dependency| refresh_dependency_status(root, &profile, dependency))
+            .collect();
+
+        if record.enabled {
+            if let Some(plan) = record.plan.clone() {
+                if let Some(reason) = incompatible_install_plan_reason(&profile, &plan) {
+                    record.enabled = false;
+                    record.last_status = "failed".to_string();
+                    warnings.push(format!(
+                        "Skipped {}: {}",
+                        display_record_name(&record),
+                        reason
+                    ));
+                    add_installed_mod(root, record.clone())?;
+                    write_receipt(root, &profile, &record)?;
+                    id_map.insert(old_mod_id, new_mod_id);
+                    installed_mods.push(record);
+                    continue;
+                }
+
+                let mut visited_dependencies = HashSet::new();
+                match install_dependencies_for_plan(
+                    root,
+                    &profile,
+                    &plan,
+                    &mut visited_dependencies,
+                    0,
+                ) {
+                    Ok(mut dependency_warnings) => warnings.append(&mut dependency_warnings),
+                    Err(error) => warnings.push(format!(
+                        "Could not install dependencies for {}: {}",
+                        display_record_name(&record),
+                        error
+                    )),
+                }
+
+                match deploy_mod_files(
+                    root,
+                    &profile,
+                    &new_mod_id,
+                    &record.archive_path.clone(),
+                    &plan,
+                    &mut record,
+                ) {
+                    Ok(files) => {
+                        record.files_written = files.clone();
+                        record.config_files = config_files_from_paths(&record.files_written);
+                        record.last_status = "installed".to_string();
+                        deployed_files.extend(files);
+                    }
+                    Err(error) => {
+                        record.enabled = false;
+                        record.last_status = "failed".to_string();
+                        warnings.push(format!(
+                            "Could not deploy {}: {}",
+                            display_record_name(&record),
+                            error
+                        ));
+                    }
+                }
+            } else {
+                record.enabled = false;
+                record.last_status = "failed".to_string();
+                warnings.push(format!(
+                    "Could not deploy {} because no install plan was stored.",
+                    display_record_name(&record)
+                ));
+            }
+        } else {
+            record.last_status = "disabled".to_string();
+        }
+
+        add_installed_mod(root, record.clone())?;
+        write_receipt(root, &profile, &record)?;
+        id_map.insert(old_mod_id, new_mod_id);
+        installed_mods.push(record);
+    }
+
+    let mut config_files_written = Vec::new();
+    for config_file in bundle_config_files {
+        let Some(new_mod_id) = id_map.get(&config_file.mod_id) else {
+            continue;
+        };
+        let destination_path = safe_join(game_path, &config_file.target_relative_path)?;
+        if let Some(parent) = destination_path.parent() {
+            fs::create_dir_all(parent).map_err(error_to_string)?;
+        }
+        extract_zip_file(&mut zip, &config_file.bundle_path, &destination_path)?;
+        let written_config_path = destination_path.to_string_lossy().to_string();
+        config_files_written.push(written_config_path.clone());
+
+        for record in &mut installed_mods {
+            if record.id == *new_mod_id && !record.config_files.contains(&written_config_path) {
+                record.config_files.push(written_config_path.clone());
+            }
+        }
+    }
+
+    if !config_files_written.is_empty() {
+        let installed_mods_file = installed_mods_path(root);
+        let mut store =
+            read_store::<InstalledModRecord>(&installed_mods_file).map_err(error_to_string)?;
+        for record in &installed_mods {
+            if let Some(stored_record) = store.items.iter_mut().find(|item| item.id == record.id) {
+                stored_record.config_files = record.config_files.clone();
+            }
+        }
+        write_store(&installed_mods_file, &store).map_err(error_to_string)?;
+    }
+
+    Ok(ProfileImportResult {
+        profile,
+        installed_mods,
+        deployed_files,
+        config_files_written,
+        warnings,
+    })
+}
+
+fn install_profile_bootstrap_dependencies(root: &Path, profile: &GameProfile) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let mut visited_dependencies = HashSet::new();
+    let mut seen_dependencies = HashSet::new();
+
+    for dependency in profile_bootstrap_dependencies(profile)
+        .into_iter()
+        .map(|dependency| refresh_dependency_status(root, profile, &dependency))
+    {
+        if !seen_dependencies.insert(dependency_key(&dependency))
+            || dependency.status == "already-installed"
+        {
+            continue;
+        }
+
+        match install_dependency_by_provider(
+            root,
+            profile,
+            &dependency,
+            &mut visited_dependencies,
+            0,
+        ) {
+            Ok(mut dependency_warnings) => warnings.append(&mut dependency_warnings),
+            Err(error) => warnings.push(format!(
+                "Could not install {} automatically: {}",
+                dependency.name, error
+            )),
+        }
+    }
+
+    warnings
+}
+
+fn redeploy_enabled_profile_mods(
+    root: &Path,
+    profile: &GameProfile,
+) -> Result<RedeployProfileModsResult, String> {
+    let installed_mods_file = installed_mods_path(root);
+    let mut store =
+        read_store::<InstalledModRecord>(&installed_mods_file).map_err(error_to_string)?;
+    let mut deployed_files = Vec::new();
+    let mut warnings = Vec::new();
+
+    for record in store
+        .items
+        .iter_mut()
+        .filter(|record| record.profile_id == profile.id)
+    {
+        if !record.enabled {
+            continue;
+        }
+
+        let Some(plan) = record.plan.clone() else {
+            warnings.push(format!(
+                "Could not redeploy {} because no install plan was stored.",
+                display_record_name(record)
+            ));
+            continue;
+        };
+        if let Some(reason) = incompatible_install_plan_reason(profile, &plan) {
+            record.enabled = false;
+            record.last_status = "failed".to_string();
+            warnings.push(format!(
+                "Skipped {}: {}",
+                display_record_name(record),
+                reason
+            ));
+            continue;
+        }
+
+        let mut visited_dependencies = HashSet::new();
+        match install_dependencies_for_plan(root, profile, &plan, &mut visited_dependencies, 0) {
+            Ok(mut dependency_warnings) => warnings.append(&mut dependency_warnings),
+            Err(error) => warnings.push(format!(
+                "Could not install dependencies for {}: {}",
+                display_record_name(record),
+                error
+            )),
+        }
+
+        match deploy_mod_files(
+            root,
+            profile,
+            &record.id.clone(),
+            &record.archive_path.clone(),
+            &plan,
+            record,
+        ) {
+            Ok(files) => {
+                record.files_written = files.clone();
+                record.config_files = config_files_from_paths(&record.files_written);
+                record.dependencies = record
+                    .dependencies
+                    .iter()
+                    .map(|dependency| refresh_dependency_status(root, profile, dependency))
+                    .collect();
+                record.last_status = "installed".to_string();
+                deployed_files.extend(files);
+                write_receipt(root, profile, record)?;
+            }
+            Err(error) => warnings.push(format!(
+                "Could not redeploy {}: {}",
+                display_record_name(record),
+                error
+            )),
+        }
+    }
+
+    write_store(&installed_mods_file, &store).map_err(error_to_string)?;
+    let installed_mods = store
+        .items
+        .into_iter()
+        .filter(|record| record.profile_id == profile.id)
+        .collect();
+
+    Ok(RedeployProfileModsResult {
+        installed_mods,
+        deployed_files,
+        warnings,
+    })
+}
+
+fn read_bundle_manifest(zip: &mut ZipArchive<File>) -> Result<ProfileBundleManifest, String> {
+    let manifest_file = zip
+        .by_name("manifest.json")
+        .map_err(|_| "Profile bundle is missing manifest.json.".to_string())?;
+    serde_json::from_reader(manifest_file).map_err(error_to_string)
+}
+
+fn extract_profile_package_source(
+    zip: &mut ZipArchive<File>,
+    old_mod_id: &str,
+    new_mod_id: &str,
+    profile: &GameProfile,
+    root: &Path,
+    bundle_mod: &ProfileBundleMod,
+) -> Result<PathBuf, String> {
+    let package_root = profile_package_dir(root, &profile.id, new_mod_id);
+    fs::create_dir_all(&package_root).map_err(error_to_string)?;
+
+    let source_relative_path = sanitize_bundle_relative_path(&bundle_mod.source_relative_path)?;
+    let source_path = safe_join(&package_root, &source_relative_path)?;
+    let bundle_entry = format!(
+        "packages/{}/{}",
+        sanitize_file_segment(old_mod_id),
+        source_relative_path
+    );
+
+    if bundle_mod.source_is_directory {
+        extract_zip_prefix(zip, &bundle_entry, &source_path)?;
+    } else {
+        extract_zip_file(zip, &bundle_entry, &source_path)?;
+    }
+
+    Ok(source_path)
+}
+
+fn add_directory_to_zip<W>(
+    zip: &mut ZipWriter<W>,
+    source_root: &Path,
+    entry_root: &str,
+) -> Result<(), String>
+where
+    W: Write + Seek,
+{
+    let entry_root = normalize_zip_entry(entry_root);
+    zip.add_directory(format!("{entry_root}/"), zip_file_options())
+        .map_err(error_to_string)?;
+
+    let mut queue = VecDeque::from([source_root.to_path_buf()]);
+    while let Some(current_path) = queue.pop_front() {
+        for entry in fs::read_dir(&current_path).map_err(error_to_string)? {
+            let entry = entry.map_err(error_to_string)?;
+            let file_type = entry.file_type().map_err(error_to_string)?;
+            if file_type.is_symlink() {
+                continue;
+            }
+
+            let source_path = entry.path();
+            let relative_path = source_path
+                .strip_prefix(source_root)
+                .map_err(error_to_string)?;
+            let zip_entry = format!("{entry_root}/{}", to_portable_path(relative_path));
+
+            if file_type.is_dir() {
+                zip.add_directory(
+                    format!("{}/", normalize_zip_entry(&zip_entry)),
+                    zip_file_options(),
+                )
+                .map_err(error_to_string)?;
+                queue.push_back(source_path);
+            } else if file_type.is_file() {
+                add_file_to_zip(zip, &source_path, &zip_entry)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn add_file_to_zip<W>(
+    zip: &mut ZipWriter<W>,
+    source_path: &Path,
+    entry_name: &str,
+) -> Result<(), String>
+where
+    W: Write + Seek,
+{
+    zip.start_file(normalize_zip_entry(entry_name), zip_file_options())
+        .map_err(error_to_string)?;
+    let mut source_file = File::open(source_path).map_err(error_to_string)?;
+    io::copy(&mut source_file, zip).map_err(error_to_string)?;
+    Ok(())
+}
+
+fn add_bytes_to_zip<W>(zip: &mut ZipWriter<W>, entry_name: &str, bytes: &[u8]) -> Result<(), String>
+where
+    W: Write + Seek,
+{
+    zip.start_file(normalize_zip_entry(entry_name), zip_file_options())
+        .map_err(error_to_string)?;
+    zip.write_all(bytes).map_err(error_to_string)
+}
+
+fn extract_zip_prefix(
+    zip: &mut ZipArchive<File>,
+    entry_prefix: &str,
+    destination_root: &Path,
+) -> Result<(), String> {
+    let prefix = format!(
+        "{}/",
+        normalize_zip_entry(entry_prefix).trim_end_matches('/')
+    );
+    let mut entry_names = Vec::new();
+
+    for index in 0..zip.len() {
+        let file = zip.by_index(index).map_err(error_to_string)?;
+        let name = file.name().to_string();
+        if name.starts_with(&prefix) {
+            entry_names.push(name);
+        }
+    }
+
+    if entry_names.is_empty() {
+        return Err(format!(
+            "Profile bundle is missing package source: {entry_prefix}"
+        ));
+    }
+
+    for entry_name in entry_names {
+        let relative_path = entry_name.trim_start_matches(&prefix);
+        if relative_path.is_empty() {
+            continue;
+        }
+
+        let destination_path = safe_join(destination_root, relative_path)?;
+        if entry_name.ends_with('/') {
+            fs::create_dir_all(destination_path).map_err(error_to_string)?;
+        } else {
+            extract_zip_file(zip, &entry_name, &destination_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn extract_zip_file(
+    zip: &mut ZipArchive<File>,
+    entry_name: &str,
+    destination_path: &Path,
+) -> Result<(), String> {
+    let mut zip_file = zip
+        .by_name(&normalize_zip_entry(entry_name))
+        .map_err(error_to_string)?;
+    if zip_file.name().ends_with('/') {
+        return Err(format!("Expected a file but found a folder: {entry_name}"));
+    }
+    if let Some(parent) = destination_path.parent() {
+        fs::create_dir_all(parent).map_err(error_to_string)?;
+    }
+    let mut output = File::create(destination_path).map_err(error_to_string)?;
+    io::copy(&mut zip_file, &mut output).map_err(error_to_string)?;
+    Ok(())
+}
+
+fn zip_file_options() -> SimpleFileOptions {
+    SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .unix_permissions(0o644)
+}
+
+fn normalize_zip_entry(entry_name: &str) -> String {
+    entry_name
+        .replace('\\', "/")
+        .trim_start_matches('/')
+        .to_string()
+}
+
+fn sanitize_bundle_relative_path(relative_path: &str) -> Result<String, String> {
+    let normalized = normalize_archive_path(relative_path);
+    let path = Path::new(&normalized);
+    if normalized.is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(format!("Unsafe bundle path: {relative_path}"));
+    }
+
+    Ok(normalized)
+}
+
+fn unique_profile_name(root: &Path, base_name: &str) -> Result<String, String> {
+    let profiles = read_store::<GameProfile>(&profiles_path(root))
+        .map_err(error_to_string)?
+        .items;
+    let existing_names = profiles
+        .iter()
+        .map(|profile| profile.name.to_lowercase())
+        .collect::<HashSet<_>>();
+
+    if !existing_names.contains(&base_name.to_lowercase()) {
+        return Ok(base_name.to_string());
+    }
+
+    let imported_name = format!("{base_name} Imported");
+    if !existing_names.contains(&imported_name.to_lowercase()) {
+        return Ok(imported_name);
+    }
+
+    for index in 2..1000 {
+        let candidate = format!("{base_name} Imported {index}");
+        if !existing_names.contains(&candidate.to_lowercase()) {
+            return Ok(candidate);
+        }
+    }
+
+    Err("Could not create a unique imported profile name.".to_string())
+}
+
+fn display_record_name(record: &InstalledModRecord) -> String {
+    record
+        .display_name
+        .clone()
+        .unwrap_or_else(|| record.archive_name.clone())
 }
 
 #[tauri::command]
@@ -1052,6 +1842,9 @@ pub fn run() {
             remove_profile,
             refresh_profile,
             bootstrap_profile_dependencies,
+            update_profile_game_folder,
+            export_profile_bundle,
+            import_profile_bundle,
             detect_game_setup,
             analyze_archive_for_profile,
             install_archive,
@@ -2271,6 +3064,14 @@ fn install_archive_impl_with_metadata(
     if dependency_depth > MAX_DEPENDENCY_DEPTH {
         return Err("Dependency chain is too deep to install safely.".to_string());
     }
+    if let Some(reason) = incompatible_install_plan_reason(profile, plan) {
+        return Err(reason);
+    }
+    if let Some(reason) =
+        duplicate_installed_mod_reason(store_root, profile, plan, archive_path, &metadata)?
+    {
+        return Err(reason);
+    }
 
     let install_id = Uuid::new_v4().to_string();
     let installed_at = now_string();
@@ -2424,6 +3225,151 @@ fn attach_manifest_dependencies(
     }
 
     plan
+}
+
+fn incompatible_install_plan_reason(profile: &GameProfile, plan: &InstallPlan) -> Option<String> {
+    match plan.adapter_id.as_str() {
+        "unreal-pak" | "ue4ss" if profile.engine != "unreal" => Some(format!(
+            "{} mods are for Unreal Engine games, but this profile is detected as {}.",
+            plan.adapter_name,
+            engine_label(&profile.engine)
+        )),
+        "reframework" if profile.engine != "re-engine" => Some(format!(
+            "REFramework mods are for RE Engine games, but this profile is detected as {}.",
+            engine_label(&profile.engine)
+        )),
+        "bepinex" if !profile.engine.starts_with("unity") && !profile.loader.starts_with("bepinex") => {
+            Some(format!(
+                "BepInEx mods are for Unity/BepInEx games, but this profile is detected as {} with {}.",
+                engine_label(&profile.engine),
+                format_loader(&profile.loader)
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn duplicate_installed_mod_reason(
+    store_root: &Path,
+    profile: &GameProfile,
+    plan: &InstallPlan,
+    archive_path: &str,
+    metadata: &InstallMetadata,
+) -> Result<Option<String>, String> {
+    let candidate_keys = install_identity_keys(plan, archive_path, metadata);
+    if candidate_keys.is_empty() {
+        return Ok(None);
+    }
+
+    let store = read_store::<InstalledModRecord>(&installed_mods_path(store_root))
+        .map_err(error_to_string)?;
+    for record in store
+        .items
+        .iter()
+        .filter(|record| record.profile_id == profile.id && record.last_status != "removed")
+    {
+        let existing_keys = installed_mod_identity_keys(record);
+        if candidate_keys
+            .iter()
+            .any(|candidate| existing_keys.contains(candidate))
+        {
+            return Ok(Some(format!(
+                "{} is already installed in this profile. Disable, enable, or remove the existing copy before importing it again.",
+                display_record_name(record)
+            )));
+        }
+    }
+
+    Ok(None)
+}
+
+fn install_identity_keys(
+    plan: &InstallPlan,
+    archive_path: &str,
+    metadata: &InstallMetadata,
+) -> HashSet<String> {
+    let mut keys = HashSet::new();
+
+    if let Some(package_id) = metadata.package_id.as_deref() {
+        push_identity_key(&mut keys, "package", package_id);
+    }
+    if let Some(dependency_string) = metadata.dependency_string.as_deref() {
+        push_identity_key(&mut keys, "dependency", dependency_string);
+    }
+    if let Some(display_name) = metadata.display_name.as_deref() {
+        push_mod_name_identity_key(&mut keys, plan, display_name);
+    }
+    if let Some(primary_source) = primary_mapping_source(plan) {
+        push_mod_name_identity_key(&mut keys, plan, &primary_source);
+    }
+    if let Some(archive_name) = metadata.archive_name.as_deref() {
+        push_mod_name_identity_key(&mut keys, plan, archive_name);
+    }
+    if let Some(file_name) = Path::new(archive_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+    {
+        push_mod_name_identity_key(&mut keys, plan, file_name);
+    }
+
+    keys
+}
+
+fn installed_mod_identity_keys(record: &InstalledModRecord) -> HashSet<String> {
+    let mut keys = HashSet::new();
+
+    if let Some(package_id) = record.package_id.as_deref() {
+        push_identity_key(&mut keys, "package", package_id);
+    }
+    if let Some(dependency_string) = record.dependency_string.as_deref() {
+        push_identity_key(&mut keys, "dependency", dependency_string);
+    }
+    if let Some(display_name) = record.display_name.as_deref() {
+        push_mod_name_identity_key_for_adapter(&mut keys, &record.adapter_id, display_name);
+    }
+    push_mod_name_identity_key_for_adapter(&mut keys, &record.adapter_id, &record.archive_name);
+
+    keys
+}
+
+fn push_mod_name_identity_key(keys: &mut HashSet<String>, plan: &InstallPlan, value: &str) {
+    push_mod_name_identity_key_for_adapter(keys, &plan.adapter_id, value);
+}
+
+fn push_mod_name_identity_key_for_adapter(
+    keys: &mut HashSet<String>,
+    adapter_id: &str,
+    value: &str,
+) {
+    let identity = normalize_mod_identity(value);
+    if !identity.is_empty() {
+        keys.insert(format!("name:{}:{}", adapter_id.to_lowercase(), identity));
+    }
+}
+
+fn push_identity_key(keys: &mut HashSet<String>, prefix: &str, value: &str) {
+    let normalized = value.trim().to_lowercase();
+    if !normalized.is_empty() {
+        keys.insert(format!("{prefix}:{normalized}"));
+    }
+}
+
+fn normalize_mod_identity(value: &str) -> String {
+    humanize_mod_display_name(value)
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(|character| character.to_lowercase())
+        .collect()
+}
+
+fn engine_label(engine: &str) -> &'static str {
+    match engine {
+        "unity-mono" => "Unity Mono",
+        "unity-il2cpp" => "Unity IL2CPP",
+        "unreal" => "Unreal Engine",
+        "re-engine" => "RE Engine",
+        _ => "an unknown engine",
+    }
 }
 
 fn known_runtime_dependency(profile: &GameProfile, runtime: &str) -> DependencySpec {
@@ -5444,6 +6390,108 @@ mod tests {
         assert!(is_newer_version("v1.0.0", "0.9.9"));
         assert!(!is_newer_version("0.1.0", "0.1.0"));
         assert!(!is_newer_version("0.1.0", "0.2.0"));
+    }
+
+    #[test]
+    fn incompatible_install_plan_blocks_unreal_mods_on_unity_profiles() {
+        let profile = GameProfile {
+            id: "profile-1".to_string(),
+            name: "Valheim".to_string(),
+            game_path: "C:/Games/Valheim".to_string(),
+            game_id: Some("valheim".to_string()),
+            engine: "unity-mono".to_string(),
+            loader: "bepinex".to_string(),
+            created_at: now_string(),
+            updated_at: now_string(),
+        };
+        let plan = InstallPlan {
+            adapter_id: "unreal-pak".to_string(),
+            adapter_name: "Unreal Pak Files".to_string(),
+            confidence: 0.66,
+            summary: "Deploy one pak file.".to_string(),
+            mappings: Vec::new(),
+            dependencies: Vec::new(),
+            warnings: Vec::new(),
+            requires_confirmation: false,
+        };
+
+        let reason = incompatible_install_plan_reason(&profile, &plan).unwrap();
+        assert!(reason.contains("Unreal Engine games"));
+        assert!(reason.contains("Unity Mono"));
+    }
+
+    #[test]
+    fn duplicate_mod_detection_blocks_same_clean_name_and_adapter() {
+        let root = temp_game_dir("duplicate-mod-detection");
+        let profile = GameProfile {
+            id: "profile-1".to_string(),
+            name: "Windrose".to_string(),
+            game_path: "C:/Games/Windrose".to_string(),
+            game_id: None,
+            engine: "unreal".to_string(),
+            loader: "ue4ss".to_string(),
+            created_at: now_string(),
+            updated_at: now_string(),
+        };
+        let record = InstalledModRecord {
+            id: "mod-1".to_string(),
+            profile_id: profile.id.clone(),
+            archive_path: "C:/UniLoader/packages/ShipLootx2.zip".to_string(),
+            archive_name: "ShipLootx2-172-3-1777184245.zip".to_string(),
+            display_name: Some("Ship Lootx 2".to_string()),
+            package_id: None,
+            dependency_string: None,
+            adapter_id: "unreal-pak".to_string(),
+            summary: String::new(),
+            installed_at: now_string(),
+            files_written: Vec::new(),
+            backups_written: Vec::new(),
+            dependencies: Vec::new(),
+            config_files: Vec::new(),
+            enabled: true,
+            last_status: "installed".to_string(),
+            plan: None,
+        };
+        write_store(
+            &installed_mods_path(&root),
+            &StoreFile {
+                version: 1,
+                items: vec![record],
+            },
+        )
+        .unwrap();
+        let plan = InstallPlan {
+            adapter_id: "unreal-pak".to_string(),
+            adapter_name: "Unreal Pak Files".to_string(),
+            confidence: 0.88,
+            summary: "Deploy one pak file.".to_string(),
+            mappings: vec![mapping(
+                "ShipLootx2.pak",
+                "game",
+                "Content/Paks/~mods/ShipLootx2.pak",
+                "Test pak.",
+            )],
+            dependencies: Vec::new(),
+            warnings: Vec::new(),
+            requires_confirmation: false,
+        };
+        let metadata = InstallMetadata {
+            archive_name: Some("ShipLootx2-172-3-1777184245.zip".to_string()),
+            ..InstallMetadata::default()
+        };
+
+        let reason = duplicate_installed_mod_reason(
+            &root,
+            &profile,
+            &plan,
+            "C:/Downloads/ShipLootx2-172-3-1777184245.zip",
+            &metadata,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(reason.contains("already installed"));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

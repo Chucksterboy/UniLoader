@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   AppSettings,
@@ -16,6 +16,9 @@ import {
   ModActionResult,
   ProfileActionResult,
   ProfileDependencyBootstrapResult,
+  ProfileExportResult,
+  ProfileGameFolderUpdateResult,
+  ProfileImportResult,
   ProfileRefreshResult,
   UpdateModConfigValueInput
 } from "../shared/contracts";
@@ -40,6 +43,50 @@ export const desktopApi: DesktopApi = {
     invoke<ProfileRefreshResult>("refresh_profile", { profileId }),
   bootstrapProfileDependencies: (profileId: string) =>
     invoke<ProfileDependencyBootstrapResult>("bootstrap_profile_dependencies", { profileId }),
+  updateProfileGameFolder: (profileId: string, gamePath: string) =>
+    invoke<ProfileGameFolderUpdateResult>("update_profile_game_folder", { profileId, gamePath }),
+  exportProfileBundle: async (profileId: string, profileName: string) => {
+    const selected = await save({
+      title: "Export UniLoader profile",
+      defaultPath: `${safeFileName(profileName)}.uniloader-profile`,
+      filters: [{ name: "UniLoader profile bundle", extensions: ["uniloader-profile"] }]
+    });
+
+    if (!selected) {
+      return null;
+    }
+
+    return invoke<ProfileExportResult>("export_profile_bundle", {
+      profileId,
+      outputPath: selected
+    });
+  },
+  importProfileBundle: async () => {
+    const bundleSelection = await open({
+      directory: false,
+      multiple: false,
+      title: "Import UniLoader profile",
+      filters: [{ name: "UniLoader profile bundle", extensions: ["uniloader-profile"] }]
+    });
+    const bundlePath = normalizeDialogSelection(bundleSelection);
+
+    if (!bundlePath) {
+      return null;
+    }
+
+    const gameSelection = await open({
+      directory: true,
+      multiple: false,
+      title: "Select game install folder for imported profile"
+    });
+    const gamePath = normalizeDialogSelection(gameSelection);
+
+    if (!gamePath) {
+      return null;
+    }
+
+    return invoke<ProfileImportResult>("import_profile_bundle", { bundlePath, gamePath });
+  },
   selectGameFolder: async () => {
     const selected = await open({
       directory: true,
@@ -115,4 +162,9 @@ function normalizeDialogSelection(selection: string | string[] | null): string |
   }
 
   return selection;
+}
+
+function safeFileName(name: string): string {
+  const cleaned = name.replace(/[<>:"/\\|?*\u0000-\u001f]/g, " ").replace(/\s+/g, " ").trim();
+  return cleaned || "UniLoader Profile";
 }

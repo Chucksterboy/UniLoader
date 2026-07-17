@@ -17,6 +17,7 @@ import {
   SlidersHorizontal,
   Square,
   Trash2,
+  Upload,
   X
 } from "lucide-react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -51,7 +52,9 @@ const defaultAppSettings: AppSettings = {
 
 const appDisplayVersion = "v0.1";
 
-type ViewMode = "manager" | "settings";
+type ViewMode = "manager" | "transfer" | "settings";
+type ModSortMode = "newest" | "oldest";
+type TransferMode = "import" | "export" | null;
 type NoticeKind = "success" | "warning" | "error";
 
 interface Notice {
@@ -95,12 +98,15 @@ export function App() {
   const [profileInput, setProfileInput] = useState<CreateProfileInput>(emptyProfileInput);
   const [analysis, setAnalysis] = useState<ArchiveAnalysis | null>(null);
   const [installedMods, setInstalledMods] = useState<InstalledModRecord[]>([]);
+  const [modSortMode, setModSortMode] = useState<ModSortMode>("newest");
+  const [transferMode, setTransferMode] = useState<TransferMode>(null);
   const [detection, setDetection] = useState<GameDetectionResult | null>(null);
   const [isDetecting, setIsDetecting] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
   const [isInstalling, setIsInstalling] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isCheckingForUpdate, setIsCheckingForUpdate] = useState(false);
+  const [isTransferringProfile, setIsTransferringProfile] = useState(false);
   const [status, setStatus] = useState<string>("Ready");
   const [notice, setNoticeState] = useState<Notice | null>(null);
   const [configModal, setConfigModal] = useState<ConfigModalState | null>(null);
@@ -134,6 +140,15 @@ export function App() {
   const selectedProfile = useMemo(
     () => profiles.find((profile) => profile.id === selectedProfileId),
     [profiles, selectedProfileId]
+  );
+  const sortedInstalledMods = useMemo(
+    () =>
+      [...installedMods].sort((first, second) => {
+        const firstTime = Date.parse(first.installedAt) || 0;
+        const secondTime = Date.parse(second.installedAt) || 0;
+        return modSortMode === "newest" ? secondTime - firstTime : firstTime - secondTime;
+      }),
+    [installedMods, modSortMode]
   );
   const selectedPlan = analysis?.recommendedPlan;
   const detectionIssue = getDetectionIssue(detection);
@@ -570,6 +585,120 @@ export function App() {
     }
   }
 
+  async function reselectProfileGameFolder(profile: GameProfile) {
+    const folder = await api.selectGameFolder();
+    if (!folder) {
+      return;
+    }
+
+    setError("");
+    setStatus("Updating game folder");
+    try {
+      const result = await api.updateProfileGameFolder(profile.id, folder);
+      setProfiles((current) =>
+        current.map((item) => (item.id === result.profile.id ? result.profile : item))
+      );
+      if (selectedProfileId === result.profile.id) {
+        setInstalledMods(result.installedMods);
+        setDetection(result.detection);
+        setAnalysis(null);
+      }
+      setStatus(result.warnings.length > 0 ? "Needs attention" : "Game folder updated");
+      setNotice({
+        kind: result.warnings.length > 0 ? "warning" : "success",
+        title: "Game folder updated",
+        detail:
+          result.warnings[0] ??
+          `Redeployed ${result.deployedFiles.length} file(s) into the selected game folder.`
+      });
+    } catch (caughtError) {
+      setError(String(caughtError));
+      setStatus("Folder update failed");
+      setNotice({
+        kind: "error",
+        title: "Folder update failed",
+        detail: String(caughtError)
+      });
+    }
+  }
+
+  async function exportProfileBundle(profileId: string) {
+    const profile = profiles.find((item) => item.id === profileId);
+    if (!profile) {
+      setNotice({
+        kind: "warning",
+        title: "Select a profile",
+        detail: "Choose the profile you want to export."
+      });
+      return;
+    }
+
+    setError("");
+    setIsTransferringProfile(true);
+    setStatus("Exporting profile");
+    try {
+      const result = await api.exportProfileBundle(profile.id, profile.name);
+      if (!result) {
+        setStatus("Export canceled");
+        return;
+      }
+      setStatus(result.warnings.length > 0 ? "Export needs attention" : "Profile exported");
+      setNotice({
+        kind: result.warnings.length > 0 ? "warning" : "success",
+        title: "Profile exported",
+        detail:
+          result.warnings[0] ??
+          `${result.profileName}: ${result.exportedMods} mod(s) and ${result.exportedConfigFiles} config file(s) bundled.`
+      });
+    } catch (caughtError) {
+      setError(String(caughtError));
+      setStatus("Export failed");
+      setNotice({
+        kind: "error",
+        title: "Export failed",
+        detail: String(caughtError)
+      });
+    } finally {
+      setIsTransferringProfile(false);
+    }
+  }
+
+  async function importProfileBundle() {
+    setError("");
+    setIsTransferringProfile(true);
+    setStatus("Importing profile");
+    try {
+      const result = await api.importProfileBundle();
+      if (!result) {
+        setStatus("Import canceled");
+        return;
+      }
+      setProfiles((current) => [...current, result.profile]);
+      setSelectedProfileId(result.profile.id);
+      setInstalledMods(result.installedMods);
+      setAnalysis(null);
+      setDetection(null);
+      setStatus(result.warnings.length > 0 ? "Import needs attention" : "Profile imported");
+      setNotice({
+        kind: result.warnings.length > 0 ? "warning" : "success",
+        title: "Profile imported",
+        detail:
+          result.warnings[0] ??
+          `${result.profile.name}: ${result.installedMods.length} mod(s), ${result.deployedFiles.length} deployed file(s), and ${result.configFilesWritten.length} config file(s) restored.`
+      });
+    } catch (caughtError) {
+      setError(String(caughtError));
+      setStatus("Import failed");
+      setNotice({
+        kind: "error",
+        title: "Import failed",
+        detail: String(caughtError)
+      });
+    } finally {
+      setIsTransferringProfile(false);
+    }
+  }
+
   async function chooseArchive() {
     if (!selectedProfile) {
       setNotice({
@@ -805,7 +934,7 @@ export function App() {
 
   return (
     <>
-    <main className={renderedView === "settings" ? "app-shell settings-shell" : "app-shell"}>
+    <main className={renderedView === "manager" ? "app-shell" : "app-shell settings-shell"}>
       <div
         className="window-drag-region"
         onMouseDown={startWindowDrag}
@@ -835,6 +964,14 @@ export function App() {
             type="button"
           >
             <Settings2 size={18} />
+          </button>
+          <button
+            className={activeView === "transfer" ? "rail-button active" : "rail-button"}
+            onClick={() => setActiveView("transfer")}
+            title="Import / export profiles"
+            type="button"
+          >
+            <Upload size={18} />
           </button>
         </nav>
         <div className="rail-footer">
@@ -903,6 +1040,15 @@ export function App() {
                     F
                   </button>
                   <button
+                    aria-label={`Select ${profile.name} game folder`}
+                    className="select-folder"
+                    onClick={() => void reselectProfileGameFolder(profile)}
+                    title="Select game folder"
+                    type="button"
+                  >
+                    S
+                  </button>
+                  <button
                     aria-label={`Remove ${profile.name}`}
                     className="remove"
                     onClick={() => setProfilePendingRemoval(profile)}
@@ -958,7 +1104,7 @@ export function App() {
       ) : null}
 
       <section
-        className={`${renderedView === "settings" ? "workspace settings-workspace" : "workspace"} view-motion ${viewMotion.className}`}
+        className={`${renderedView === "settings" ? "workspace settings-workspace" : renderedView === "transfer" ? "workspace transfer-workspace" : "workspace"} view-motion ${viewMotion.className}`}
       >
         {renderedView === "manager" ? (
           <>
@@ -1048,10 +1194,28 @@ export function App() {
                   <p className="eyebrow">Mod library</p>
                   <h3>Available Mods</h3>
                 </div>
-                <span className="library-count">{installedMods.length}</span>
+                <div className="library-toolbar">
+                  <div className="sort-toggle" aria-label="Sort installed mods">
+                    <button
+                      className={modSortMode === "newest" ? "active" : ""}
+                      onClick={() => setModSortMode("newest")}
+                      type="button"
+                    >
+                      Newest
+                    </button>
+                    <button
+                      className={modSortMode === "oldest" ? "active" : ""}
+                      onClick={() => setModSortMode("oldest")}
+                      type="button"
+                    >
+                      Oldest
+                    </button>
+                  </div>
+                  <span className="library-count">{installedMods.length}</span>
+                </div>
               </div>
               <div className="history-list">
-                {installedMods.map((mod) => (
+                {sortedInstalledMods.map((mod) => (
                   <ModCard
                     key={mod.id}
                     mod={mod}
@@ -1071,6 +1235,16 @@ export function App() {
             </section>
           </div>
           </>
+        ) : renderedView === "transfer" ? (
+          <TransferView
+            isBusy={isTransferringProfile}
+            mode={transferMode}
+            profiles={profiles}
+            selectedProfileId={selectedProfileId}
+            onExport={(profileId) => void exportProfileBundle(profileId)}
+            onImport={() => void importProfileBundle()}
+            onSelectMode={setTransferMode}
+          />
         ) : (
           <SettingsView
             appSettings={appSettings}
@@ -1412,6 +1586,127 @@ function UniLoaderMark() {
         strokeWidth="4"
       />
     </svg>
+  );
+}
+
+interface TransferViewProps {
+  isBusy: boolean;
+  mode: TransferMode;
+  profiles: GameProfile[];
+  selectedProfileId: string;
+  onExport(profileId: string): void;
+  onImport(): void;
+  onSelectMode(mode: TransferMode): void;
+}
+
+function TransferView({
+  isBusy,
+  mode,
+  profiles,
+  selectedProfileId,
+  onExport,
+  onImport,
+  onSelectMode
+}: TransferViewProps) {
+  const [exportProfileId, setExportProfileId] = useState(selectedProfileId);
+
+  useEffect(() => {
+    setExportProfileId((current) =>
+      current && profiles.some((profile) => profile.id === current)
+        ? current
+        : selectedProfileId || profiles[0]?.id || ""
+    );
+  }, [profiles, selectedProfileId]);
+
+  return (
+    <div className="transfer-layout">
+      <div className="transfer-hero">
+        <p className="eyebrow">Profile transfer</p>
+        <h2>Import / Export</h2>
+      </div>
+
+      <div className="transfer-choice-grid">
+        <button
+          className={mode === "import" ? "transfer-choice active" : "transfer-choice"}
+          onClick={() => onSelectMode("import")}
+          type="button"
+        >
+          <Download size={24} />
+          <strong>Import</strong>
+          <span>Restore a shared UniLoader profile bundle into a selected game folder.</span>
+        </button>
+        <button
+          className={mode === "export" ? "transfer-choice active" : "transfer-choice"}
+          onClick={() => onSelectMode("export")}
+          type="button"
+        >
+          <Upload size={24} />
+          <strong>Export</strong>
+          <span>Bundle one profile with its managed mods and detected config files.</span>
+        </button>
+      </div>
+
+      {mode ? (
+        <section className="work-panel transfer-step-panel ui-motion-enter" key={mode}>
+          <div className="panel-title-row">
+            <div>
+              <p className="eyebrow">{mode === "import" ? "Import" : "Export"}</p>
+              <h3>{mode === "import" ? "Restore Profile Bundle" : "Create Profile Bundle"}</h3>
+            </div>
+            {mode === "import" ? <Download size={20} /> : <Upload size={20} />}
+          </div>
+
+          {mode === "import" ? (
+            <>
+              <div className="transfer-steps">
+                <span>1. Choose a `.uniloader-profile` bundle.</span>
+                <span>2. Select the matching game install folder.</span>
+                <span>3. UniLoader recreates the profile and deploys enabled mods.</span>
+              </div>
+              <button
+                className="primary-button transfer-action"
+                disabled={isBusy}
+                onClick={onImport}
+                type="button"
+              >
+                <Download size={17} />
+                {isBusy ? "Importing" : "Import Profile"}
+              </button>
+            </>
+          ) : (
+            <>
+              <label className="transfer-field">
+                Profile
+                <select
+                  value={exportProfileId}
+                  onChange={(event) => setExportProfileId(event.target.value)}
+                >
+                  {profiles.map((profile) => (
+                    <option key={profile.id} value={profile.id}>
+                      {profile.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="transfer-steps">
+                <span>1. Pick the profile to share.</span>
+                <span>2. Choose where to save the bundle.</span>
+                <span>3. Send the saved file to a friend.</span>
+              </div>
+              <button
+                className="primary-button transfer-action"
+                disabled={isBusy || profiles.length === 0}
+                onClick={() => onExport(exportProfileId)}
+                type="button"
+              >
+                <Upload size={17} />
+                {isBusy ? "Exporting" : "Export Profile"}
+              </button>
+            </>
+          )}
+        </section>
+      ) : null}
+    </div>
   );
 }
 

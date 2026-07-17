@@ -11,6 +11,7 @@ UniLoader is a desktop mod manager prototype built around a practical universal 
 - Managed per-profile package copies so mods can be disabled and re-enabled even if the original download is removed.
 - Data-driven game definitions for known game IDs, runtime overrides, and config roots.
 - Startup update checks against GitHub Releases, with a sidebar indicator when a newer release is available.
+- Profile import/export bundles for sharing a profile's managed mods and config files with another player.
 
 The first implementation supports ZIP archives, 7Z archives, and normal folder imports for these install families:
 
@@ -49,6 +50,8 @@ The Desktop shortcut points at `Start-UniLoader.cmd`. It starts a release build 
 This is a working foundation, not a finished public mod manager. It can create game profiles, detect game engines/loaders from a selected game folder, scan imported ZIP archives, detect common mod layouts, build an install plan, download supported runtime dependencies, and install files with backups. Nexus, CurseForge/Overwolf, and Mod.io source-provider integrations should be added through their official API/auth flows.
 
 The React frontend lives in `src/renderer`. The Tauri/Rust backend lives in `src-tauri`.
+
+The transfer tab exports a selected profile into a `.uniloader-profile` bundle. Importing that bundle prompts for the local game folder, recreates the profile, restores bundled config files, and redeploys enabled mods from the managed package copies.
 
 ## Releases and Updates
 

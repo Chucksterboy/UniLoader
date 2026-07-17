@@ -251,6 +251,30 @@ export interface ProfileRefreshResult {
   warnings: string[];
 }
 
+export interface ProfileGameFolderUpdateResult {
+  profile: GameProfile;
+  detection: GameDetectionResult;
+  installedMods: InstalledModRecord[];
+  deployedFiles: string[];
+  warnings: string[];
+}
+
+export interface ProfileExportResult {
+  outputPath: string;
+  profileName: string;
+  exportedMods: number;
+  exportedConfigFiles: number;
+  warnings: string[];
+}
+
+export interface ProfileImportResult {
+  profile: GameProfile;
+  installedMods: InstalledModRecord[];
+  deployedFiles: string[];
+  configFilesWritten: string[];
+  warnings: string[];
+}
+
 export interface AppState {
   profiles: GameProfile[];
   installedMods: InstalledModRecord[];
@@ -270,6 +294,9 @@ export interface DesktopApi {
   removeProfile(profileId: string): Promise<ProfileActionResult>;
   refreshProfile(profileId: string): Promise<ProfileRefreshResult>;
   bootstrapProfileDependencies(profileId: string): Promise<ProfileDependencyBootstrapResult>;
+  updateProfileGameFolder(profileId: string, gamePath: string): Promise<ProfileGameFolderUpdateResult>;
+  exportProfileBundle(profileId: string, profileName: string): Promise<ProfileExportResult | null>;
+  importProfileBundle(): Promise<ProfileImportResult | null>;
   selectGameFolder(): Promise<string | null>;
   detectGameSetup(gamePath: string): Promise<GameDetectionResult>;
   selectAndAnalyzeArchive(profileId: string): Promise<ArchiveAnalysis | null>;
