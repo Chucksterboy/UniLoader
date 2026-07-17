@@ -2,6 +2,7 @@ import {
   Activity,
   AlertTriangle,
   CheckCircle2,
+  Compass,
   Database,
   Download,
   FolderOpen,
@@ -21,7 +22,15 @@ import {
   X
 } from "lucide-react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { FormEvent, MouseEvent as ReactMouseEvent, useEffect, useMemo, useRef, useState } from "react";
+import {
+  FormEvent,
+  memo,
+  MouseEvent as ReactMouseEvent,
+  useEffect,
+  useMemo,
+  useRef,
+  useState
+} from "react";
 import {
   AppSettings,
   AppUpdateInfo,
@@ -33,6 +42,7 @@ import {
   InstallPlan,
   ModConfigEntry,
   ModConfigFile,
+  OnlineModRecord,
   ProfileDependencyBootstrapResult,
   ProfileRefreshResult
 } from "../shared/contracts";
@@ -47,13 +57,15 @@ const emptyProfileInput: CreateProfileInput = {
 };
 
 const defaultAppSettings: AppSettings = {
-  minimizeToTrayOnClose: false
+  minimizeToTrayOnClose: false,
+  nexusApiKey: ""
 };
 
-const appDisplayVersion = "v0.2";
+const appDisplayVersion = "v0.3";
 
-type ViewMode = "manager" | "transfer" | "settings";
+type ViewMode = "manager" | "discover" | "transfer" | "settings";
 type ModSortMode = "newest" | "oldest";
+type OnlineSortMode = "downloads" | "newest" | "oldest";
 type TransferMode = "import" | "export" | null;
 type NoticeKind = "success" | "warning" | "error";
 
@@ -88,6 +100,8 @@ interface MotionPresence<T> {
 }
 
 const motionDurationMs = 180;
+const discoverPageSize = 20;
+const nexusApiKeysUrl = "https://www.nexusmods.com/settings/api-keys";
 
 export function App() {
   const [activeView, setActiveView] = useState<ViewMode>("manager");
@@ -98,6 +112,9 @@ export function App() {
   const [profileInput, setProfileInput] = useState<CreateProfileInput>(emptyProfileInput);
   const [analysis, setAnalysis] = useState<ArchiveAnalysis | null>(null);
   const [installedMods, setInstalledMods] = useState<InstalledModRecord[]>([]);
+  const [discoverProfileId, setDiscoverProfileId] = useState<string>("");
+  const [discoverLoadedProfileId, setDiscoverLoadedProfileId] = useState<string>("");
+  const [onlineMods, setOnlineMods] = useState<OnlineModRecord[]>([]);
   const [modSortMode, setModSortMode] = useState<ModSortMode>("newest");
   const [transferMode, setTransferMode] = useState<TransferMode>(null);
   const [detection, setDetection] = useState<GameDetectionResult | null>(null);
@@ -105,10 +122,13 @@ export function App() {
   const [isDragOver, setIsDragOver] = useState(false);
   const [isInstalling, setIsInstalling] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isDiscoveringMods, setIsDiscoveringMods] = useState(false);
+  const [installingOnlineModId, setInstallingOnlineModId] = useState<string>("");
   const [isCheckingForUpdate, setIsCheckingForUpdate] = useState(false);
   const [isTransferringProfile, setIsTransferringProfile] = useState(false);
   const [status, setStatus] = useState<string>("Ready");
   const [notice, setNoticeState] = useState<Notice | null>(null);
+  const [nexusSettingsAttentionId, setNexusSettingsAttentionId] = useState(0);
   const [configModal, setConfigModal] = useState<ConfigModalState | null>(null);
   const [profilePendingRename, setProfilePendingRename] = useState<GameProfile | null>(null);
   const [profilePendingRemoval, setProfilePendingRemoval] = useState<GameProfile | null>(null);
@@ -150,6 +170,8 @@ export function App() {
       }),
     [installedMods, modSortMode]
   );
+  const displayedOnlineMods =
+    discoverLoadedProfileId === discoverProfileId ? onlineMods : [];
   const selectedPlan = analysis?.recommendedPlan;
   const detectionIssue = getDetectionIssue(detection);
   const healthTone: NoticeKind =
@@ -177,6 +199,18 @@ export function App() {
       void refreshInstalledMods(selectedProfileId);
     }
   }, [selectedProfileId]);
+
+  useEffect(() => {
+    if (activeView !== "discover") {
+      return;
+    }
+
+    setDiscoverProfileId((current) =>
+      current && profiles.some((profile) => profile.id === current)
+        ? current
+        : selectedProfileId || profiles[0]?.id || ""
+    );
+  }, [activeView, profiles, selectedProfileId]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -291,7 +325,7 @@ export function App() {
     } catch (caughtError) {
       const message = String(caughtError);
       setUpdateInfo({
-        currentVersion: "0.2.0",
+        currentVersion: "0.3.0",
         updateAvailable: false,
         status: "error",
         message
@@ -699,6 +733,105 @@ export function App() {
     }
   }
 
+  async function loadOnlineMods(profileId: string) {
+    setError("");
+    setIsDiscoveringMods(true);
+    setStatus("Discovering online mods");
+    try {
+      const mods = await api.discoverOnlineMods(profileId);
+      setOnlineMods(mods);
+      setDiscoverLoadedProfileId(profileId);
+      setStatus("Discovery ready");
+      const profile = profiles.find((item) => item.id === profileId);
+      setNotice({
+        kind: "success",
+        title: "Discovery updated",
+        detail: `${profile?.name ?? "Selected profile"}: found ${mods.length} online mod(s).`
+      });
+    } catch (caughtError) {
+      setOnlineMods([]);
+      setError(String(caughtError));
+      setStatus("Discovery failed");
+      setNotice({
+        kind: "error",
+        title: "Discovery failed",
+        detail: String(caughtError)
+      });
+    } finally {
+      setIsDiscoveringMods(false);
+    }
+  }
+
+  async function installOnlineMod(mod: OnlineModRecord) {
+    if (!discoverProfileId) {
+      setNotice({
+        kind: "warning",
+        title: "Select a profile",
+        detail: "Choose the profile you want to install this mod into."
+      });
+      return;
+    }
+
+    if (!mod.installSupported) {
+      setNotice({
+        kind: "warning",
+        title: "Install needs provider support",
+        detail: mod.installNote ?? `${mod.providerLabel} install is not available yet.`
+      });
+      return;
+    }
+
+    setError("");
+    setInstallingOnlineModId(mod.id);
+    setStatus("Installing online mod");
+    try {
+      const result = await api.installDiscoveredMod(discoverProfileId, mod);
+      setOnlineMods((current) =>
+        current.map((item) => (item.id === mod.id ? { ...item, installed: true } : item))
+      );
+      if (discoverProfileId === selectedProfileId) {
+        await refreshInstalledMods(discoverProfileId);
+      }
+      setStatus("Mod installed");
+      setNotice({
+        kind: result.warnings.length > 0 ? "warning" : "success",
+        title: "Online mod installed",
+        detail: installSuccessDetail(mod.name, result.filesWritten.length, result.warnings)
+      });
+    } catch (caughtError) {
+      setError(String(caughtError));
+      setStatus("Install failed");
+      setNotice({
+        kind: "error",
+        title: "Online install failed",
+        detail: String(caughtError)
+      });
+    } finally {
+      setInstallingOnlineModId("");
+    }
+  }
+
+  function openNexusAuthSettings() {
+    setActiveView("settings");
+    setNexusSettingsAttentionId((current) => current + 1);
+    setStatus("Nexus auth needed");
+  }
+
+  async function openExternalUrl(url: string) {
+    setError("");
+    try {
+      await api.openExternalUrl(url);
+    } catch (caughtError) {
+      setError(String(caughtError));
+      setStatus("Link failed");
+      setNotice({
+        kind: "error",
+        title: "Could not open link",
+        detail: String(caughtError)
+      });
+    }
+  }
+
   async function chooseArchive() {
     if (!selectedProfile) {
       setNotice({
@@ -958,6 +1091,14 @@ export function App() {
             <Home size={18} />
           </button>
           <button
+            className={activeView === "discover" ? "rail-button active" : "rail-button"}
+            onClick={() => setActiveView("discover")}
+            title="Discover online mods"
+            type="button"
+          >
+            <Compass size={18} />
+          </button>
+          <button
             className={activeView === "settings" ? "rail-button active" : "rail-button"}
             onClick={() => setActiveView("settings")}
             title="Settings"
@@ -1104,7 +1245,15 @@ export function App() {
       ) : null}
 
       <section
-        className={`${renderedView === "settings" ? "workspace settings-workspace" : renderedView === "transfer" ? "workspace transfer-workspace" : "workspace"} view-motion ${viewMotion.className}`}
+        className={`${
+          renderedView === "settings"
+            ? "workspace settings-workspace"
+            : renderedView === "transfer"
+              ? "workspace transfer-workspace"
+              : renderedView === "discover"
+                ? "workspace discover-workspace"
+                : "workspace"
+        } view-motion ${viewMotion.className}`}
       >
         {renderedView === "manager" ? (
           <>
@@ -1245,9 +1394,24 @@ export function App() {
             onImport={() => void importProfileBundle()}
             onSelectMode={setTransferMode}
           />
+        ) : renderedView === "discover" ? (
+          <DiscoverView
+            hasLoaded={discoverLoadedProfileId === discoverProfileId}
+            installingModId={installingOnlineModId}
+            isLoading={isDiscoveringMods}
+            mods={displayedOnlineMods}
+            profiles={profiles}
+            selectedProfileId={discoverProfileId}
+            onInstall={(mod) => void installOnlineMod(mod)}
+            onNeedsAuth={openNexusAuthSettings}
+            onRefresh={() => void loadOnlineMods(discoverProfileId)}
+            onSelectProfile={setDiscoverProfileId}
+          />
         ) : (
           <SettingsView
             appSettings={appSettings}
+            nexusAttentionId={nexusSettingsAttentionId}
+            onOpenExternalUrl={(url) => void openExternalUrl(url)}
             onUpdateSettings={updateAppSetting}
           />
         )}
@@ -1589,6 +1753,318 @@ function UniLoaderMark() {
   );
 }
 
+interface DiscoverViewProps {
+  hasLoaded: boolean;
+  installingModId: string;
+  isLoading: boolean;
+  mods: OnlineModRecord[];
+  profiles: GameProfile[];
+  selectedProfileId: string;
+  onInstall(mod: OnlineModRecord): void;
+  onNeedsAuth(): void;
+  onRefresh(): void;
+  onSelectProfile(profileId: string): void;
+}
+
+function DiscoverView({
+  hasLoaded,
+  installingModId,
+  isLoading,
+  mods,
+  profiles,
+  selectedProfileId,
+  onInstall,
+  onNeedsAuth,
+  onRefresh,
+  onSelectProfile
+}: DiscoverViewProps) {
+  const [query, setQuery] = useState("");
+  const [page, setPage] = useState(1);
+  const [sortMode, setSortMode] = useState<OnlineSortMode>("downloads");
+  const selectedProfile = profiles.find((profile) => profile.id === selectedProfileId);
+  const normalizedQuery = query.toLowerCase().trim();
+  const filteredMods = useMemo(
+    () =>
+      normalizedQuery
+        ? mods.filter((mod) =>
+            [
+              mod.name,
+              mod.owner,
+              mod.description,
+              mod.providerLabel,
+              mod.categories.join(" ")
+            ]
+              .join(" ")
+              .toLowerCase()
+              .includes(normalizedQuery)
+          )
+        : mods,
+    [mods, normalizedQuery]
+  );
+  const sortedOnlineMods = useMemo(
+    () =>
+      [...filteredMods].sort((first, second) => {
+        const firstTime = onlineModTimestamp(first);
+        const secondTime = onlineModTimestamp(second);
+
+        if (sortMode === "newest") {
+          return (
+            secondTime - firstTime ||
+            second.downloads - first.downloads ||
+            second.ratingScore - first.ratingScore
+          );
+        }
+
+        if (sortMode === "oldest") {
+          return (
+            firstTime - secondTime ||
+            second.downloads - first.downloads ||
+            second.ratingScore - first.ratingScore
+          );
+        }
+
+        return (
+          second.downloads - first.downloads ||
+          second.ratingScore - first.ratingScore ||
+          first.name.localeCompare(second.name)
+        );
+      }),
+    [filteredMods, sortMode]
+  );
+  const pageCount = Math.max(1, Math.ceil(sortedOnlineMods.length / discoverPageSize));
+  const currentPage = Math.min(page, pageCount);
+  const pageStart = (currentPage - 1) * discoverPageSize;
+  const visibleMods = useMemo(
+    () => sortedOnlineMods.slice(pageStart, pageStart + discoverPageSize),
+    [sortedOnlineMods, pageStart]
+  );
+
+  useEffect(() => {
+    setPage(1);
+  }, [normalizedQuery, selectedProfileId, mods, sortMode]);
+
+  return (
+    <div className="discover-layout">
+      <div className="discover-hero">
+        <div>
+          <p className="eyebrow">Discover</p>
+          <h2>Online Mods</h2>
+          <span>
+            {selectedProfile
+              ? `${selectedProfile.name} results sorted by popularity`
+              : "Select a profile to load provider results"}
+          </span>
+        </div>
+        <button
+          className="secondary-button"
+          disabled={!selectedProfileId || isLoading}
+          onClick={onRefresh}
+          type="button"
+        >
+          <RefreshCw size={16} />
+          {isLoading ? "Loading" : hasLoaded ? "Refresh" : "Load Online Mods"}
+        </button>
+      </div>
+
+      <section className="work-panel discover-controls">
+        <label className="transfer-field">
+          Profile
+          <select
+            value={selectedProfileId}
+            onChange={(event) => onSelectProfile(event.target.value)}
+          >
+            {profiles.map((profile) => (
+              <option key={profile.id} value={profile.id}>
+                {profile.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="discover-search">
+          <Search size={17} />
+          <input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Search online mods"
+          />
+          {query ? (
+            <button onClick={() => setQuery("")} title="Clear search" type="button">
+              X
+            </button>
+          ) : null}
+        </label>
+        <div className="discover-provider-pill" title={`${sortedOnlineMods.length} total online mods`}>
+          <Compass size={17} />
+          <span>Total Mods</span>
+          <strong>{formatCompactNumber(sortedOnlineMods.length)}</strong>
+        </div>
+        <div className="sort-toggle discover-sort" aria-label="Sort online mods">
+          <button
+            className={sortMode === "downloads" ? "active" : ""}
+            onClick={() => setSortMode("downloads")}
+            type="button"
+          >
+            Total Downloads
+          </button>
+          <button
+            className={sortMode === "newest" ? "active" : ""}
+            onClick={() => setSortMode("newest")}
+            type="button"
+          >
+            Newest
+          </button>
+          <button
+            className={sortMode === "oldest" ? "active" : ""}
+            onClick={() => setSortMode("oldest")}
+            type="button"
+          >
+            Oldest
+          </button>
+        </div>
+      </section>
+
+      <section className="discover-results" aria-label="Online mod results">
+        {visibleMods.map((mod) => (
+          <OnlineModCard
+            installing={installingModId === mod.id}
+            key={`${mod.provider}:${mod.id}:${mod.version}`}
+            mod={mod}
+            onInstall={onInstall}
+            onNeedsAuth={onNeedsAuth}
+          />
+        ))}
+        {!isLoading && !hasLoaded ? (
+          <div className="empty-mods discover-empty">
+            <Compass size={26} />
+            <p>Select a profile, then load online mods when you are ready.</p>
+          </div>
+        ) : null}
+        {!isLoading && hasLoaded && mods.length === 0 ? (
+          <div className="empty-mods discover-empty">
+            <Compass size={26} />
+            <p>No online provider results were found for this profile.</p>
+          </div>
+        ) : null}
+        {!isLoading && hasLoaded && mods.length > 0 && visibleMods.length === 0 ? (
+          <div className="empty-mods discover-empty">
+            <Search size={24} />
+            <p>No online mods match that search.</p>
+          </div>
+        ) : null}
+        {!isLoading && filteredMods.length > discoverPageSize ? (
+          <div className="discover-pagination">
+            <button
+              className="secondary-button compact-button"
+              disabled={currentPage <= 1}
+              onClick={() => setPage((value) => Math.max(1, value - 1))}
+              type="button"
+            >
+              Previous
+            </button>
+            <span>
+              Page {currentPage} / {pageCount}
+            </span>
+            <button
+              className="secondary-button compact-button"
+              disabled={currentPage >= pageCount}
+              onClick={() => setPage((value) => Math.min(pageCount, value + 1))}
+              type="button"
+            >
+              Next
+            </button>
+          </div>
+        ) : null}
+        {isLoading ? (
+          <div className="empty-mods discover-empty">
+            <RefreshCw size={24} />
+            <p>Loading online mods...</p>
+          </div>
+        ) : null}
+      </section>
+    </div>
+  );
+}
+
+interface OnlineModCardProps {
+  installing: boolean;
+  mod: OnlineModRecord;
+  onInstall(mod: OnlineModRecord): void;
+  onNeedsAuth(): void;
+}
+
+const OnlineModCard = memo(function OnlineModCard({
+  installing,
+  mod,
+  onInstall,
+  onNeedsAuth
+}: OnlineModCardProps) {
+  const needsAuth = !mod.installSupported && mod.provider === "nexus";
+  const installDisabled = mod.installed || installing || (!mod.installSupported && !needsAuth);
+  const installTitle = !mod.installSupported
+    ? (mod.installNote ?? `${mod.providerLabel} direct install is not available yet.`)
+    : undefined;
+
+  return (
+    <article className={mod.installed ? "online-mod-card installed" : "online-mod-card"}>
+      <div className="online-mod-icon">
+        {mod.iconUrl ? (
+          <img alt="" decoding="async" loading="lazy" src={mod.iconUrl} />
+        ) : (
+          <PackagePlus size={24} />
+        )}
+      </div>
+      <div className="online-mod-copy">
+        <div className="online-mod-heading">
+          <div>
+            <p className="eyebrow">{mod.providerLabel}</p>
+            <h3>{mod.name}</h3>
+          </div>
+          <span className={mod.installed ? "online-mod-state installed" : "online-mod-state"}>
+            {mod.installed ? "Installed" : `v${mod.version}`}
+          </span>
+        </div>
+        <p>{mod.description || "No description provided."}</p>
+        <div className="online-mod-meta">
+          <span>{mod.owner}</span>
+          <span>{formatCompactNumber(mod.downloads)} downloads</span>
+          <span>{mod.dependencyCount} dependenc{mod.dependencyCount === 1 ? "y" : "ies"}</span>
+          {mod.fileSize ? <span>{formatFileSize(mod.fileSize)}</span> : null}
+        </div>
+        {mod.categories.length > 0 ? (
+          <div className="dependency-chips">
+            {mod.categories.slice(0, 4).map((category) => (
+              <span key={category}>{category}</span>
+            ))}
+          </div>
+        ) : null}
+      </div>
+      <div className="online-mod-actions">
+        {mod.packageUrl ? (
+          <a className="secondary-button compact-button" href={mod.packageUrl} target="_blank" rel="noreferrer">
+            Page
+          </a>
+        ) : null}
+        <button
+          className={needsAuth ? "secondary-button compact-button auth-button" : "primary-button compact-button"}
+          disabled={installDisabled}
+          onClick={() => (needsAuth ? onNeedsAuth() : onInstall(mod))}
+          title={installTitle}
+          type="button"
+        >
+          {needsAuth ? <Settings2 size={15} /> : <Download size={15} />}
+          {mod.installed
+            ? "Installed"
+            : installing
+              ? "Installing"
+              : mod.installSupported
+                ? "Install"
+                : "Needs Auth"}
+        </button>
+      </div>
+    </article>
+  );
+});
+
 interface TransferViewProps {
   isBusy: boolean;
   mode: TransferMode;
@@ -1712,11 +2188,15 @@ function TransferView({
 
 interface SettingsViewProps {
   appSettings: AppSettings;
+  nexusAttentionId: number;
+  onOpenExternalUrl(url: string): void;
   onUpdateSettings(settings: AppSettings): Promise<void>;
 }
 
 function SettingsView({
   appSettings,
+  nexusAttentionId,
+  onOpenExternalUrl,
   onUpdateSettings
 }: SettingsViewProps) {
   return (
@@ -1733,7 +2213,7 @@ function SettingsView({
         <label className="setting-toggle-row">
           <div>
             <strong>Minimize to system tray on close</strong>
-            <span>Close hides UniLoader; click the tray icon to restore it.</span>
+            <span>Close hides UniLoader; left-click tray to restore, right-click tray to quit.</span>
           </div>
           <input
             checked={appSettings.minimizeToTrayOnClose}
@@ -1746,6 +2226,71 @@ function SettingsView({
             type="checkbox"
           />
         </label>
+      </section>
+
+      <section
+        className={`work-panel settings-panel nexus-settings-panel ${
+          nexusAttentionId > 0 ? "attention" : ""
+        }`}
+      >
+        <div className="panel-title-row">
+          <div>
+            <p className="eyebrow">Provider</p>
+            <h3>Nexus Mods</h3>
+          </div>
+          <Compass size={20} />
+        </div>
+
+        <label className="settings-field">
+          <span>Personal API key</span>
+          <input
+            autoComplete="off"
+            placeholder="Paste Nexus API key"
+            type="password"
+            value={appSettings.nexusApiKey}
+            onChange={(event) =>
+              void onUpdateSettings({
+                ...appSettings,
+                nexusApiKey: event.target.value.trim()
+              })
+            }
+          />
+        </label>
+        <p className={appSettings.nexusApiKey.trim() ? "settings-status connected" : "settings-status"}>
+          {appSettings.nexusApiKey.trim()
+            ? "Nexus install support is enabled for discovered mods."
+            : "Nexus results are browse-only until an API key is saved."}
+        </p>
+        <ol className="settings-steps">
+          <li>
+            <strong>Step 1</strong>
+            <span>
+              Log in at{" "}
+              <a
+                href={nexusApiKeysUrl}
+                onClick={(event) => {
+                  event.preventDefault();
+                  onOpenExternalUrl(nexusApiKeysUrl);
+                }}
+              >
+                Nexus Mods API Keys
+              </a>
+              .
+            </span>
+          </li>
+          <li>
+            <strong>Step 2</strong>
+            <span>Scroll all the way to the bottom of the page.</span>
+          </li>
+          <li>
+            <strong>Step 3</strong>
+            <span>Request a personal API key.</span>
+          </li>
+          <li>
+            <strong>Step 4</strong>
+            <span>Paste the key into UniLoader.</span>
+          </li>
+        </ol>
       </section>
     </div>
   );
@@ -1760,6 +2305,25 @@ function installSuccessDetail(archiveName: string, fileCount: number, warnings: 
   }
 
   return `${base} ${dependencyNotes.length} dependency package(s) installed automatically.`;
+}
+
+function onlineModTimestamp(mod: OnlineModRecord): number {
+  return Date.parse(mod.updatedAt ?? mod.createdAt ?? "") || 0;
+}
+
+function formatCompactNumber(value: number): string {
+  return Intl.NumberFormat(undefined, {
+    maximumFractionDigits: value >= 1000 ? 1 : 0,
+    notation: value >= 1000 ? "compact" : "standard"
+  }).format(value);
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024 * 1024) {
+    return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  }
+
+  return `${(bytes / 1024 / 1024).toFixed(bytes >= 100 * 1024 * 1024 ? 0 : 1)} MB`;
 }
 
 function refreshSummary(result: ProfileRefreshResult): string {
@@ -1777,6 +2341,14 @@ function refreshSummary(result: ProfileRefreshResult): string {
 
   if (result.detection.createdModFolders.length > 0) {
     parts.push(`Created ${result.detection.createdModFolders.length} missing route(s).`);
+  }
+
+  if (result.adoptedNativeScriptMods > 0) {
+    parts.push(
+      `Adopted ${result.adoptedNativeScriptMods} existing script mod${
+        result.adoptedNativeScriptMods === 1 ? "" : "s"
+      }.`
+    );
   }
 
   if (missingFileCount > 0) {

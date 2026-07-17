@@ -24,7 +24,8 @@ export type AdapterId =
   | "ue4ss"
   | "reframework"
   | "unreal-pak"
-  | "loose-files";
+  | "loose-files"
+  | "script-files";
 
 export type DependencyProvider =
   | "thunderstore"
@@ -200,6 +201,7 @@ export interface UpdateModConfigValueInput {
 
 export interface AppSettings {
   minimizeToTrayOnClose: boolean;
+  nexusApiKey: string;
 }
 
 export type AppUpdateStatus = "up-to-date" | "available" | "unavailable" | "error";
@@ -211,6 +213,32 @@ export interface AppUpdateInfo {
   releaseUrl?: string;
   status: AppUpdateStatus;
   message: string;
+}
+
+export type OnlineModProvider = "thunderstore" | "nexus";
+
+export interface OnlineModRecord {
+  id: string;
+  provider: OnlineModProvider;
+  providerLabel: string;
+  gameId?: string;
+  name: string;
+  owner: string;
+  version: string;
+  description: string;
+  categories: string[];
+  downloads: number;
+  ratingScore: number;
+  dependencyCount: number;
+  fileSize?: number;
+  iconUrl?: string;
+  packageUrl?: string;
+  websiteUrl?: string;
+  installed: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+  installSupported: boolean;
+  installNote?: string;
 }
 
 export interface ModActionResult {
@@ -248,6 +276,7 @@ export interface ProfileRefreshResult {
   installedMods: InstalledModRecord[];
   modFileHealth: ModFileHealth[];
   missingDependencies: DependencySpec[];
+  adoptedNativeScriptMods: number;
   warnings: string[];
 }
 
@@ -303,6 +332,8 @@ export interface DesktopApi {
   selectAndAnalyzeModFolder(profileId: string): Promise<ArchiveAnalysis | null>;
   analyzeArchivePath(profileId: string, archivePath: string): Promise<ArchiveAnalysis>;
   installArchive(request: InstallRequest): Promise<InstallResult>;
+  discoverOnlineMods(profileId: string): Promise<OnlineModRecord[]>;
+  installDiscoveredMod(profileId: string, mod: OnlineModRecord): Promise<InstallResult>;
   listInstalledMods(profileId: string): Promise<InstalledModRecord[]>;
   getModConfigDetails(profileId: string, installedModId: string): Promise<ModConfigFile[]>;
   updateModConfigValue(input: UpdateModConfigValueInput): Promise<ModConfigFile>;
@@ -310,5 +341,6 @@ export interface DesktopApi {
   enableMod(profileId: string, installedModId: string): Promise<ModActionResult>;
   removeMod(profileId: string, installedModId: string): Promise<ModActionResult>;
   openProfileGameFolder(profileId: string): Promise<void>;
+  openExternalUrl(url: string): Promise<void>;
   getStorePath(): Promise<string>;
 }

@@ -7,6 +7,8 @@
     "pathMarkers": ["valheim_data"],
     "bootstrapRuntimes": ["bepinex"],
     "configRoots": ["BepInEx/config"],
+    "thunderstoreCommunity": "valheim",
+    "nexusGameDomain": "valheim",
     "runtimeDependencies": {
       "bepinex": {
         "id": "thunderstore:denikson-BepInExPack_Valheim",
@@ -24,6 +26,16 @@
     "executableNames": ["windrose.exe"],
     "pathMarkers": ["r5/content/paks"],
     "configRoots": ["Binaries/Win64/Mods", "R5/Binaries/Win64/Mods"]
+  },
+  {
+    "id": "witchspire",
+    "displayName": "Witchspire",
+    "engine": "unreal",
+    "executableNames": ["witchspire.exe"],
+    "pathMarkers": ["hercules/script", "hercules/content/paks"],
+    "configRoots": ["Hercules/Script/Mods"],
+    "nativeScriptRoots": ["Hercules/Script/Mods"],
+    "nexusGameDomain": "witchspire"
   },
   {
     "id": "re2",

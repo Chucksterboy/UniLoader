@@ -14,6 +14,7 @@ import {
   InstallResult,
   ModConfigFile,
   ModActionResult,
+  OnlineModRecord,
   ProfileActionResult,
   ProfileDependencyBootstrapResult,
   ProfileExportResult,
@@ -139,6 +140,15 @@ export const desktopApi: DesktopApi = {
     }),
   installArchive: (request: InstallRequest) =>
     invoke<InstallResult>("install_archive", { request }),
+  discoverOnlineMods: (profileId: string) =>
+    invoke<OnlineModRecord[]>("discover_online_mods", { profileId }),
+  installDiscoveredMod: (profileId: string, mod: OnlineModRecord) =>
+    invoke<InstallResult>("install_discovered_mod", {
+      profileId,
+      provider: mod.provider,
+      modId: mod.id,
+      version: mod.version
+    }),
   listInstalledMods: (profileId: string) =>
     invoke<InstalledModRecord[]>("list_installed_mods", { profileId }),
   getModConfigDetails: (profileId: string, installedModId: string) =>
@@ -153,6 +163,8 @@ export const desktopApi: DesktopApi = {
     invoke<ModActionResult>("remove_mod", { profileId, installedModId }),
   openProfileGameFolder: (profileId: string) =>
     invoke<void>("open_profile_game_folder", { profileId }),
+  openExternalUrl: (url: string) =>
+    invoke<void>("open_external_url", { url }),
   getStorePath: () => invoke<string>("get_store_path")
 };
 
