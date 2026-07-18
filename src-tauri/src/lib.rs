@@ -456,6 +456,8 @@ struct GameDefinition {
     #[serde(default)]
     engine: Option<String>,
     #[serde(default)]
+    steam_app_ids: Vec<String>,
+    #[serde(default)]
     executable_names: Vec<String>,
     #[serde(default)]
     path_markers: Vec<String>,
@@ -856,7 +858,7 @@ struct NativeScriptFile {
     source_relative_path: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ScannedArchive {
     archive_path: String,
     archive_name: String,
@@ -1055,7 +1057,8 @@ fn check_app_update_impl() -> AppUpdateInfo {
 
 #[tauri::command]
 fn list_profiles(app: AppHandle) -> Result<Vec<GameProfile>, String> {
-    let path = profiles_path(&store_root(&app)?);
+    let root = store_root(&app)?;
+    let path = profiles_path(&root);
     let mut store = read_store::<GameProfile>(&path).map_err(error_to_string)?;
     let mut changed = false;
 
@@ -1076,6 +1079,28 @@ fn list_profiles(app: AppHandle) -> Result<Vec<GameProfile>, String> {
                 changed = true;
             }
         }
+        if let Some(definition) = profile
+            .steam_app_id
+            .as_deref()
+            .and_then(game_definition_by_steam_app_id)
+        {
+            if profile.game_id.as_deref() != Some(definition.id.as_str()) {
+                profile.game_id = Some(definition.id.clone());
+                changed = true;
+            }
+            if let Some(engine) = definition.engine.as_deref() {
+                if profile.engine != engine {
+                    profile.engine = engine.to_string();
+                    changed = true;
+                }
+            }
+            if profile.loader == "none" {
+                if let Some(loader) = definition.bootstrap_runtimes.first() {
+                    profile.loader = loader.clone();
+                    changed = true;
+                }
+            }
+        }
     }
 
     if changed {
@@ -1093,7 +1118,16 @@ fn profile_folder_exists(app: AppHandle, profile_id: String) -> Result<bool, Str
 }
 
 #[tauri::command]
-fn create_profile(app: AppHandle, mut input: CreateProfileInput) -> Result<GameProfile, String> {
+async fn create_profile(app: AppHandle, input: CreateProfileInput) -> Result<GameProfile, String> {
+    tauri::async_runtime::spawn_blocking(move || create_profile_sync(app, input))
+        .await
+        .map_err(error_to_string)?
+}
+
+fn create_profile_sync(
+    app: AppHandle,
+    mut input: CreateProfileInput,
+) -> Result<GameProfile, String> {
     let _operation = lock_mutations()?;
     let root = store_root(&app)?;
     if input
@@ -1104,7 +1138,16 @@ fn create_profile(app: AppHandle, mut input: CreateProfileInput) -> Result<GameP
     {
         input.steam_app_id = infer_steam_app_id_for_game_path(Path::new(&input.game_path));
     }
-    create_profile_in_store(&root, input)
+    let detection = detect_game_setup_with_steam_app_id(
+        Path::new(&input.game_path),
+        input.steam_app_id.as_deref(),
+    )?;
+    input.game_id = detection.game_id;
+    input.engine = detection.engine;
+    input.loader = detection.loader;
+    let profile = create_profile_in_store(&root, input)?;
+    let _ = install_profile_bootstrap_dependencies(&root, &profile);
+    Ok(profile)
 }
 
 fn create_profile_in_store(root: &Path, input: CreateProfileInput) -> Result<GameProfile, String> {
@@ -1154,8 +1197,9 @@ async fn create_steam_profile(
 fn create_steam_profile_sync(app: AppHandle, game: SteamGameRecord) -> Result<GameProfile, String> {
     let _operation = lock_mutations()?;
     let root = store_root(&app)?;
-    let detection = detect_game_setup_impl(Path::new(&game.install_dir))?;
-    create_profile_in_store(
+    let detection =
+        detect_game_setup_with_steam_app_id(Path::new(&game.install_dir), Some(&game.app_id))?;
+    let profile = create_profile_in_store(
         &root,
         CreateProfileInput {
             name: game.name,
@@ -1165,7 +1209,9 @@ fn create_steam_profile_sync(app: AppHandle, game: SteamGameRecord) -> Result<Ga
             engine: detection.engine,
             loader: detection.loader,
         },
-    )
+    )?;
+    let _ = install_profile_bootstrap_dependencies(&root, &profile);
+    Ok(profile)
 }
 
 #[tauri::command]
@@ -1607,7 +1653,10 @@ fn refresh_profile_sync(
         .position(|profile| profile.id == profile_id)
         .ok_or_else(|| format!("Profile not found: {}", profile_id))?;
     let mut profile = profiles.items[profile_index].clone();
-    let detection = detect_game_setup_impl(Path::new(&profile.game_path))?;
+    let detection = detect_game_setup_with_steam_app_id(
+        Path::new(&profile.game_path),
+        profile.steam_app_id.as_deref(),
+    )?;
 
     profile.game_id = detection.game_id.clone();
     profile.engine = detection.engine.clone();
@@ -1717,7 +1766,8 @@ fn bootstrap_profile_dependencies_sync(
 ) -> Result<ProfileDependencyBootstrapResult, String> {
     let _operation = lock_mutations()?;
     let root = store_root(&app)?;
-    let profile = get_profile(&root, &profile_id)?;
+    let mut profile = get_profile(&root, &profile_id)?;
+    repair_profile_identity_from_steam_app_id(&root, &mut profile)?;
     let mut visited_dependencies = HashSet::new();
     let mut installed_dependencies = Vec::new();
     let mut skipped_dependencies = Vec::new();
@@ -1743,8 +1793,16 @@ fn bootstrap_profile_dependencies_sync(
 
         match install_result {
             Ok(mut dependency_warnings) => {
-                installed_dependencies.push(dependency.name.clone());
-                warnings.append(&mut dependency_warnings);
+                let verified = refresh_dependency_status(&root, &profile, &dependency);
+                if verified.status == "already-installed" {
+                    installed_dependencies.push(dependency.name.clone());
+                    warnings.append(&mut dependency_warnings);
+                } else {
+                    warnings.push(format!(
+                        "{} was downloaded, but its required runtime files were not detected in the game folder after installation.",
+                        dependency.name
+                    ));
+                }
             }
             Err(error) => warnings.push(format!(
                 "Could not install {} automatically: {}",
@@ -1823,7 +1881,11 @@ fn update_profile_game_folder_impl(
     game_path: &str,
 ) -> Result<ProfileGameFolderUpdateResult, String> {
     let normalized_game_path = normalize_profile_game_path(game_path);
-    let detection = detect_game_setup_impl(Path::new(&normalized_game_path))?;
+    let steam_app_id = infer_steam_app_id_for_game_path(Path::new(&normalized_game_path));
+    let detection = detect_game_setup_with_steam_app_id(
+        Path::new(&normalized_game_path),
+        steam_app_id.as_deref(),
+    )?;
     let profiles_file = profiles_path(root);
     let mut profiles = read_store::<GameProfile>(&profiles_file).map_err(error_to_string)?;
     let profile_index = profiles
@@ -1853,7 +1915,7 @@ fn update_profile_game_folder_impl(
     let mut profile = old_profile.clone();
     profile.game_path = normalized_game_path.clone();
     profile.game_id = detection.game_id.clone();
-    profile.steam_app_id = infer_steam_app_id_for_game_path(Path::new(&normalized_game_path));
+    profile.steam_app_id = steam_app_id;
     profile.engine = detection.engine.clone();
     profile.loader = detection.loader.clone();
     profile.updated_at = now_string();
@@ -2200,13 +2262,15 @@ fn import_profile_bundle_impl_unchecked(
     let bundle_mods = manifest.mods;
     let bundle_config_files = manifest.config_files;
 
-    let detection = detect_game_setup_impl(game_path)?;
+    let steam_app_id = infer_steam_app_id_for_game_path(game_path);
+    let detection = detect_game_setup_with_steam_app_id(game_path, steam_app_id.as_deref())?;
     let imported_at = now_string();
     let mut profile = exported_profile;
     profile.id = Uuid::new_v4().to_string();
     profile.name = unique_profile_name(root, &profile.name)?;
     profile.game_path = game_path.to_string_lossy().to_string();
     profile.game_id = detection.game_id.clone();
+    profile.steam_app_id = steam_app_id;
     profile.engine = detection.engine.clone();
     profile.loader = detection.loader.clone();
     profile.created_at = imported_at.clone();
@@ -3556,12 +3620,20 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
 }
 
 fn detect_game_setup_impl(game_path: &Path) -> Result<GameDetectionResult, String> {
+    let steam_app_id = infer_steam_app_id_for_game_path(game_path);
+    detect_game_setup_with_steam_app_id(game_path, steam_app_id.as_deref())
+}
+
+fn detect_game_setup_with_steam_app_id(
+    game_path: &Path,
+    steam_app_id: Option<&str>,
+) -> Result<GameDetectionResult, String> {
     if !game_path.is_dir() {
         return Err("Selected game path must be a folder.".to_string());
     }
 
     let entries = walk_game_folder(game_path);
-    let game_id = detect_game_id(&entries);
+    let game_id = detect_game_id(&entries, steam_app_id);
     let mut signals = Vec::new();
     let mut engine_scores = score_map(&[
         "unity-mono",
@@ -3638,6 +3710,18 @@ fn detect_game_setup_impl(game_path: &Path) -> Result<GameDetectionResult, Strin
             path: definition.id.clone(),
             weight: 12,
         });
+        if steam_app_id.is_some_and(|app_id| {
+            definition
+                .steam_app_ids
+                .iter()
+                .any(|known_id| known_id == app_id.trim())
+        }) {
+            signals.push(DetectionSignal {
+                label: "Steam App ID match".to_string(),
+                path: steam_app_id.unwrap_or_default().trim().to_string(),
+                weight: 50,
+            });
+        }
     }
 
     let route_preparation =
@@ -3840,7 +3924,11 @@ fn score_engine(
     }
 }
 
-fn detect_game_id(entries: &[ProbeEntry]) -> Option<String> {
+fn detect_game_id(entries: &[ProbeEntry], steam_app_id: Option<&str>) -> Option<String> {
+    if let Some(definition) = steam_app_id.and_then(game_definition_by_steam_app_id) {
+        return Some(definition.id.clone());
+    }
+
     game_definitions()
         .iter()
         .find(|definition| game_definition_matches(definition, entries))
@@ -3861,6 +3949,66 @@ fn game_definition_by_id(game_id: &str) -> Option<&'static GameDefinition> {
     game_definitions()
         .iter()
         .find(|definition| definition.id.eq_ignore_ascii_case(game_id))
+}
+
+fn game_definition_by_steam_app_id(app_id: &str) -> Option<&'static GameDefinition> {
+    let app_id = app_id.trim();
+    if app_id.is_empty() {
+        return None;
+    }
+
+    game_definitions().iter().find(|definition| {
+        definition
+            .steam_app_ids
+            .iter()
+            .any(|known_id| known_id == app_id)
+    })
+}
+
+fn repair_profile_identity_from_steam_app_id(
+    root: &Path,
+    profile: &mut GameProfile,
+) -> Result<(), String> {
+    let Some(definition) = profile
+        .steam_app_id
+        .as_deref()
+        .and_then(game_definition_by_steam_app_id)
+    else {
+        return Ok(());
+    };
+
+    let mut changed = false;
+    if profile.game_id.as_deref() != Some(definition.id.as_str()) {
+        profile.game_id = Some(definition.id.clone());
+        changed = true;
+    }
+    if let Some(engine) = definition.engine.as_deref() {
+        if profile.engine != engine {
+            profile.engine = engine.to_string();
+            changed = true;
+        }
+    }
+    if profile.loader == "none" {
+        if let Some(loader) = definition.bootstrap_runtimes.first() {
+            profile.loader = loader.clone();
+            changed = true;
+        }
+    }
+
+    if changed {
+        profile.updated_at = now_string();
+        let profiles_file = profiles_path(root);
+        let mut profiles = read_store::<GameProfile>(&profiles_file).map_err(error_to_string)?;
+        let stored_profile = profiles
+            .items
+            .iter_mut()
+            .find(|stored| stored.id == profile.id)
+            .ok_or_else(|| format!("Profile not found: {}", profile.id))?;
+        *stored_profile = profile.clone();
+        write_store(&profiles_file, &profiles).map_err(error_to_string)?;
+    }
+
+    Ok(())
 }
 
 fn runtime_definitions() -> &'static [RuntimeDefinition] {
@@ -4601,6 +4749,7 @@ fn analyze_scanned_archive_with_identity(
         native_script_plan(&scanned, profile),
         ue4ss_plan(&scanned, profile),
         reframework_plan(&scanned, profile),
+        re_engine_native_plan(&scanned, profile),
         unreal_pak_plan(&scanned, profile),
         loose_files_plan(&scanned),
     ]
@@ -5098,6 +5247,59 @@ fn reframework_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<I
     })
 }
 
+fn re_engine_native_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<InstallPlan> {
+    let mappings = installable_files(&scanned.entries)
+        .into_iter()
+        .filter_map(|file| {
+            let target = re_engine_native_relative_path(&file.logical_path)?;
+            Some(mapping(
+                &file.path,
+                "game",
+                &target,
+                "Preserve the verified RE Engine natives asset layout.",
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    if mappings.is_empty() {
+        return None;
+    }
+
+    Some(InstallPlan {
+        adapter_id: "re-engine-native".to_string(),
+        adapter_name: "RE Engine Native Assets".to_string(),
+        confidence: if profile.engine == "re-engine" {
+            0.92
+        } else {
+            0.72
+        },
+        summary: format!(
+            "Install {} file(s) while preserving the RE Engine natives layout.",
+            mappings.len()
+        ),
+        mappings,
+        dependencies: Vec::new(),
+        warnings: Vec::new(),
+        requires_confirmation: false,
+    })
+}
+
+fn re_engine_native_relative_path(path: &str) -> Option<String> {
+    let normalized = normalize_archive_path(path);
+    let parts = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let natives_index = parts
+        .iter()
+        .position(|part| part.eq_ignore_ascii_case("natives"))?;
+    if natives_index + 1 >= parts.len() {
+        return None;
+    }
+
+    Some(parts[natives_index..].join("/"))
+}
+
 fn unreal_pak_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<InstallPlan> {
     let pak_files = installable_files(&scanned.entries)
         .into_iter()
@@ -5518,6 +5720,10 @@ fn incompatible_install_plan_reason(profile: &GameProfile, plan: &InstallPlan) -
             "REFramework mods are for RE Engine games, but this profile is detected as {}.",
             engine_label(&profile.engine)
         )),
+        "re-engine-native" if profile.engine != "re-engine" => Some(format!(
+            "RE Engine native asset mods are for RE Engine games, but this profile is detected as {}.",
+            engine_label(&profile.engine)
+        )),
         "bepinex" if !profile.engine.starts_with("unity") && !profile.loader.starts_with("bepinex") => {
             Some(format!(
                 "BepInEx mods are for Unity/BepInEx games, but this profile is detected as {} with {}.",
@@ -5611,6 +5817,7 @@ fn supported_adapters_for_detection(
     }
     if engine == "re-engine" || loader == "reframework" {
         push_unique_string_value(&mut adapters, "reframework");
+        push_unique_string_value(&mut adapters, "re-engine-native");
     }
     adapters
 }
@@ -5630,6 +5837,7 @@ fn adapter_display_name(adapter: &str) -> &str {
         "script-files" => "native script mods",
         "ue4ss" => "UE4SS mods",
         "reframework" => "REFramework mods",
+        "re-engine-native" => "RE Engine native asset mods",
         "unreal-pak" => "Unreal Pak mods",
         _ => adapter,
     }
@@ -13110,6 +13318,117 @@ mod tests {
         assert!(root.join("Hercules/Script/Mods").is_dir());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn steam_app_id_resolves_registered_game_before_file_signatures() {
+        let root = temp_game_dir("steam-id-mhwilds");
+        fs::create_dir_all(&root).unwrap();
+
+        let result = detect_game_setup_with_steam_app_id(&root, Some("2246340")).unwrap();
+
+        assert_eq!(result.game_id.as_deref(), Some("mhwilds"));
+        assert_eq!(result.engine, "re-engine");
+        assert_eq!(result.loader, "reframework");
+        assert_eq!(result.recommended_loader, "reframework");
+        assert!(!result.loader_installed);
+        assert!(result
+            .signals
+            .iter()
+            .any(|signal| signal.label == "Steam App ID match"));
+
+        let profile = GameProfile {
+            id: "profile-mhwilds".to_string(),
+            name: "Monster Hunter Wilds".to_string(),
+            game_path: root.to_string_lossy().to_string(),
+            game_id: result.game_id,
+            steam_app_id: Some("2246340".to_string()),
+            engine: result.engine,
+            loader: result.loader,
+            created_at: now_string(),
+            updated_at: now_string(),
+        };
+        let dependencies = profile_bootstrap_dependencies(&profile);
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].id, "runtime:reframework");
+        assert_eq!(dependencies[0].provider, "github-release");
+        assert_eq!(
+            dependencies[0].source.as_deref(),
+            Some("github-release:praydog/REFramework#MHWILDS.zip")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "live provider smoke test"]
+    fn live_mhwilds_reframework_bootstrap_installs_and_verifies_runtime() {
+        let root = temp_game_dir("live-mhwilds-bootstrap");
+        let store_root = root.join("store");
+        let game_root = root.join("game");
+        fs::create_dir_all(&store_root).unwrap();
+        fs::create_dir_all(&game_root).unwrap();
+        let mut profile = test_profile(
+            "mhwilds",
+            "Monster Hunter Wilds",
+            "re-engine",
+            "reframework",
+        );
+        profile.game_path = game_root.to_string_lossy().to_string();
+
+        let warnings = install_profile_bootstrap_dependencies(&store_root, &profile);
+        assert!(
+            runtime_installed(&profile, "reframework"),
+            "REFramework was not detected after bootstrap: {warnings:?}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn re_engine_native_assets_preserve_layout_and_strip_wrappers() {
+        let profile = test_profile(
+            "mhwilds",
+            "Monster Hunter Wilds",
+            "re-engine",
+            "reframework",
+        );
+        let scanned = ScannedArchive {
+            archive_path: "C:/Downloads/NativeAssets.zip".to_string(),
+            archive_name: "NativeAssets.zip".to_string(),
+            entries: vec![
+                ArchiveEntry {
+                    path: "Mod Wrapper/natives/STM/streaming/example.pak".to_string(),
+                    logical_path: "Mod Wrapper/natives/STM/streaming/example.pak".to_string(),
+                    size: 1,
+                    is_directory: false,
+                },
+                ArchiveEntry {
+                    path: "README.txt".to_string(),
+                    logical_path: "README.txt".to_string(),
+                    size: 1,
+                    is_directory: false,
+                },
+            ],
+            manifest: None,
+            package_identity: None,
+        };
+
+        let analysis = analyze_scanned_archive(scanned.clone(), &profile);
+        let plan = analysis.recommended_plan.unwrap();
+        assert_eq!(plan.adapter_id, "re-engine-native");
+        assert_eq!(plan.mappings.len(), 1);
+        assert_eq!(
+            plan.mappings[0].target_relative_path,
+            "natives/STM/streaming/example.pak"
+        );
+        assert!(plan.dependencies.is_empty());
+
+        let valheim = test_profile("valheim", "Valheim", "unity-mono", "bepinex");
+        let blocked = analyze_scanned_archive(scanned, &valheim);
+        assert!(blocked.recommended_plan.is_none());
+        assert_eq!(blocked.compatibility.status, "blocked");
+        assert!(blocked.compatibility.reason.contains("RE Engine"));
     }
 
     #[test]

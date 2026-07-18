@@ -1398,7 +1398,7 @@ svg {
   justify-content: space-between;
   gap: 20px;
   margin: -6px 0 14px;
-  padding-right: 0;
+  padding-right: 484px;
   cursor: default;
   user-select: none;
 }
@@ -1416,13 +1416,14 @@ svg {
 .health-panel {
   position: fixed;
   z-index: 35;
-  right: 24px;
-  bottom: 24px;
+  top: calc(var(--titlebar-height) + 14px);
+  right: 18px;
+  bottom: auto;
   display: grid;
   grid-template-columns: 42px minmax(110px, 1fr) minmax(0, 104px) auto;
   align-items: center;
   gap: 12px;
-  width: min(460px, calc(100vw - 48px));
+  width: min(460px, calc(100vw - 440px));
   min-height: 64px;
   border: 1px solid rgba(85, 185, 255, 0.28);
   border-radius: 8px;
@@ -3999,6 +4000,19 @@ code {
   .settings-grid,
   .context-strip {
     grid-template-columns: 1fr;
+  }
+
+  .topbar {
+    padding-right: 404px;
+  }
+
+  .health-panel {
+    grid-template-columns: 42px minmax(100px, 1fr) auto;
+    width: min(380px, calc(100vw - 440px));
+  }
+
+  .health-status {
+    display: none;
   }
 
   .profile-command-panel,

@@ -23,6 +23,7 @@ export type AdapterId =
   | "bepinex"
   | "ue4ss"
   | "reframework"
+  | "re-engine-native"
   | "unreal-pak"
   | "loose-files"
   | "script-files";
