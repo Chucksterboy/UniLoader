@@ -15,6 +15,11 @@
         "provider": "thunderstore",
         "namespacePatterns": ["*"],
         "packagePatterns": ["BepInEx", "BepInExPack", "BepInExPack_*", "*_BepInExPack"]
+      },
+      {
+        "provider": "nexus",
+        "namespacePatterns": [],
+        "packagePatterns": ["BepInEx", "BepInEx Pack", "BepInExPack", "BepInExPack *", "BepInEx Pack *"]
       }
     ],
     "detectionRules": [
@@ -42,6 +47,11 @@
         "provider": "thunderstore",
         "namespacePatterns": ["*"],
         "packagePatterns": ["BepInEx", "BepInExPack", "BepInExPack_*", "*_BepInExPack"]
+      },
+      {
+        "provider": "nexus",
+        "namespacePatterns": [],
+        "packagePatterns": ["BepInEx", "BepInEx Pack", "BepInExPack", "BepInExPack *", "BepInEx Pack *"]
       }
     ],
     "detectionRules": [
@@ -75,6 +85,11 @@
         "provider": "thunderstore",
         "namespacePatterns": ["*"],
         "packagePatterns": ["UE4SS", "RE-UE4SS", "RE_UE4SS", "UE4SSLoader", "UE4SSRuntime"]
+      },
+      {
+        "provider": "nexus",
+        "namespacePatterns": [],
+        "packagePatterns": ["UE4SS", "RE-UE4SS", "RE UE4SS", "UE4SS Loader", "UE4SS Runtime"]
       }
     ],
     "detectionRules": [
@@ -99,6 +114,11 @@
         "provider": "thunderstore",
         "namespacePatterns": ["*"],
         "packagePatterns": ["REFramework", "REFrameworkRuntime"]
+      },
+      {
+        "provider": "nexus",
+        "namespacePatterns": [],
+        "packagePatterns": ["REFramework", "REFramework Runtime"]
       }
     ],
     "detectionRules": [

@@ -190,6 +190,12 @@ export interface InstallResult {
   warnings: string[];
 }
 
+export interface InstallPreflightResult {
+  dependencies: DependencySpec[];
+  missingDependencies: DependencySpec[];
+  confirmationRequired: boolean;
+}
+
 export interface NexusNxmInstallResult {
   modId: string;
   installResult: InstallResult;
@@ -210,6 +216,8 @@ export interface InstalledModRecord {
   backupsWritten: string[];
   dependencies: DependencySpec[];
   configFiles: string[];
+  runtimeId?: string;
+  externallyManaged: boolean;
   enabled: boolean;
   lastStatus: "installed" | "disabled" | "removed" | "failed";
   plan?: InstallPlan;
@@ -427,6 +435,10 @@ export interface DesktopApi {
     profileId: string,
     mod: OnlineModRecord
   ): Promise<OnlineModFileOption[]>;
+  preflightDiscoveredModInstall(
+    profileId: string,
+    mod: OnlineModRecord
+  ): Promise<InstallPreflightResult>;
   installDiscoveredMod(
     profileId: string,
     mod: OnlineModRecord,
@@ -437,6 +449,7 @@ export interface DesktopApi {
     mod: OnlineModRecord,
     file: OnlineModFileOption
   ): Promise<string>;
+  beginNexusRequirementDownload(profileId: string, dependencyId: string): Promise<string>;
   installNexusNxmLink(nxmUrl: string): Promise<NexusNxmInstallResult>;
   listInstalledMods(profileId: string): Promise<InstalledModRecord[]>;
   getModConfigDetails(profileId: string, installedModId: string): Promise<ModConfigFile[]>;

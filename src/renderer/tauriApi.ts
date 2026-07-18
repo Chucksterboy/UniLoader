@@ -12,6 +12,7 @@ import {
   DiscoveryPage,
   InstalledModRecord,
   InstallRequest,
+  InstallPreflightResult,
   InstallResult,
   ModConfigFile,
   ModActionResult,
@@ -172,6 +173,12 @@ export const desktopApi: DesktopApi = {
       modId: mod.id,
       providerGameId: mod.providerGameId
     }),
+  preflightDiscoveredModInstall: (profileId: string, mod: OnlineModRecord) =>
+    invoke<InstallPreflightResult>("preflight_discovered_mod_install", {
+      profileId,
+      provider: mod.provider,
+      modId: mod.id
+    }),
   installDiscoveredMod: (
     profileId: string,
     mod: OnlineModRecord,
@@ -197,6 +204,8 @@ export const desktopApi: DesktopApi = {
       providerGameId: mod.providerGameId,
       selectedFileId: file.id
     }),
+  beginNexusRequirementDownload: (profileId: string, dependencyId: string) =>
+    invoke<string>("begin_nexus_requirement_download", { profileId, dependencyId }),
   installNexusNxmLink: (nxmUrl: string) =>
     invoke<NexusNxmInstallResult>("install_nexus_nxm_link", { nxmUrl }),
   listInstalledMods: (profileId: string) =>

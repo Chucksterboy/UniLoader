@@ -8,7 +8,6 @@ import {
   Database,
   Download,
   ExternalLink,
-  FolderCog,
   FolderOpen,
   Gamepad2,
   Heart,
@@ -33,7 +32,6 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getVersion } from "@tauri-apps/api/app";
 import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import {
-  FormEvent,
   useEffect,
   useMemo,
   useRef,
@@ -45,10 +43,12 @@ import {
   ArchiveAnalysis,
   DiscoveryPage,
   CreateProfileInput,
+  DependencySpec,
   GameDetectionResult,
   GameProfile,
   InstalledModRecord,
   InstallPlan,
+  InstallPreflightResult,
   ModConfigEntry,
   ModConfigFile,
   OnlineModFileOption,
@@ -80,9 +80,14 @@ type ViewMode = "manager" | "discover" | "transfer" | "settings";
 type ModSortMode = "newest" | "oldest";
 type OnlineSortMode = "downloads" | "newest" | "oldest";
 type TransferMode = "import" | "export" | null;
-type ProfileCreationMode = "steam" | "manual";
 type NoticeKind = "success" | "warning" | "error";
 type StartupSplashPhase = "intro" | "exiting" | "hidden";
+
+interface PendingDependencyPrompt {
+  mod: OnlineModRecord;
+  file?: OnlineModFileOption;
+  preflight: InstallPreflightResult;
+}
 
 interface Notice {
   motionId: number;
@@ -155,14 +160,12 @@ export function App() {
   const [isDownloadingUpdate, setIsDownloadingUpdate] = useState(false);
   const [isTransferringProfile, setIsTransferringProfile] = useState(false);
   const [isScanningSteamGames, setIsScanningSteamGames] = useState(false);
-  const [isCreatingProfile, setIsCreatingProfile] = useState(false);
   const [isCreatingSteamProfile, setIsCreatingSteamProfile] = useState(false);
   const [isLaunchingGame, setIsLaunchingGame] = useState(false);
   const [isTogglingAllMods, setIsTogglingAllMods] = useState(false);
   const [steamGames, setSteamGames] = useState<SteamGameRecord[]>([]);
   const [selectedSteamGameAppId, setSelectedSteamGameAppId] = useState("");
   const [profileCreatorOpen, setProfileCreatorOpen] = useState(false);
-  const [profileCreationMode, setProfileCreationMode] = useState<ProfileCreationMode>("steam");
   const [steamGameSearch, setSteamGameSearch] = useState("");
   const [status, setStatus] = useState<string>("Ready");
   const [notice, setNoticeState] = useState<Notice | null>(null);
@@ -170,6 +173,8 @@ export function App() {
   const [configModal, setConfigModal] = useState<ConfigModalState | null>(null);
   const [profilePendingRename, setProfilePendingRename] = useState<GameProfile | null>(null);
   const [profilePendingRemoval, setProfilePendingRemoval] = useState<GameProfile | null>(null);
+  const [pendingDependencyPrompt, setPendingDependencyPrompt] =
+    useState<PendingDependencyPrompt | null>(null);
   const [error, setErrorState] = useState<string>("");
   const [errorMotionId, setErrorMotionId] = useState(0);
   const noticeSequence = useRef(0);
@@ -202,13 +207,17 @@ export function App() {
   const configModalPresence = useFadePresence(configModal);
   const profileRenamePresence = useFadePresence(profilePendingRename);
   const profileRemovalPresence = useFadePresence(profilePendingRemoval);
+  const dependencyPromptPresence = useFadePresence(pendingDependencyPrompt);
   const profileCreatorPresence = useFadePresence(profileCreatorOpen ? true : null);
-  const profileCreationModeMotion = useFadeSwitch(profileCreationMode, 140);
   const noticePresence = useFadePresence(notice, 140);
   const errorPresence = useFadePresence(error ? error : null, 140);
   const selectedProfile = useMemo(
     () => profiles.find((profile) => profile.id === selectedProfileId),
     [profiles, selectedProfileId]
+  );
+  const discoveryProfiles = useMemo(
+    () => profiles.filter((profile) => Boolean(profile.steamAppId)),
+    [profiles]
   );
   const sortedInstalledMods = useMemo(
     () =>
@@ -362,11 +371,18 @@ export function App() {
     }
 
     setDiscoverProfileId((current) =>
-      current && profiles.some((profile) => profile.id === current)
+      current && discoveryProfiles.some((profile) => profile.id === current)
         ? current
-        : selectedProfileId || profiles[0]?.id || ""
+        : selectedProfile?.steamAppId
+          ? selectedProfileId
+          : discoveryProfiles[0]?.id || ""
     );
-  }, [activeView, profiles, selectedProfileId]);
+  }, [
+    activeView,
+    discoveryProfiles,
+    selectedProfile?.steamAppId,
+    selectedProfileId
+  ]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -409,7 +425,7 @@ export function App() {
         setNotice({
           kind: "warning",
           title: "Drag and drop unavailable",
-          detail: "Use the Choose ZIP button to import mods."
+          detail: "Use Choose File to import a local mod."
         });
       });
 
@@ -716,62 +732,7 @@ export function App() {
     }
   }
 
-  async function selectGameFolder() {
-    const folder = await api.selectGameFolder();
-    if (!folder) {
-      return;
-    }
-
-    setProfileInput((current) => ({
-      ...current,
-      gamePath: folder,
-      name: current.name || getFolderName(folder),
-      gameId: undefined,
-      steamAppId: undefined,
-      engine: "unknown",
-      loader: "none"
-    }));
-    setSelectedSteamGameAppId("");
-    setDetection(null);
-    setIsDetecting(true);
-    setStatus("Detecting game setup");
-    setError("");
-
-    try {
-      const detectedSetup = await api.detectGameSetup(folder);
-      setDetection(detectedSetup);
-      setProfileInput((current) => ({
-        ...current,
-        gameId: detectedSetup.gameId,
-        engine: detectedSetup.engine,
-        loader: detectedSetup.loader
-      }));
-      const issue = getDetectionIssue(detectedSetup);
-      setStatus(issue ? "Detection needs review" : "Game folder ready");
-      setNotice(
-        issue
-          ? {
-              kind: "warning",
-              title: "Detection needs review",
-              detail: issue
-            }
-          : {
-              kind: "success",
-              title: "Game folder ready",
-              detail: detectionRouteDetail(detectedSetup)
-            }
-      );
-    } catch (caughtError) {
-      setProfileInput((current) => ({ ...current, engine: "unknown", loader: "none" }));
-      setError(String(caughtError));
-      setStatus("Detection failed");
-    } finally {
-      setIsDetecting(false);
-    }
-  }
-
   function openProfileCreator() {
-    setProfileCreationMode("steam");
     setProfileInput(emptyProfileInput);
     setDetection(null);
     setSelectedSteamGameAppId("");
@@ -783,77 +744,10 @@ export function App() {
   }
 
   function closeProfileCreator() {
-    if (isCreatingProfile || isCreatingSteamProfile) {
+    if (isCreatingSteamProfile) {
       return;
     }
     setProfileCreatorOpen(false);
-    setProfileCreationMode("steam");
-  }
-
-  function changeProfileCreationMode(mode: ProfileCreationMode) {
-    if (mode === profileCreationMode) {
-      return;
-    }
-    setProfileCreationMode(mode);
-    setProfileInput(emptyProfileInput);
-    setDetection(null);
-    setSelectedSteamGameAppId("");
-    setSteamGameSearch("");
-    if (mode === "steam" && steamGames.length === 0 && !isScanningSteamGames) {
-      void scanSteamGames();
-    }
-  }
-
-  async function createProfile(event: FormEvent) {
-    event.preventDefault();
-    setError("");
-    setIsCreatingProfile(true);
-    setStatus("Creating profile");
-
-    try {
-      const profile = await api.createProfile(profileInput);
-      setProfiles((current) => [...current, profile]);
-      setSelectedProfileId(profile.id);
-      setProfileInput(emptyProfileInput);
-      setDetection(null);
-      setAnalysis(null);
-      setStatus("Installing profile dependencies");
-      let dependencyDetail = "";
-      let dependencyWarnings: string[] = [];
-      try {
-        const dependencyResult = await api.bootstrapProfileDependencies(profile.id);
-        await refreshInstalledMods(profile.id);
-        if (dependencyResult.installedDependencies.length > 0) {
-          dependencyDetail = ` Installed ${dependencyResult.installedDependencies.length} profile dependenc${dependencyResult.installedDependencies.length === 1 ? "y" : "ies"} automatically.`;
-        } else if (dependencyResult.skippedDependencies.length > 0) {
-          dependencyDetail = " Profile dependencies were already installed.";
-        }
-        dependencyWarnings = actionableDependencyWarnings(dependencyResult.warnings);
-      } catch (caughtError) {
-        dependencyWarnings = [String(caughtError)];
-      }
-      setNotice({
-        kind:
-          profile.engine === "unknown" || profile.loader === "none" || dependencyWarnings.length > 0
-            ? "warning"
-            : "success",
-        title: "Profile created",
-        detail:
-          profile.engine === "unknown" || profile.loader === "none"
-            ? "UniLoader saved the profile, but mod installs may need manual review if detection remains unclear."
-            : `Drop a mod archive into the workspace to install it.${dependencyDetail}${
-                dependencyWarnings.length > 0 ? ` ${dependencyWarnings[0]}` : ""
-              }`
-      });
-      setStatus("Profile created");
-      setProfileCreatorOpen(false);
-      setProfileCreationMode("steam");
-    } catch (caughtError) {
-      setError(String(caughtError));
-      setStatus("Profile failed");
-    } finally {
-      setIsCreatingProfile(false);
-    }
   }
 
   async function renameProfile(profile: GameProfile, name: string) {
@@ -940,43 +834,6 @@ export function App() {
       setNotice({
         kind: "error",
         title: "Open folder failed",
-        detail: String(caughtError)
-      });
-    }
-  }
-
-  async function reselectProfileGameFolder(profile: GameProfile) {
-    const folder = await api.selectGameFolder();
-    if (!folder) {
-      return;
-    }
-
-    setError("");
-    setStatus("Updating game folder");
-    try {
-      const result = await api.updateProfileGameFolder(profile.id, folder);
-      setProfiles((current) =>
-        current.map((item) => (item.id === result.profile.id ? result.profile : item))
-      );
-      if (selectedProfileId === result.profile.id) {
-        setInstalledMods(result.installedMods);
-        setDetection(result.detection);
-        setAnalysis(null);
-      }
-      setStatus(result.warnings.length > 0 ? "Needs attention" : "Game folder updated");
-      setNotice({
-        kind: result.warnings.length > 0 ? "warning" : "success",
-        title: "Game folder updated",
-        detail:
-          result.warnings[0] ??
-          `Redeployed ${result.deployedFiles.length} file(s) into the selected game folder.`
-      });
-    } catch (caughtError) {
-      setError(String(caughtError));
-      setStatus("Folder update failed");
-      setNotice({
-        kind: "error",
-        title: "Folder update failed",
         detail: String(caughtError)
       });
     }
@@ -1086,7 +943,6 @@ export function App() {
     if (existingProfile) {
       setSelectedProfileId(existingProfile.id);
       setProfileCreatorOpen(false);
-      setProfileCreationMode("steam");
       setNotice({
         kind: "warning",
         title: "Profile already exists",
@@ -1136,7 +992,6 @@ export function App() {
               }`
       });
       setProfileCreatorOpen(false);
-      setProfileCreationMode("steam");
     } catch (caughtError) {
       setError(String(caughtError));
       setStatus("Steam profile failed");
@@ -1365,7 +1220,11 @@ export function App() {
     return api.listDiscoveredModFiles(discoverProfileId, mod);
   }
 
-  async function installOnlineMod(mod: OnlineModRecord, file?: OnlineModFileOption) {
+  async function installOnlineMod(
+    mod: OnlineModRecord,
+    file?: OnlineModFileOption,
+    skipDependencyPrompt = false
+  ) {
     if (!discoverProfileId) {
       setNotice({
         kind: "warning",
@@ -1373,6 +1232,26 @@ export function App() {
         detail: "Choose the profile you want to install this mod into."
       });
       return;
+    }
+
+    if (mod.provider === "nexus" && !skipDependencyPrompt) {
+      try {
+        const preflight = await api.preflightDiscoveredModInstall(discoverProfileId, mod);
+        if (preflight.confirmationRequired) {
+          setPendingDependencyPrompt({ mod, file, preflight });
+          setStatus("Dependency confirmation needed");
+          return;
+        }
+      } catch (caughtError) {
+        setError(String(caughtError));
+        setStatus("Dependency check failed");
+        setNotice({
+          kind: "error",
+          title: "Could not verify requirements",
+          detail: String(caughtError)
+        });
+        return;
+      }
     }
 
     if (file?.action === "browser") {
@@ -1443,6 +1322,54 @@ export function App() {
     } finally {
       setInstallingOnlineModId("");
     }
+  }
+
+  async function confirmDependencyInstall(prompt: PendingDependencyPrompt) {
+    const missingNexusDependency = prompt.preflight.missingDependencies.find(
+      (dependency) => dependency.provider === "nexus"
+    );
+    const missingManualDependency = prompt.preflight.missingDependencies.find(
+      (dependency) => dependency.provider === "manual"
+    );
+    setPendingDependencyPrompt(null);
+
+    if (missingManualDependency?.source) {
+      await openExternalUrl(missingManualDependency.source);
+      setStatus("External requirement opened");
+      setNotice({
+        kind: "warning",
+        title: "Install the required component",
+        detail: `${missingManualDependency.name} is hosted outside Nexus. Install it, then retry the mod.`
+      });
+      return;
+    }
+
+    if (prompt.file?.action === "browser" && missingNexusDependency) {
+      try {
+        const downloadPageUrl = await api.beginNexusRequirementDownload(
+          discoverProfileId,
+          missingNexusDependency.id
+        );
+        await openExternalUrl(downloadPageUrl);
+        setStatus("Waiting for Nexus requirement");
+        setNotice({
+          kind: "warning",
+          title: `Required: ${missingNexusDependency.name}`,
+          detail: "Click Slow download, then Open via UniLoader. Retry the original mod after this requirement installs."
+        });
+      } catch (caughtError) {
+        setError(String(caughtError));
+        setStatus("Requirement handoff failed");
+        setNotice({
+          kind: "error",
+          title: "Could not start requirement download",
+          detail: String(caughtError)
+        });
+      }
+      return;
+    }
+
+    await installOnlineMod(prompt.mod, prompt.file, true);
   }
 
   function openNexusAuthSettings() {
@@ -1694,6 +1621,7 @@ export function App() {
 
   const profileToRename = profileRenamePresence.value;
   const profileToRemove = profileRemovalPresence.value;
+  const dependencyPrompt = dependencyPromptPresence.value;
 
   return (
     <>
@@ -1742,14 +1670,6 @@ export function App() {
           >
             <Settings2 size={18} />
           </button>
-          <button
-            className={activeView === "transfer" ? "rail-button active" : "rail-button"}
-            onClick={() => setActiveView("transfer")}
-            title="Import / export profiles"
-            type="button"
-          >
-            <Upload size={18} />
-          </button>
         </nav>
         <div className="rail-footer">
           <UpdateRailIndicator
@@ -1786,7 +1706,11 @@ export function App() {
             {profiles.map((profile) => {
               const isSelected = profile.id === selectedProfileId;
               const isExpanded = profile.id === expandedProfileId;
-              const needsReview = profile.engine === "unknown" || profile.loader === "none";
+              const profileStatus = profile.engine === "unknown"
+                ? "Game not identified"
+                : profile.loader === "none" && profile.engine !== "unreal"
+                  ? "Loader not detected"
+                  : "Ready";
               return (
                 <div
                   className={`profile${isSelected ? " active" : ""}${isExpanded ? " expanded" : ""}`}
@@ -1810,7 +1734,7 @@ export function App() {
                     <ProfileArtwork profile={profile} />
                     <span className="profile-copy">
                       <strong>{profile.name}</strong>
-                      <small>{needsReview ? "Needs review" : "Ready"}</small>
+                      <small>{profileStatus}</small>
                     </span>
                     <span className="profile-chevron" aria-hidden="true">
                       {isExpanded ? <ChevronUp size={18} /> : <ChevronDown size={18} />}
@@ -1833,14 +1757,6 @@ export function App() {
                         >
                           <FolderOpen size={15} />
                           <span>Open Folder</span>
-                        </button>
-                        <button
-                          className="select-folder"
-                          onClick={() => void reselectProfileGameFolder(profile)}
-                          type="button"
-                        >
-                          <FolderCog size={15} />
-                          <span>Change Folder</span>
                         </button>
                         <button
                           className="remove"
@@ -2079,7 +1995,7 @@ export function App() {
           <TransferView
             isBusy={isTransferringProfile}
             mode={transferMode}
-            profiles={profiles}
+            profiles={discoveryProfiles}
             selectedProfileId={selectedProfileId}
             onExport={(profileId) => void exportProfileBundle(profileId)}
             onImport={() => void importProfileBundle()}
@@ -2127,25 +2043,16 @@ export function App() {
         detection={detection}
         detectionIssue={detectionIssue}
         filteredSteamGames={filteredSteamGames}
-        isCreatingProfile={isCreatingProfile}
         isCreatingSteamProfile={isCreatingSteamProfile}
         isDetecting={isDetecting}
         isScanningSteamGames={isScanningSteamGames}
-        mode={profileCreationModeMotion.value}
-        modeMotionClassName={profileCreationModeMotion.className}
         motionClassName={profileCreatorPresence.className}
         profileInput={profileInput}
         selectedSteamGameAppId={selectedSteamGameAppId}
         steamGameSearch={steamGameSearch}
         steamGamesCount={steamGames.length}
         onCancel={closeProfileCreator}
-        onChangeMode={changeProfileCreationMode}
-        onChangeName={(name) =>
-          setProfileInput((current) => ({ ...current, name }))
-        }
         onChangeSteamSearch={setSteamGameSearch}
-        onChooseFolder={() => void selectGameFolder()}
-        onCreateManual={createProfile}
         onCreateSteam={() => void createSelectedSteamProfile()}
         onScanSteam={() => void scanSteamGames()}
         onSelectSteamGame={(appId) => void selectSteamGameForProfile(appId)}
@@ -2173,6 +2080,15 @@ export function App() {
         profile={profileToRemove}
         onCancel={() => setProfilePendingRemoval(null)}
         onConfirm={() => void removeProfile(profileToRemove)}
+      />
+    ) : null}
+    {dependencyPrompt ? (
+      <DependencyInstallDialog
+        missingDependencies={dependencyPrompt.preflight.missingDependencies}
+        modName={dependencyPrompt.mod.name}
+        motionClassName={dependencyPromptPresence.className}
+        onCancel={() => setPendingDependencyPrompt(null)}
+        onConfirm={() => void confirmDependencyInstall(dependencyPrompt)}
       />
     ) : null}
     </>
@@ -2252,23 +2168,16 @@ interface ProfileCreatorDialogProps {
   detection: GameDetectionResult | null;
   detectionIssue: string;
   filteredSteamGames: SteamGameRecord[];
-  isCreatingProfile: boolean;
   isCreatingSteamProfile: boolean;
   isDetecting: boolean;
   isScanningSteamGames: boolean;
-  mode: ProfileCreationMode;
-  modeMotionClassName: string;
   motionClassName: string;
   profileInput: CreateProfileInput;
   selectedSteamGameAppId: string;
   steamGameSearch: string;
   steamGamesCount: number;
   onCancel(): void;
-  onChangeMode(mode: ProfileCreationMode): void;
-  onChangeName(name: string): void;
   onChangeSteamSearch(value: string): void;
-  onChooseFolder(): void;
-  onCreateManual(event: FormEvent): void;
   onCreateSteam(): void;
   onScanSteam(): void;
   onSelectSteamGame(appId: string): void;
@@ -2278,30 +2187,21 @@ function ProfileCreatorDialog({
   detection,
   detectionIssue,
   filteredSteamGames,
-  isCreatingProfile,
   isCreatingSteamProfile,
   isDetecting,
   isScanningSteamGames,
-  mode,
-  modeMotionClassName,
   motionClassName,
   profileInput,
   selectedSteamGameAppId,
   steamGameSearch,
   steamGamesCount,
   onCancel,
-  onChangeMode,
-  onChangeName,
   onChangeSteamSearch,
-  onChooseFolder,
-  onCreateManual,
   onCreateSteam,
   onScanSteam,
   onSelectSteamGame
 }: ProfileCreatorDialogProps) {
-  const isBusy = isCreatingProfile || isCreatingSteamProfile;
-  const canCreateManual =
-    profileInput.name.trim().length > 0 && profileInput.gamePath.length > 0 && !isDetecting;
+  const isBusy = isCreatingSteamProfile;
   const canCreateSteam = selectedSteamGameAppId.length > 0 && !isDetecting;
 
   return (
@@ -2309,13 +2209,9 @@ function ProfileCreatorDialog({
       <form
         aria-label="Create game profile"
         aria-modal="true"
-        className="profile-creator-modal"
+        className="profile-creator-modal steam-only"
         onMouseDown={(event) => event.stopPropagation()}
         onSubmit={(event) => {
-          if (mode === "manual") {
-            onCreateManual(event);
-            return;
-          }
           event.preventDefault();
           if (canCreateSteam) {
             onCreateSteam();
@@ -2345,115 +2241,61 @@ function ProfileCreatorDialog({
           </button>
         </header>
 
-        <div className="profile-source-tabs" role="tablist" aria-label="Profile source">
-          <button
-            aria-selected={mode === "steam"}
-            className={mode === "steam" ? "active" : ""}
-            onClick={() => onChangeMode("steam")}
-            role="tab"
-            type="button"
-          >
-            <Gamepad2 size={17} />
-            Steam Game
-          </button>
-          <button
-            aria-selected={mode === "manual"}
-            className={mode === "manual" ? "active" : ""}
-            onClick={() => onChangeMode("manual")}
-            role="tab"
-            type="button"
-          >
-            <FolderOpen size={17} />
-            Choose Folder
-          </button>
-        </div>
-
-        <div className={`profile-creator-content view-motion ${modeMotionClassName}`}>
-          {mode === "steam" ? (
-            <div className="steam-creator-flow">
-              <div className="steam-creator-toolbar">
-                <label className="search-field">
-                  <Search size={16} />
-                  <input
-                    autoFocus
-                    onChange={(event) => onChangeSteamSearch(event.target.value)}
-                    placeholder="Search installed Steam games"
-                    value={steamGameSearch}
-                  />
-                </label>
-                <button
-                  aria-label="Scan Steam games"
-                  className="icon-button steam-scan-button"
-                  disabled={isScanningSteamGames}
-                  onClick={onScanSteam}
-                  title="Scan Steam games"
-                  type="button"
-                >
-                  <RefreshCw className={isScanningSteamGames ? "spin-icon" : ""} size={17} />
-                </button>
-              </div>
-
-              <div className="steam-creator-list" aria-label="Installed Steam games">
-                {isScanningSteamGames && steamGamesCount === 0 ? (
-                  <div className="profile-creator-empty">Scanning Steam libraries...</div>
-                ) : null}
-                {!isScanningSteamGames && steamGamesCount === 0 ? (
-                  <div className="profile-creator-empty">
-                    No installed Steam games were found. Rescan or use Choose Folder.
-                  </div>
-                ) : null}
-                {steamGamesCount > 0 && filteredSteamGames.length === 0 ? (
-                  <div className="profile-creator-empty">No installed games match this search.</div>
-                ) : null}
-                {filteredSteamGames.map((game) => (
-                  <button
-                    aria-pressed={selectedSteamGameAppId === game.appId}
-                    className={
-                      selectedSteamGameAppId === game.appId
-                        ? "steam-creator-game selected"
-                        : "steam-creator-game"
-                    }
-                    key={game.appId}
-                    onClick={() => onSelectSteamGame(game.appId)}
-                    type="button"
-                  >
-                    <span>
-                      <strong>{game.name}</strong>
-                      <small title={game.installDir}>{game.installDir}</small>
-                    </span>
-                    <CheckCircle2 size={17} />
-                  </button>
-                ))}
-              </div>
-            </div>
-          ) : (
-            <div className="manual-creator-flow">
-              <label>
-                Game name
+        <div className="profile-creator-content">
+          <div className="steam-creator-flow">
+            <div className="steam-creator-toolbar">
+              <label className="search-field">
+                <Search size={16} />
                 <input
                   autoFocus
-                  onChange={(event) => onChangeName(event.target.value)}
-                  placeholder="Game name"
-                  value={profileInput.name}
+                  onChange={(event) => onChangeSteamSearch(event.target.value)}
+                  placeholder="Search installed Steam games"
+                  value={steamGameSearch}
                 />
               </label>
-              <label>
-                Main game folder
-                <div className="folder-input">
-                  <input readOnly value={profileInput.gamePath} placeholder="Select game folder" />
-                  <button
-                    aria-label="Select main game folder"
-                    className="icon-button"
-                    onClick={onChooseFolder}
-                    title="Select folder"
-                    type="button"
-                  >
-                    <FolderOpen size={17} />
-                  </button>
-                </div>
-              </label>
+              <button
+                aria-label="Scan Steam games"
+                className="icon-button steam-scan-button"
+                disabled={isScanningSteamGames}
+                onClick={onScanSteam}
+                title="Scan Steam games"
+                type="button"
+              >
+                <RefreshCw className={isScanningSteamGames ? "spin-icon" : ""} size={17} />
+              </button>
             </div>
-          )}
+
+            <div className="steam-creator-list" aria-label="Installed Steam games">
+              {isScanningSteamGames && steamGamesCount === 0 ? (
+                <div className="profile-creator-empty">Scanning Steam libraries...</div>
+              ) : null}
+              {!isScanningSteamGames && steamGamesCount === 0 ? (
+                <div className="profile-creator-empty">No installed Steam games were found.</div>
+              ) : null}
+              {steamGamesCount > 0 && filteredSteamGames.length === 0 ? (
+                <div className="profile-creator-empty">No installed games match this search.</div>
+              ) : null}
+              {filteredSteamGames.map((game) => (
+                <button
+                  aria-pressed={selectedSteamGameAppId === game.appId}
+                  className={
+                    selectedSteamGameAppId === game.appId
+                      ? "steam-creator-game selected"
+                      : "steam-creator-game"
+                  }
+                  key={game.appId}
+                  onClick={() => onSelectSteamGame(game.appId)}
+                  type="button"
+                >
+                  <span>
+                    <strong>{game.name}</strong>
+                    <small title={game.installDir}>{game.installDir}</small>
+                  </span>
+                  <CheckCircle2 size={17} />
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
 
         <section className="profile-detection-preview" aria-label="Profile detection preview">
@@ -2461,7 +2303,7 @@ function ProfileCreatorDialog({
             <span>Selected game</span>
             <strong>{profileInput.name || "Waiting for selection"}</strong>
             <small title={profileInput.gamePath}>
-              {profileInput.gamePath || "Choose an installed game or main game folder."}
+              {profileInput.gamePath || "Choose an installed Steam game."}
             </small>
           </div>
           <DetectionWarning
@@ -2477,9 +2319,7 @@ function ProfileCreatorDialog({
           </button>
           <button
             className="primary-button compact-button"
-            disabled={
-              isBusy || (mode === "steam" ? !canCreateSteam : !canCreateManual)
-            }
+            disabled={isBusy || !canCreateSteam}
             type="submit"
           >
             <PackagePlus size={16} />
@@ -2593,6 +2433,58 @@ function ProfileRemovalDialog({
           </button>
           <button className="danger-button compact-button" onClick={onConfirm} type="button">
             Remove
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+interface DependencyInstallDialogProps {
+  missingDependencies: DependencySpec[];
+  modName: string;
+  motionClassName: string;
+  onCancel(): void;
+  onConfirm(): void;
+}
+
+function DependencyInstallDialog({
+  missingDependencies,
+  modName,
+  motionClassName,
+  onCancel,
+  onConfirm
+}: DependencyInstallDialogProps) {
+  return (
+    <div className={`modal-backdrop ${motionClassName}`} onMouseDown={onCancel}>
+      <section
+        aria-label={`Install requirements for ${modName}`}
+        className="confirm-modal dependency-confirm-modal"
+        onMouseDown={(event) => event.stopPropagation()}
+        role="dialog"
+      >
+        <div className="confirm-icon dependency-confirm-icon">
+          <PackagePlus size={22} />
+        </div>
+        <div className="confirm-copy">
+          <p className="eyebrow">Required Components</p>
+          <h3>{modName}</h3>
+          <p>UniLoader checked this profile first. These required components are still missing:</p>
+          <div className="dependency-confirm-list">
+            {missingDependencies.map((dependency) => (
+              <div className="dependency-confirm-item" key={dependency.id}>
+                <strong>{dependency.name}</strong>
+                <span>{dependency.provider === "nexus" ? "Nexus Mods" : "External source"}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="confirm-actions">
+          <button className="secondary-button compact-button" onClick={onCancel} type="button">
+            Cancel
+          </button>
+          <button className="primary-button compact-button" onClick={onConfirm} type="button">
+            Install Requirements
           </button>
         </div>
       </section>
@@ -3862,7 +3754,7 @@ function DetectionWarning({ detection, detectionIssue, isDetecting }: DetectionW
   if (!detection) {
     return (
       <div className="detection-card muted-card">
-        UniLoader will detect the game setup after folder selection.
+        UniLoader will detect the game setup after Steam game selection.
       </div>
     );
   }
@@ -4277,10 +4169,11 @@ function ModCard({ mod, onConfigure, onEnable, onDisable, onRemove }: ModCardPro
   const configFiles = mod.configFiles ?? [];
   const dependencies = mod.dependencies ?? [];
   const modName = displayModName(mod);
+  const isRuntime = Boolean(mod.runtimeId);
   const [showExtraDetails, setShowExtraDetails] = useState(false);
 
   return (
-    <article className={`mod-card ${mod.enabled ? "enabled" : "disabled"}`}>
+    <article className={`mod-card ${mod.enabled ? "enabled" : "disabled"}${isRuntime ? " runtime" : ""}`}>
       <div className="mod-card-header">
         <div className="mod-card-title">
           <strong title={mod.archiveName}>{modName}</strong>
@@ -4294,7 +4187,7 @@ function ModCard({ mod, onConfigure, onEnable, onDisable, onRemove }: ModCardPro
               type="checkbox"
             />
           </label>
-          <small>{mod.enabled ? "Enabled" : "Disabled"}</small>
+          <small>{isRuntime ? "System Runtime" : mod.enabled ? "Enabled" : "Disabled"}</small>
         </div>
       </div>
 
@@ -4304,6 +4197,9 @@ function ModCard({ mod, onConfigure, onEnable, onDisable, onRemove }: ModCardPro
           <div className="mod-meta">
             <span>{mod.adapterId}</span>
             <span>{mod.filesWritten.length} file(s)</span>
+            {isRuntime ? (
+              <span>{mod.externallyManaged ? "Detected in game folder" : "Managed by UniLoader"}</span>
+            ) : null}
           </div>
         </div>
       ) : null}
@@ -4323,7 +4219,12 @@ function ModCard({ mod, onConfigure, onEnable, onDisable, onRemove }: ModCardPro
             Configure
           </button>
         ) : null}
-        {mod.enabled ? (
+        {isRuntime ? (
+          <span className="runtime-protected" title="Required runtimes are protected so installed mods keep working.">
+            <ShieldCheck size={15} />
+            Protected
+          </span>
+        ) : mod.enabled ? (
           <button className="secondary-button compact-button" onClick={onDisable}>
             <PowerOff size={15} />
             Disable
@@ -4334,10 +4235,12 @@ function ModCard({ mod, onConfigure, onEnable, onDisable, onRemove }: ModCardPro
             Enable
           </button>
         )}
-        <button className="danger-button compact-button" onClick={onRemove}>
-          <Trash2 size={15} />
-          Remove
-        </button>
+        {!isRuntime ? (
+          <button className="danger-button compact-button" onClick={onRemove}>
+            <Trash2 size={15} />
+            Remove
+          </button>
+        ) : null}
       </div>
     </article>
   );

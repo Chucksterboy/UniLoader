@@ -216,6 +216,17 @@
     }
   },
   {
+    "id": "marvel-rivals",
+    "displayName": "Marvel Rivals",
+    "engine": "unreal",
+    "steamAppIds": ["2767030"],
+    "executableNames": ["marvel.exe", "marvel-win64-shipping.exe"],
+    "pathMarkers": ["marvelgame/marvel/content/paks", "marvelgame/content/paks"],
+    "supportedAdapters": ["unreal-pak"],
+    "configRoots": ["MarvelGame/Marvel/Content/Paks/~mods", "MarvelGame/Content/Paks/~mods"],
+    "nexusGameDomain": "marvelrivals"
+  },
+  {
     "id": "sf6",
     "displayName": "Street Fighter 6",
     "engine": "re-engine",

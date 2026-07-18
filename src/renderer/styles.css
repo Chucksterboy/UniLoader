@@ -2028,6 +2028,7 @@ svg {
   line-height: 1.45;
 }
 
+
 .last-import {
   display: grid;
   width: min(440px, calc(100% - 36px));
@@ -2159,6 +2160,22 @@ svg {
   opacity: 0.72;
 }
 
+.mod-card.runtime {
+  border-color: rgba(85, 185, 255, 0.42);
+  background:
+    linear-gradient(90deg, transparent 0 42px, rgba(85, 185, 255, 0.08) 42px 43px, transparent 43px 128px),
+    linear-gradient(180deg, rgba(85, 185, 255, 0.09), transparent),
+    rgba(255, 255, 255, 0.035);
+  box-shadow:
+    inset 2px 0 0 rgba(85, 185, 255, 0.9),
+    inset 0 0 22px rgba(85, 185, 255, 0.06);
+}
+
+.mod-card.runtime .mod-card-header small {
+  border-color: rgba(85, 185, 255, 0.42);
+  color: var(--blue);
+}
+
 .mod-card-header {
   display: flex;
   min-width: 0;
@@ -2268,6 +2285,20 @@ svg {
 .mod-actions {
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.runtime-protected {
+  display: inline-flex;
+  min-height: 32px;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid rgba(85, 185, 255, 0.32);
+  border-radius: 6px;
+  padding: 0 10px;
+  background: rgba(85, 185, 255, 0.07);
+  color: var(--blue);
+  font-size: 12px;
+  font-weight: 850;
 }
 
 .compact-button {
@@ -3075,6 +3106,7 @@ svg {
   accent-color: var(--blue);
 }
 
+
 .settings-field {
   display: grid;
   gap: 8px;
@@ -3263,6 +3295,10 @@ code {
     0 28px 90px rgba(0, 0, 0, 0.58);
   padding: 18px;
   overflow: hidden;
+}
+
+.profile-creator-modal.steam-only {
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
 }
 
 .profile-creator-header,
@@ -3613,6 +3649,54 @@ code {
   justify-content: flex-end;
   gap: 8px;
   padding-top: 2px;
+}
+
+.dependency-confirm-modal {
+  width: min(600px, calc(100vw - 48px));
+  border-color: rgba(85, 185, 255, 0.45);
+  background:
+    linear-gradient(90deg, transparent 0 46px, rgba(85, 185, 255, 0.06) 46px 47px, transparent 47px 146px),
+    linear-gradient(180deg, rgba(85, 185, 255, 0.09), transparent 140px),
+    rgba(7, 14, 22, 0.98);
+}
+
+.dependency-confirm-icon {
+  border-color: rgba(85, 185, 255, 0.45);
+  background: rgba(85, 185, 255, 0.12);
+  color: var(--accent);
+}
+
+.dependency-confirm-list {
+  display: grid;
+  gap: 7px;
+  margin-top: 12px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.dependency-confirm-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  min-width: 0;
+  border: 1px solid rgba(85, 185, 255, 0.2);
+  border-radius: 6px;
+  background: rgba(10, 25, 37, 0.72);
+  padding: 10px 12px;
+}
+
+.dependency-confirm-item strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.dependency-confirm-item span {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 11px;
 }
 
 .rename-modal {
