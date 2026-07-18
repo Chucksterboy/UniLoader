@@ -9,18 +9,23 @@ import {
   DesktopApi,
   GameDetectionResult,
   GameProfile,
+  DiscoveryPage,
   InstalledModRecord,
   InstallRequest,
   InstallResult,
   ModConfigFile,
   ModActionResult,
+  NexusNxmInstallResult,
   OnlineModRecord,
+  OnlineModFileOption,
   ProfileActionResult,
   ProfileDependencyBootstrapResult,
   ProfileExportResult,
   ProfileGameFolderUpdateResult,
   ProfileImportResult,
+  ProfileModToggleResult,
   ProfileRefreshResult,
+  SteamGameRecord,
   UpdateModConfigValueInput
 } from "../shared/contracts";
 
@@ -28,14 +33,24 @@ export const desktopApi: DesktopApi = {
   getAppSettings: () => invoke<AppSettings>("get_app_settings"),
   updateAppSettings: (input: AppSettings) =>
     invoke<AppSettings>("update_app_settings", { input }),
+  saveNexusApiKey: (apiKey: string) =>
+    invoke<AppSettings>("save_nexus_api_key", { apiKey }),
   checkAppUpdate: () => invoke<AppUpdateInfo>("check_app_update"),
   minimizeWindow: () => getCurrentWindow().minimize(),
   toggleMaximizeWindow: () => getCurrentWindow().toggleMaximize(),
   closeWindow: () => getCurrentWindow().close(),
-  startWindowDrag: () => getCurrentWindow().startDragging(),
   downloadUpdateInstaller: (url: string, fileName?: string) =>
     invoke<string>("download_update_installer", { url, fileName }),
+  scanSteamGames: () => invoke<SteamGameRecord[]>("scan_steam_games"),
+  createSteamProfile: (game: SteamGameRecord) =>
+    invoke<GameProfile>("create_steam_profile", { game }),
+  launchProfileGame: (profileId: string) =>
+    invoke<void>("launch_profile_game", { profileId }),
+  setAllProfileModsEnabled: (profileId: string, enabled: boolean) =>
+    invoke<ProfileModToggleResult>("set_all_profile_mods_enabled", { profileId, enabled }),
   listProfiles: () => invoke<GameProfile[]>("list_profiles"),
+  profileFolderExists: (profileId: string) =>
+    invoke<boolean>("profile_folder_exists", { profileId }),
   createProfile: (input: CreateProfileInput) =>
     invoke<GameProfile>("create_profile", { input }),
   renameProfile: (profileId: string, name: string) =>
@@ -142,15 +157,48 @@ export const desktopApi: DesktopApi = {
     }),
   installArchive: (request: InstallRequest) =>
     invoke<InstallResult>("install_archive", { request }),
-  discoverOnlineMods: (profileId: string) =>
-    invoke<OnlineModRecord[]>("discover_online_mods", { profileId }),
-  installDiscoveredMod: (profileId: string, mod: OnlineModRecord) =>
+  discoverOnlineMods: (profileId, page, pageSize, sort, query) =>
+    invoke<DiscoveryPage>("discover_online_mods", {
+      profileId,
+      page,
+      pageSize,
+      sort,
+      query
+    }),
+  listDiscoveredModFiles: (profileId: string, mod: OnlineModRecord) =>
+    invoke<OnlineModFileOption[]>("list_discovered_mod_files", {
+      profileId,
+      provider: mod.provider,
+      modId: mod.id,
+      providerGameId: mod.providerGameId
+    }),
+  installDiscoveredMod: (
+    profileId: string,
+    mod: OnlineModRecord,
+    file?: OnlineModFileOption
+  ) =>
     invoke<InstallResult>("install_discovered_mod", {
       profileId,
       provider: mod.provider,
       modId: mod.id,
-      version: mod.version
+      version: file?.version ?? mod.version,
+      providerGameId: mod.providerGameId,
+      selectedFileId: file?.id
     }),
+  beginNexusBrowserDownload: (
+    profileId: string,
+    mod: OnlineModRecord,
+    file: OnlineModFileOption
+  ) =>
+    invoke<string>("begin_nexus_browser_download", {
+      profileId,
+      modId: mod.id,
+      version: file.version ?? mod.version,
+      providerGameId: mod.providerGameId,
+      selectedFileId: file.id
+    }),
+  installNexusNxmLink: (nxmUrl: string) =>
+    invoke<NexusNxmInstallResult>("install_nexus_nxm_link", { nxmUrl }),
   listInstalledMods: (profileId: string) =>
     invoke<InstalledModRecord[]>("list_installed_mods", { profileId }),
   getModConfigDetails: (profileId: string, installedModId: string) =>

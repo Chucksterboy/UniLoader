@@ -2,13 +2,15 @@ use chrono::Utc;
 use reqwest::blocking::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{self, Seek, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::webview::PageLoadEvent;
@@ -17,7 +19,7 @@ use uuid::Uuid;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-const MAX_SCAN_DEPTH: usize = 4;
+const MAX_SCAN_DEPTH: usize = 6;
 const MAX_SCAN_ENTRIES: usize = 3000;
 const MAX_UNREAL_PAK_ROOT_SCAN_DEPTH: usize = 9;
 const MAX_UNREAL_PAK_ROOTS: usize = 64;
@@ -26,18 +28,50 @@ const MAX_CONFIG_READ_BYTES: u64 = 512 * 1024;
 const MAX_CONFIG_SCAN_DEPTH: usize = 5;
 const MAX_PROFILE_CONFIG_FILES: usize = 500;
 const MAX_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRIES: usize = 10_000;
+const MAX_ARCHIVE_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_ARCHIVE_EXPANDED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MAX_ARCHIVE_PATH_DEPTH: usize = 32;
+const MAX_ARCHIVE_COMPRESSION_RATIO: u64 = 500;
+const MAX_IMPORT_SCAN_DEPTH: usize = 32;
+const IMPORT_CACHE_MAX_AGE_HOURS: i64 = 24;
 const THUNDERSTORE_API_BASE: &str = "https://thunderstore.io/api/experimental/package";
 const THUNDERSTORE_COMMUNITY_API_BASE: &str = "https://thunderstore.io/c";
 const NEXUS_GRAPHQL_API_BASE: &str = "https://api.nexusmods.com/v2/graphql";
 const NEXUS_SITE_BASE: &str = "https://www.nexusmods.com";
 const NEXUS_DISCOVERY_PAGE_SIZE: usize = 80;
-const NEXUS_MAX_DISCOVERY_RESULTS: usize = 5000;
+const NEXUS_PENDING_DOWNLOAD_TTL_MINUTES: i64 = 30;
+const MAX_DISCOVERY_PAGE_SIZE: usize = 50;
 const MAX_PROVIDER_CANDIDATES: usize = 16;
+const PROVIDER_MAPPING_CACHE_HOURS: u64 = 12;
+const PROVIDER_MAPPING_NEGATIVE_CACHE_MINUTES: u64 = 10;
 const GITHUB_API_BASE: &str = "https://api.github.com/repos";
 const APP_UPDATE_REPOSITORY: &str = "Chucksterboy/UniLoader";
 const BEPINBUILDS_BASE: &str = "https://builds.bepinex.dev";
 const BEPINBUILDS_BEPINEX_BE: &str = "https://builds.bepinex.dev/projects/bepinex_be";
 const GAME_DEFINITIONS_JSON: &str = include_str!("game_definitions.json");
+const RUNTIME_DEFINITIONS_JSON: &str = include_str!("runtime_definitions.json");
+const NEXUS_KEYRING_SERVICE: &str = "UniLoader";
+const NEXUS_KEYRING_USER: &str = "nexus-api-key";
+
+static STORE_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static THUNDERSTORE_CACHE: OnceLock<Mutex<HashMap<String, ThunderstoreCacheEntry>>> =
+    OnceLock::new();
+static PROVIDER_MAPPING_CACHE: OnceLock<Mutex<HashMap<String, ProviderMappingCacheEntry>>> =
+    OnceLock::new();
+
+#[derive(Debug, Clone)]
+struct ThunderstoreCacheEntry {
+    fetched_at: Instant,
+    packages: Vec<ThunderstoreCommunityPackage>,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderMappingCacheEntry {
+    fetched_at: Instant,
+    value: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,6 +81,8 @@ pub struct GameProfile {
     game_path: String,
     #[serde(default)]
     game_id: Option<String>,
+    #[serde(default)]
+    steam_app_id: Option<String>,
     engine: String,
     loader: String,
     created_at: String,
@@ -60,8 +96,19 @@ pub struct CreateProfileInput {
     game_path: String,
     #[serde(default)]
     game_id: Option<String>,
+    #[serde(default)]
+    steam_app_id: Option<String>,
     engine: String,
     loader: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SteamGameRecord {
+    app_id: String,
+    name: String,
+    install_dir: String,
+    library_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,8 +181,6 @@ struct ThunderstorePackageRef {
 #[derive(Debug, Deserialize)]
 struct ThunderstorePackageResponse {
     latest: ThunderstoreVersion,
-    #[serde(default)]
-    versions: Vec<ThunderstoreVersion>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -248,19 +293,57 @@ struct NexusFileRecord {
     #[serde(default)]
     name: String,
     #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
     category_name: Option<String>,
     #[serde(default)]
     is_primary: Option<bool>,
     #[serde(default)]
     uploaded_timestamp: Option<u64>,
     #[serde(default)]
+    uploaded_time: Option<String>,
+    #[serde(default)]
     file_name: Option<String>,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
+    size_kb: Option<u64>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct NexusUserValidation {
+    #[serde(default)]
+    is_premium: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct NexusDownloadLink {
     #[serde(default, rename = "URI", alias = "uri")]
     uri: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingNexusDownload {
+    profile_id: String,
+    domain: String,
+    mod_id: u64,
+    file_id: u64,
+    version: Option<String>,
+    provider_game_id: String,
+    created_at: i64,
+}
+
+#[derive(Debug, Clone)]
+struct NexusNxmLink {
+    domain: String,
+    mod_id: u64,
+    file_id: u64,
+    key: String,
+    expires: i64,
+    user_id: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -296,6 +379,7 @@ pub struct OnlineModRecord {
     provider: String,
     provider_label: String,
     game_id: Option<String>,
+    provider_game_id: Option<String>,
     name: String,
     owner: String,
     version: String,
@@ -313,6 +397,32 @@ pub struct OnlineModRecord {
     updated_at: Option<String>,
     install_supported: bool,
     install_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OnlineModFileOption {
+    id: String,
+    name: String,
+    version: Option<String>,
+    category: Option<String>,
+    description: Option<String>,
+    file_name: Option<String>,
+    file_size: Option<u64>,
+    uploaded_at: Option<String>,
+    primary: bool,
+    action: String,
+    download_page_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveryPage {
+    items: Vec<OnlineModRecord>,
+    total: usize,
+    page: usize,
+    page_size: usize,
+    has_more: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -350,6 +460,8 @@ struct GameDefinition {
     #[serde(default)]
     path_markers: Vec<String>,
     #[serde(default)]
+    supported_adapters: Vec<String>,
+    #[serde(default)]
     bootstrap_runtimes: Vec<String>,
     #[serde(default)]
     config_roots: Vec<String>,
@@ -359,6 +471,8 @@ struct GameDefinition {
     thunderstore_community: Option<String>,
     #[serde(default)]
     nexus_game_domain: Option<String>,
+    #[serde(default)]
+    curseforge_game_id: Option<String>,
     #[serde(default)]
     runtime_dependencies: HashMap<String, RuntimeDependencyDefinition>,
 }
@@ -372,6 +486,39 @@ struct RuntimeDependencyDefinition {
     source: String,
     #[serde(default)]
     notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeDefinition {
+    id: String,
+    dependency: RuntimeDependencyDefinition,
+    #[serde(default)]
+    profile_engines: Vec<String>,
+    #[serde(default)]
+    profile_loaders: Vec<String>,
+    #[serde(default)]
+    provider_packages: Vec<RuntimeProviderPackageDefinition>,
+    #[serde(default)]
+    detection_rules: Vec<RuntimeDetectionRule>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeProviderPackageDefinition {
+    provider: String,
+    #[serde(default)]
+    namespace_patterns: Vec<String>,
+    #[serde(default)]
+    package_patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RuntimeDetectionRule {
+    #[serde(default)]
+    all: Vec<String>,
+    #[serde(default)]
+    any: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -398,11 +545,38 @@ pub struct InstallPlan {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PackageIdentity {
+    provider: String,
+    package_id: Option<String>,
+    version: Option<String>,
+    provider_game_id: Option<String>,
+    mod_types: Vec<String>,
+    dependencies: Vec<String>,
+    evidence: Vec<String>,
+    confidence: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompatibilityResult {
+    status: String,
+    reason: String,
+    confidence: f64,
+    game_id: Option<String>,
+    provider_game_id: Option<String>,
+    detected_mod_types: Vec<String>,
+    supported_mod_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ArchiveAnalysis {
     archive_path: String,
     archive_name: String,
     entries: Vec<ArchiveEntry>,
     manifest: Option<ThunderstoreManifest>,
+    package_identity: PackageIdentity,
+    compatibility: CompatibilityResult,
     plans: Vec<InstallPlan>,
     recommended_plan: Option<InstallPlan>,
 }
@@ -414,6 +588,7 @@ pub struct InstallRequest {
     archive_path: String,
     #[serde(default)]
     archive_name: Option<String>,
+    package_identity: Option<PackageIdentity>,
     plan: InstallPlan,
 }
 
@@ -447,6 +622,8 @@ pub struct InstalledModRecord {
     installed_at: String,
     files_written: Vec<String>,
     backups_written: Vec<String>,
+    #[serde(default)]
+    written_file_hashes: HashMap<String, String>,
     dependencies: Vec<DependencySpec>,
     #[serde(default)]
     config_files: Vec<String>,
@@ -497,6 +674,17 @@ pub struct ModActionResult {
     status: String,
     files_changed: Vec<String>,
     warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileModToggleResult {
+    profile_id: String,
+    enabled: bool,
+    changed_mods: usize,
+    files_changed: Vec<String>,
+    warnings: Vec<String>,
+    installed_mods: Vec<InstalledModRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -599,8 +787,10 @@ struct ProfileBundleConfigFile {
 pub struct AppSettings {
     #[serde(default)]
     minimize_to_tray_on_close: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     nexus_api_key: String,
+    #[serde(default)]
+    nexus_api_key_configured: bool,
 }
 
 impl AppSettings {
@@ -631,7 +821,14 @@ pub struct AppUpdateInfo {
     message: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NexusNxmInstallResult {
+    mod_id: String,
+    install_result: InstallResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoreFile<T> {
     version: u32,
     items: Vec<T>,
@@ -652,13 +849,6 @@ struct RoutePreparation {
     warnings: Vec<String>,
 }
 
-#[derive(Debug, Default)]
-struct RedeployProfileModsResult {
-    installed_mods: Vec<InstalledModRecord>,
-    deployed_files: Vec<String>,
-    warnings: Vec<String>,
-}
-
 #[derive(Debug, Clone)]
 struct NativeScriptFile {
     absolute_path: PathBuf,
@@ -672,22 +862,84 @@ struct ScannedArchive {
     archive_name: String,
     entries: Vec<ArchiveEntry>,
     manifest: Option<ThunderstoreManifest>,
+    package_identity: Option<PackageIdentity>,
 }
 
 #[tauri::command]
 fn get_app_settings(app: AppHandle) -> Result<AppSettings, String> {
-    read_app_settings(&store_root(&app)?)
+    let mut settings = read_app_settings(&store_root(&app)?)?;
+    settings.nexus_api_key_configured = settings.nexus_api_ready();
+    settings.nexus_api_key.clear();
+    Ok(settings)
 }
 
 #[tauri::command]
 fn update_app_settings(app: AppHandle, input: AppSettings) -> Result<AppSettings, String> {
+    let _operation = lock_mutations()?;
     let root = store_root(&app)?;
-    write_app_settings(&root, &input)?;
-    Ok(input)
+    if !input.nexus_api_key.trim().is_empty() {
+        write_nexus_api_key(Some(input.nexus_api_key.trim()))?;
+    }
+
+    let mut saved = input;
+    saved.nexus_api_key.clear();
+    saved.nexus_api_key_configured = read_nexus_api_key()?.is_some();
+    write_app_settings(&root, &saved)?;
+    Ok(saved)
 }
 
 #[tauri::command]
-fn check_app_update() -> AppUpdateInfo {
+async fn save_nexus_api_key(app: AppHandle, api_key: String) -> Result<AppSettings, String> {
+    tauri::async_runtime::spawn_blocking(move || save_nexus_api_key_impl(app, api_key))
+        .await
+        .map_err(error_to_string)?
+}
+
+fn save_nexus_api_key_impl(app: AppHandle, api_key: String) -> Result<AppSettings, String> {
+    let trimmed = api_key.trim().to_string();
+    if !trimmed.is_empty() {
+        validate_nexus_api_key(&trimmed)?;
+    }
+
+    let _operation = lock_mutations()?;
+    let root = store_root(&app)?;
+    write_nexus_api_key(if trimmed.is_empty() {
+        None
+    } else {
+        Some(&trimmed)
+    })?;
+    let stored_key = read_nexus_api_key()?;
+    if stored_key.as_deref() != (!trimmed.is_empty()).then_some(trimmed.as_str()) {
+        return Err(
+            "Windows Credential Manager did not retain the Nexus API key. Please try saving it again."
+                .to_string(),
+        );
+    }
+
+    let mut settings = read_app_settings(&root)?;
+    settings.nexus_api_key.clear();
+    settings.nexus_api_key_configured = stored_key.is_some();
+    write_app_settings(&root, &settings)?;
+    Ok(settings)
+}
+
+#[tauri::command]
+async fn check_app_update() -> AppUpdateInfo {
+    tauri::async_runtime::spawn_blocking(check_app_update_impl)
+        .await
+        .unwrap_or_else(|error| AppUpdateInfo {
+            current_version: env!("CARGO_PKG_VERSION").to_string(),
+            latest_version: None,
+            update_available: false,
+            release_url: None,
+            installer_url: None,
+            installer_name: None,
+            status: "error".to_string(),
+            message: format!("Update check stopped unexpectedly: {error}"),
+        })
+}
+
+fn check_app_update_impl() -> AppUpdateInfo {
     let current_version = env!("CARGO_PKG_VERSION").to_string();
     let request_url = format!("{GITHUB_API_BASE}/{APP_UPDATE_REPOSITORY}/releases/latest");
     let client = match Client::builder().timeout(Duration::from_secs(8)).build() {
@@ -803,27 +1055,73 @@ fn check_app_update() -> AppUpdateInfo {
 
 #[tauri::command]
 fn list_profiles(app: AppHandle) -> Result<Vec<GameProfile>, String> {
-    read_store::<GameProfile>(&profiles_path(&store_root(&app)?))
-        .map(|store| store.items)
-        .map_err(error_to_string)
+    let path = profiles_path(&store_root(&app)?);
+    let mut store = read_store::<GameProfile>(&path).map_err(error_to_string)?;
+    let mut changed = false;
+
+    for profile in &mut store.items {
+        let normalized_game_path = normalize_profile_game_path(&profile.game_path);
+        if normalized_game_path != profile.game_path {
+            profile.game_path = normalized_game_path;
+            changed = true;
+        }
+        if profile
+            .steam_app_id
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+        {
+            if let Some(app_id) = infer_steam_app_id_for_game_path(Path::new(&profile.game_path)) {
+                profile.steam_app_id = Some(app_id);
+                changed = true;
+            }
+        }
+    }
+
+    if changed {
+        write_store(&path, &store).map_err(error_to_string)?;
+    }
+
+    Ok(store.items)
 }
 
 #[tauri::command]
-fn create_profile(app: AppHandle, input: CreateProfileInput) -> Result<GameProfile, String> {
+fn profile_folder_exists(app: AppHandle, profile_id: String) -> Result<bool, String> {
+    let root = store_root(&app)?;
+    let profile = get_profile(&root, &profile_id)?;
+    Ok(Path::new(&profile.game_path).is_dir())
+}
+
+#[tauri::command]
+fn create_profile(app: AppHandle, mut input: CreateProfileInput) -> Result<GameProfile, String> {
+    let _operation = lock_mutations()?;
+    let root = store_root(&app)?;
+    if input
+        .steam_app_id
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        input.steam_app_id = infer_steam_app_id_for_game_path(Path::new(&input.game_path));
+    }
+    create_profile_in_store(&root, input)
+}
+
+fn create_profile_in_store(root: &Path, input: CreateProfileInput) -> Result<GameProfile, String> {
     let trimmed_name = input.name.trim().to_string();
     if trimmed_name.is_empty() {
         return Err("Profile name is required.".to_string());
     }
 
-    let root = store_root(&app)?;
-    let path = profiles_path(&root);
+    let path = profiles_path(root);
     let mut store = read_store::<GameProfile>(&path).map_err(error_to_string)?;
     let now = now_string();
     let profile = GameProfile {
         id: Uuid::new_v4().to_string(),
         name: trimmed_name,
-        game_path: input.game_path,
+        game_path: normalize_profile_game_path(&input.game_path),
         game_id: input.game_id,
+        steam_app_id: input.steam_app_id,
         engine: input.engine,
         loader: input.loader,
         created_at: now.clone(),
@@ -832,12 +1130,353 @@ fn create_profile(app: AppHandle, input: CreateProfileInput) -> Result<GameProfi
 
     store.items.push(profile.clone());
     write_store(&path, &store).map_err(error_to_string)?;
-    fs::create_dir_all(profile_dir(&root, &profile.id)).map_err(error_to_string)?;
+    fs::create_dir_all(profile_dir(root, &profile.id)).map_err(error_to_string)?;
     Ok(profile)
 }
 
 #[tauri::command]
+async fn scan_steam_games() -> Result<Vec<SteamGameRecord>, String> {
+    tauri::async_runtime::spawn_blocking(scan_steam_games_impl)
+        .await
+        .map_err(error_to_string)
+}
+
+#[tauri::command]
+async fn create_steam_profile(
+    app: AppHandle,
+    game: SteamGameRecord,
+) -> Result<GameProfile, String> {
+    tauri::async_runtime::spawn_blocking(move || create_steam_profile_sync(app, game))
+        .await
+        .map_err(error_to_string)?
+}
+
+fn create_steam_profile_sync(app: AppHandle, game: SteamGameRecord) -> Result<GameProfile, String> {
+    let _operation = lock_mutations()?;
+    let root = store_root(&app)?;
+    let detection = detect_game_setup_impl(Path::new(&game.install_dir))?;
+    create_profile_in_store(
+        &root,
+        CreateProfileInput {
+            name: game.name,
+            game_path: game.install_dir,
+            game_id: detection.game_id,
+            steam_app_id: Some(game.app_id),
+            engine: detection.engine,
+            loader: detection.loader,
+        },
+    )
+}
+
+#[tauri::command]
+fn launch_profile_game(app: AppHandle, profile_id: String) -> Result<(), String> {
+    let root = store_root(&app)?;
+    let profile = get_profile(&root, &profile_id)?;
+    let steam_app_id = profile
+        .steam_app_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|app_id| !app_id.is_empty())
+        .ok_or_else(|| {
+            "This profile does not have a Steam App ID yet. Add it through Steam scan to launch it from UniLoader.".to_string()
+        })?;
+
+    open_url_in_shell(&format!("steam://run/{steam_app_id}"))
+}
+
+fn scan_steam_games_impl() -> Vec<SteamGameRecord> {
+    let mut games = Vec::new();
+    let mut seen_app_ids = HashSet::new();
+
+    for library_path in steam_library_roots() {
+        let steamapps_path = library_path.join("steamapps");
+        let Ok(entries) = fs::read_dir(&steamapps_path) else {
+            continue;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+
+            if !file_name.starts_with("appmanifest_") || !file_name.ends_with(".acf") {
+                continue;
+            }
+
+            let Some(game) = parse_steam_app_manifest(&path, &library_path) else {
+                continue;
+            };
+
+            if is_user_steam_game(&game) && seen_app_ids.insert(game.app_id.clone()) {
+                games.push(game);
+            }
+        }
+    }
+
+    games.sort_by(|first, second| {
+        first
+            .name
+            .to_lowercase()
+            .cmp(&second.name.to_lowercase())
+            .then_with(|| first.app_id.cmp(&second.app_id))
+    });
+    games
+}
+
+fn is_user_steam_game(game: &SteamGameRecord) -> bool {
+    let lower_name = game.name.to_lowercase();
+    Path::new(&game.install_dir).is_dir()
+        && game.app_id != "228980"
+        && !lower_name.contains("steamworks common redistributables")
+        && !lower_name.starts_with("steam linux runtime")
+        && !lower_name.contains("proton ")
+        && !lower_name.ends_with(" dedicated server")
+}
+
+fn steam_library_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+
+    for steam_root in steam_install_roots() {
+        push_unique_path(&mut roots, &mut seen, steam_root.clone());
+
+        let library_file = steam_root.join("steamapps").join("libraryfolders.vdf");
+        let Ok(content) = fs::read_to_string(&library_file) else {
+            continue;
+        };
+
+        for library_path in parse_steam_library_paths(&content) {
+            push_unique_path(&mut roots, &mut seen, library_path);
+        }
+    }
+
+    roots
+}
+
+fn steam_install_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+
+    for root in steam_registry_roots() {
+        push_unique_path(&mut roots, &mut seen, root);
+    }
+
+    if let Ok(program_files_x86) = std::env::var("ProgramFiles(x86)") {
+        push_unique_path(
+            &mut roots,
+            &mut seen,
+            PathBuf::from(program_files_x86).join("Steam"),
+        );
+    }
+
+    if let Ok(program_files) = std::env::var("ProgramFiles") {
+        push_unique_path(
+            &mut roots,
+            &mut seen,
+            PathBuf::from(program_files).join("Steam"),
+        );
+    }
+
+    push_unique_path(
+        &mut roots,
+        &mut seen,
+        PathBuf::from(r"C:\Program Files (x86)\Steam"),
+    );
+    roots
+        .into_iter()
+        .filter(|root| root.join("steamapps").is_dir())
+        .collect()
+}
+
+#[cfg(windows)]
+fn steam_registry_roots() -> Vec<PathBuf> {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    use winreg::RegKey;
+
+    let mut roots = Vec::new();
+
+    for (hive, key_path, value_name) in [
+        (
+            RegKey::predef(HKEY_CURRENT_USER),
+            r"Software\Valve\Steam",
+            "SteamPath",
+        ),
+        (
+            RegKey::predef(HKEY_LOCAL_MACHINE),
+            r"SOFTWARE\WOW6432Node\Valve\Steam",
+            "InstallPath",
+        ),
+        (
+            RegKey::predef(HKEY_LOCAL_MACHINE),
+            r"SOFTWARE\Valve\Steam",
+            "InstallPath",
+        ),
+    ] {
+        if let Ok(key) = hive.open_subkey(key_path) {
+            if let Ok(path) = key.get_value::<String, _>(value_name) {
+                let path = path.trim();
+                if !path.is_empty() {
+                    roots.push(PathBuf::from(path));
+                }
+            }
+        }
+    }
+
+    roots
+}
+
+#[cfg(not(windows))]
+fn steam_registry_roots() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+fn parse_steam_library_paths(content: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    for line in content.lines() {
+        let tokens = quoted_values(line);
+        if tokens.len() < 2 {
+            continue;
+        }
+
+        let key = tokens[0].trim();
+        let value = tokens[1].trim();
+        if key.eq_ignore_ascii_case("path")
+            || (key.chars().all(|ch| ch.is_ascii_digit()) && looks_like_path(value))
+        {
+            paths.push(PathBuf::from(value));
+        }
+    }
+
+    paths
+}
+
+fn parse_steam_app_manifest(path: &Path, library_path: &Path) -> Option<SteamGameRecord> {
+    let content = fs::read_to_string(path).ok()?;
+    let mut values: HashMap<String, String> = HashMap::new();
+
+    for line in content.lines() {
+        let tokens = quoted_values(line);
+        if tokens.len() >= 2 {
+            values.insert(tokens[0].to_lowercase(), tokens[1].clone());
+        }
+    }
+
+    let app_id = values.get("appid")?.trim().to_string();
+    let name = values.get("name")?.trim().to_string();
+    let install_dir_name = values
+        .get("installdir")
+        .map(String::as_str)
+        .unwrap_or(name.as_str())
+        .trim();
+    let install_dir = library_path
+        .join("steamapps")
+        .join("common")
+        .join(install_dir_name);
+
+    Some(SteamGameRecord {
+        app_id,
+        name,
+        install_dir: install_dir.to_string_lossy().to_string(),
+        library_path: library_path.to_string_lossy().to_string(),
+    })
+}
+
+fn infer_steam_app_id_for_game_path(game_path: &Path) -> Option<String> {
+    let common_path = game_path.parent()?;
+    if !common_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("common"))
+    {
+        return None;
+    }
+
+    let steamapps_path = common_path.parent()?;
+    if !steamapps_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("steamapps"))
+    {
+        return None;
+    }
+
+    let library_path = steamapps_path.parent()?;
+    let target_identity = normalize_filesystem_identity(&game_path.to_string_lossy());
+    let entries = fs::read_dir(steamapps_path).ok()?;
+
+    for entry in entries.flatten() {
+        let manifest_path = entry.path();
+        let Some(file_name) = manifest_path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !file_name.starts_with("appmanifest_") || !file_name.ends_with(".acf") {
+            continue;
+        }
+
+        let Some(game) = parse_steam_app_manifest(&manifest_path, library_path) else {
+            continue;
+        };
+        if normalize_filesystem_identity(&game.install_dir) == target_identity {
+            return Some(game.app_id);
+        }
+    }
+
+    None
+}
+
+fn quoted_values(line: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut chars = line.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '"' {
+            continue;
+        }
+
+        let mut value = String::new();
+        let mut escaped = false;
+
+        for next_ch in chars.by_ref() {
+            if escaped {
+                value.push(next_ch);
+                escaped = false;
+                continue;
+            }
+
+            if next_ch == '\\' {
+                escaped = true;
+                continue;
+            }
+
+            if next_ch == '"' {
+                break;
+            }
+
+            value.push(next_ch);
+        }
+
+        values.push(value);
+    }
+
+    values
+}
+
+fn looks_like_path(value: &str) -> bool {
+    value.contains(":\\") || value.contains(":/") || value.contains('\\') || value.contains('/')
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, seen: &mut HashSet<String>, path: PathBuf) {
+    let key = path.to_string_lossy().replace('/', "\\").to_lowercase();
+    if seen.insert(key) {
+        paths.push(path);
+    }
+}
+
+#[tauri::command]
 fn rename_profile(app: AppHandle, profile_id: String, name: String) -> Result<GameProfile, String> {
+    let _operation = lock_mutations()?;
     let trimmed_name = name.trim().to_string();
     if trimmed_name.is_empty() {
         return Err("Profile name is required.".to_string());
@@ -861,6 +1500,7 @@ fn rename_profile(app: AppHandle, profile_id: String, name: String) -> Result<Ga
 
 #[tauri::command]
 fn remove_profile(app: AppHandle, profile_id: String) -> Result<ProfileActionResult, String> {
+    let _operation = lock_mutations()?;
     let root = store_root(&app)?;
     let profiles_file = profiles_path(&root);
     let mut profiles = read_store::<GameProfile>(&profiles_file).map_err(error_to_string)?;
@@ -869,19 +1509,60 @@ fn remove_profile(app: AppHandle, profile_id: String) -> Result<ProfileActionRes
         .iter()
         .position(|profile| profile.id == profile_id)
         .ok_or_else(|| format!("Profile not found: {}", profile_id))?;
-    let profile = profiles.items.remove(profile_index);
+    let profile = profiles.items[profile_index].clone();
 
     let installed_mods_file = installed_mods_path(&root);
     let mut installed_mods =
         read_store::<InstalledModRecord>(&installed_mods_file).map_err(error_to_string)?;
+    let profile_mods = installed_mods
+        .items
+        .iter()
+        .filter(|record| record.profile_id == profile.id)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut deactivated: Vec<InstalledModRecord> = Vec::new();
+    for record in profile_mods.iter().filter(|record| record.enabled) {
+        if let Err(error) = deactivate_mod_files(&root, &profile, record) {
+            for previous in deactivated.iter().rev() {
+                let mut previous = previous.clone();
+                if let Some(plan) = previous.plan.clone() {
+                    let install_id = previous.id.clone();
+                    let archive_path = previous.archive_path.clone();
+                    let _ = deploy_mod_files(
+                        &root,
+                        &profile,
+                        &install_id,
+                        &archive_path,
+                        &plan,
+                        &mut previous,
+                    );
+                }
+            }
+            return Err(format!(
+                "Profile removal was cancelled because its mod files could not be safely removed: {error}"
+            ));
+        }
+        deactivated.push(record.clone());
+    }
+
+    profiles.items.remove(profile_index);
     let before_count = installed_mods.items.len();
     installed_mods
         .items
         .retain(|record| record.profile_id != profile.id);
     let removed_mod_records = before_count.saturating_sub(installed_mods.items.len());
 
-    write_store(&profiles_file, &profiles).map_err(error_to_string)?;
-    write_store(&installed_mods_file, &installed_mods).map_err(error_to_string)?;
+    let previous_installed_mods =
+        read_store::<InstalledModRecord>(&installed_mods_file).map_err(error_to_string)?;
+    if let Err(error) = write_store(&installed_mods_file, &installed_mods) {
+        restore_deactivated_mods(&root, &profile, &deactivated);
+        return Err(error_to_string(error));
+    }
+    if let Err(error) = write_store(&profiles_file, &profiles) {
+        let _ = write_store(&installed_mods_file, &previous_installed_mods);
+        restore_deactivated_mods(&root, &profile, &deactivated);
+        return Err(error_to_string(error));
+    }
 
     let mut warnings = Vec::new();
     let profile_data_dir = profile_dir(&root, &profile.id);
@@ -903,7 +1584,20 @@ fn remove_profile(app: AppHandle, profile_id: String) -> Result<ProfileActionRes
 }
 
 #[tauri::command]
-fn refresh_profile(app: AppHandle, profile_id: String) -> Result<ProfileRefreshResult, String> {
+async fn refresh_profile(
+    app: AppHandle,
+    profile_id: String,
+) -> Result<ProfileRefreshResult, String> {
+    tauri::async_runtime::spawn_blocking(move || refresh_profile_sync(app, profile_id))
+        .await
+        .map_err(error_to_string)?
+}
+
+fn refresh_profile_sync(
+    app: AppHandle,
+    profile_id: String,
+) -> Result<ProfileRefreshResult, String> {
+    let _operation = lock_mutations()?;
     let root = store_root(&app)?;
     let profiles_file = profiles_path(&root);
     let mut profiles = read_store::<GameProfile>(&profiles_file).map_err(error_to_string)?;
@@ -920,12 +1614,12 @@ fn refresh_profile(app: AppHandle, profile_id: String) -> Result<ProfileRefreshR
     profile.loader = detection.loader.clone();
     profile.updated_at = now_string();
     profiles.items[profile_index] = profile.clone();
-    write_store(&profiles_file, &profiles).map_err(error_to_string)?;
 
     let discovered_config_files = discover_profile_config_files(&profile);
     let installed_mods_file = installed_mods_path(&root);
     let mut installed_store =
         read_store::<InstalledModRecord>(&installed_mods_file).map_err(error_to_string)?;
+    let original_installed_store = installed_store.clone();
     let adopted_native_script_mods =
         adopt_existing_native_script_mods(&root, &profile, &mut installed_store)?;
     let mut mod_file_health = Vec::new();
@@ -966,6 +1660,10 @@ fn refresh_profile(app: AppHandle, profile_id: String) -> Result<ProfileRefreshR
     }
 
     write_store(&installed_mods_file, &installed_store).map_err(error_to_string)?;
+    if let Err(error) = write_store(&profiles_file, &profiles) {
+        let _ = write_store(&installed_mods_file, &original_installed_store);
+        return Err(error_to_string(error));
+    }
 
     let installed_mods = installed_store
         .items
@@ -987,20 +1685,37 @@ fn refresh_profile(app: AppHandle, profile_id: String) -> Result<ProfileRefreshR
 }
 
 #[tauri::command]
-fn update_profile_game_folder(
+async fn update_profile_game_folder(
     app: AppHandle,
     profile_id: String,
     game_path: String,
 ) -> Result<ProfileGameFolderUpdateResult, String> {
-    let root = store_root(&app)?;
-    update_profile_game_folder_impl(&root, &profile_id, &game_path)
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation = lock_mutations()?;
+        let root = store_root(&app)?;
+        update_profile_game_folder_impl(&root, &profile_id, &game_path)
+    })
+    .await
+    .map_err(error_to_string)?
 }
 
 #[tauri::command]
-fn bootstrap_profile_dependencies(
+async fn bootstrap_profile_dependencies(
     app: AppHandle,
     profile_id: String,
 ) -> Result<ProfileDependencyBootstrapResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        bootstrap_profile_dependencies_sync(app, profile_id)
+    })
+    .await
+    .map_err(error_to_string)?
+}
+
+fn bootstrap_profile_dependencies_sync(
+    app: AppHandle,
+    profile_id: String,
+) -> Result<ProfileDependencyBootstrapResult, String> {
+    let _operation = lock_mutations()?;
     let root = store_root(&app)?;
     let profile = get_profile(&root, &profile_id)?;
     let mut visited_dependencies = HashSet::new();
@@ -1047,23 +1762,32 @@ fn bootstrap_profile_dependencies(
 }
 
 #[tauri::command]
-fn export_profile_bundle(
+async fn export_profile_bundle(
     app: AppHandle,
     profile_id: String,
     output_path: String,
 ) -> Result<ProfileExportResult, String> {
-    let root = store_root(&app)?;
-    export_profile_bundle_impl(&root, &profile_id, Path::new(&output_path))
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = store_root(&app)?;
+        export_profile_bundle_impl(&root, &profile_id, Path::new(&output_path))
+    })
+    .await
+    .map_err(error_to_string)?
 }
 
 #[tauri::command]
-fn import_profile_bundle(
+async fn import_profile_bundle(
     app: AppHandle,
     bundle_path: String,
     game_path: String,
 ) -> Result<ProfileImportResult, String> {
-    let root = store_root(&app)?;
-    import_profile_bundle_impl(&root, Path::new(&bundle_path), Path::new(&game_path))
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation = lock_mutations()?;
+        let root = store_root(&app)?;
+        import_profile_bundle_impl(&root, Path::new(&bundle_path), Path::new(&game_path))
+    })
+    .await
+    .map_err(error_to_string)?
 }
 
 fn profile_dependency_candidates(
@@ -1098,7 +1822,8 @@ fn update_profile_game_folder_impl(
     profile_id: &str,
     game_path: &str,
 ) -> Result<ProfileGameFolderUpdateResult, String> {
-    let detection = detect_game_setup_impl(Path::new(game_path))?;
+    let normalized_game_path = normalize_profile_game_path(game_path);
+    let detection = detect_game_setup_impl(Path::new(&normalized_game_path))?;
     let profiles_file = profiles_path(root);
     let mut profiles = read_store::<GameProfile>(&profiles_file).map_err(error_to_string)?;
     let profile_index = profiles
@@ -1107,24 +1832,139 @@ fn update_profile_game_folder_impl(
         .position(|profile| profile.id == profile_id)
         .ok_or_else(|| format!("Profile not found: {}", profile_id))?;
 
-    let mut profile = profiles.items[profile_index].clone();
-    profile.game_path = game_path.to_string();
+    let old_profile = profiles.items[profile_index].clone();
+    if normalize_filesystem_identity(&old_profile.game_path)
+        == normalize_filesystem_identity(&normalized_game_path)
+    {
+        return Ok(ProfileGameFolderUpdateResult {
+            profile: old_profile,
+            detection,
+            installed_mods: read_store::<InstalledModRecord>(&installed_mods_path(root))
+                .map_err(error_to_string)?
+                .items
+                .into_iter()
+                .filter(|record| record.profile_id == profile_id)
+                .collect(),
+            deployed_files: Vec::new(),
+            warnings: vec!["The selected game folder is already active.".to_string()],
+        });
+    }
+
+    let mut profile = old_profile.clone();
+    profile.game_path = normalized_game_path.clone();
     profile.game_id = detection.game_id.clone();
+    profile.steam_app_id = infer_steam_app_id_for_game_path(Path::new(&normalized_game_path));
     profile.engine = detection.engine.clone();
     profile.loader = detection.loader.clone();
     profile.updated_at = now_string();
-    profiles.items[profile_index] = profile.clone();
-    write_store(&profiles_file, &profiles).map_err(error_to_string)?;
 
-    let mut warnings = install_profile_bootstrap_dependencies(root, &profile);
-    let mut redeploy_result = redeploy_enabled_profile_mods(root, &profile)?;
-    warnings.append(&mut redeploy_result.warnings);
+    let installed_mods_file = installed_mods_path(root);
+    let original_mod_store =
+        read_store::<InstalledModRecord>(&installed_mods_file).map_err(error_to_string)?;
+    let mut next_mod_store = StoreFile {
+        version: original_mod_store.version,
+        items: original_mod_store.items.clone(),
+    };
+    validate_profile_migration_plans(&profile, &next_mod_store.items)?;
+
+    let enabled_originals = original_mod_store
+        .items
+        .iter()
+        .filter(|record| record.profile_id == profile_id && record.enabled)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut deactivated = Vec::new();
+    for record in &enabled_originals {
+        if let Err(error) = deactivate_mod_files(root, &old_profile, record) {
+            restore_deactivated_mods(root, &old_profile, &deactivated);
+            return Err(format!("Game-folder migration was cancelled: {error}"));
+        }
+        deactivated.push(record.clone());
+        let _ = fs::remove_dir_all(profile_backup_dir(root, profile_id, &record.id));
+    }
+
+    let mut migrated_records = Vec::new();
+    let migration = (|| -> Result<Vec<String>, String> {
+        let mut deployed_files = Vec::new();
+        for record in next_mod_store
+            .items
+            .iter_mut()
+            .filter(|record| record.profile_id == profile_id && record.enabled)
+        {
+            let plan = record.plan.clone().ok_or_else(|| {
+                format!(
+                    "{} cannot be migrated because its original install plan is unavailable.",
+                    display_record_name(record)
+                )
+            })?;
+            if let Some(reason) = incompatible_install_plan_reason(&profile, &plan) {
+                return Err(format!("{}: {reason}", display_record_name(record)));
+            }
+            record.files_written.clear();
+            record.backups_written.clear();
+            record.written_file_hashes.clear();
+            let install_id = record.id.clone();
+            let archive_path = record.archive_path.clone();
+            let files =
+                deploy_mod_files(root, &profile, &install_id, &archive_path, &plan, record)?;
+            record.config_files = config_files_from_paths(&files);
+            record.last_status = "installed".to_string();
+            deployed_files.extend(files);
+            migrated_records.push(record.clone());
+            write_receipt(root, &profile, record)?;
+        }
+        Ok(deployed_files)
+    })();
+
+    let deployed_files = match migration {
+        Ok(files) => files,
+        Err(error) => {
+            rollback_profile_migration(
+                root,
+                &old_profile,
+                &profile,
+                &migrated_records,
+                &deactivated,
+            );
+            return Err(format!("Game-folder migration was rolled back: {error}"));
+        }
+    };
+
+    profiles.items[profile_index] = profile.clone();
+    if let Err(error) = write_store(&installed_mods_file, &next_mod_store) {
+        rollback_profile_migration(
+            root,
+            &old_profile,
+            &profile,
+            &migrated_records,
+            &deactivated,
+        );
+        return Err(error_to_string(error));
+    }
+    if let Err(error) = write_store(&profiles_file, &profiles) {
+        let _ = write_store(&installed_mods_file, &original_mod_store);
+        rollback_profile_migration(
+            root,
+            &old_profile,
+            &profile,
+            &migrated_records,
+            &deactivated,
+        );
+        return Err(error_to_string(error));
+    }
+
+    let warnings = install_profile_bootstrap_dependencies(root, &profile);
+    let installed_mods = next_mod_store
+        .items
+        .into_iter()
+        .filter(|record| record.profile_id == profile_id)
+        .collect();
 
     Ok(ProfileGameFolderUpdateResult {
         profile,
         detection,
-        installed_mods: redeploy_result.installed_mods,
-        deployed_files: redeploy_result.deployed_files,
+        installed_mods,
+        deployed_files,
         warnings,
     })
 }
@@ -1247,6 +2087,92 @@ fn import_profile_bundle_impl(
     bundle_path: &Path,
     game_path: &Path,
 ) -> Result<ProfileImportResult, String> {
+    let profiles_file = profiles_path(root);
+    let installed_mods_file = installed_mods_path(root);
+    let profiles_before = read_store::<GameProfile>(&profiles_file).map_err(error_to_string)?;
+    let mods_before =
+        read_store::<InstalledModRecord>(&installed_mods_file).map_err(error_to_string)?;
+    let existing_profile_ids = profiles_before
+        .items
+        .iter()
+        .map(|profile| profile.id.clone())
+        .collect::<HashSet<_>>();
+    let transaction_root = root
+        .join("transactions")
+        .join(format!("profile-import-{}", Uuid::new_v4()));
+    fs::create_dir_all(&transaction_root).map_err(error_to_string)?;
+
+    let bundle_file = File::open(bundle_path).map_err(error_to_string)?;
+    let mut zip = ZipArchive::new(bundle_file).map_err(error_to_string)?;
+    validate_zip_archive_safety(&mut zip)?;
+    let manifest = read_bundle_manifest(&mut zip)?;
+    let mut config_snapshots = Vec::new();
+    for (index, config) in manifest.config_files.iter().enumerate() {
+        let destination = safe_join(game_path, &config.target_relative_path)?;
+        let snapshot = if destination.exists() {
+            let snapshot = transaction_root.join(format!("config-{index}.bin"));
+            fs::copy(&destination, &snapshot).map_err(error_to_string)?;
+            Some(snapshot)
+        } else {
+            None
+        };
+        config_snapshots.push(DeploymentRollbackEntry {
+            destination,
+            immediate_backup: snapshot,
+        });
+    }
+    drop(zip);
+
+    let result = import_profile_bundle_impl_unchecked(root, bundle_path, game_path);
+    if result.is_ok() {
+        let _ = fs::remove_dir_all(transaction_root);
+        return result;
+    }
+
+    let profiles_after = read_store::<GameProfile>(&profiles_file).unwrap_or(StoreFile {
+        version: profiles_before.version,
+        items: Vec::new(),
+    });
+    let mods_after = read_store::<InstalledModRecord>(&installed_mods_file).unwrap_or(StoreFile {
+        version: mods_before.version,
+        items: Vec::new(),
+    });
+    let added_profiles = profiles_after
+        .items
+        .iter()
+        .filter(|profile| !existing_profile_ids.contains(&profile.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    for profile in &added_profiles {
+        for record in mods_after
+            .items
+            .iter()
+            .filter(|record| record.profile_id == profile.id && record.enabled)
+        {
+            let _ = deactivate_mod_files(root, profile, record);
+        }
+    }
+    for snapshot in config_snapshots.iter().rev() {
+        if let Some(source) = &snapshot.immediate_backup {
+            let _ = replace_file_from_path(source, &snapshot.destination);
+        } else if snapshot.destination.exists() {
+            let _ = fs::remove_file(&snapshot.destination);
+        }
+    }
+    let _ = write_store(&installed_mods_file, &mods_before);
+    let _ = write_store(&profiles_file, &profiles_before);
+    for profile in added_profiles {
+        let _ = fs::remove_dir_all(profile_dir(root, &profile.id));
+    }
+    let _ = fs::remove_dir_all(transaction_root);
+    result
+}
+
+fn import_profile_bundle_impl_unchecked(
+    root: &Path,
+    bundle_path: &Path,
+    game_path: &Path,
+) -> Result<ProfileImportResult, String> {
     if !bundle_path.is_file() {
         return Err(format!(
             "Profile bundle does not exist: {}",
@@ -1262,6 +2188,7 @@ fn import_profile_bundle_impl(
 
     let bundle_file = File::open(bundle_path).map_err(error_to_string)?;
     let mut zip = ZipArchive::new(bundle_file).map_err(error_to_string)?;
+    validate_zip_archive_safety(&mut zip)?;
     let manifest = read_bundle_manifest(&mut zip)?;
     if manifest.schema_version != 1 {
         return Err(format!(
@@ -1471,95 +2398,6 @@ fn install_profile_bootstrap_dependencies(root: &Path, profile: &GameProfile) ->
     warnings
 }
 
-fn redeploy_enabled_profile_mods(
-    root: &Path,
-    profile: &GameProfile,
-) -> Result<RedeployProfileModsResult, String> {
-    let installed_mods_file = installed_mods_path(root);
-    let mut store =
-        read_store::<InstalledModRecord>(&installed_mods_file).map_err(error_to_string)?;
-    let mut deployed_files = Vec::new();
-    let mut warnings = Vec::new();
-
-    for record in store
-        .items
-        .iter_mut()
-        .filter(|record| record.profile_id == profile.id)
-    {
-        if !record.enabled {
-            continue;
-        }
-
-        let Some(plan) = record.plan.clone() else {
-            warnings.push(format!(
-                "Could not redeploy {} because no install plan was stored.",
-                display_record_name(record)
-            ));
-            continue;
-        };
-        if let Some(reason) = incompatible_install_plan_reason(profile, &plan) {
-            record.enabled = false;
-            record.last_status = "failed".to_string();
-            warnings.push(format!(
-                "Skipped {}: {}",
-                display_record_name(record),
-                reason
-            ));
-            continue;
-        }
-
-        let mut visited_dependencies = HashSet::new();
-        match install_dependencies_for_plan(root, profile, &plan, &mut visited_dependencies, 0) {
-            Ok(mut dependency_warnings) => warnings.append(&mut dependency_warnings),
-            Err(error) => warnings.push(format!(
-                "Could not install dependencies for {}: {}",
-                display_record_name(record),
-                error
-            )),
-        }
-
-        match deploy_mod_files(
-            root,
-            profile,
-            &record.id.clone(),
-            &record.archive_path.clone(),
-            &plan,
-            record,
-        ) {
-            Ok(files) => {
-                record.files_written = files.clone();
-                record.config_files = config_files_from_paths(&record.files_written);
-                record.dependencies = record
-                    .dependencies
-                    .iter()
-                    .map(|dependency| refresh_dependency_status(root, profile, dependency))
-                    .collect();
-                record.last_status = "installed".to_string();
-                deployed_files.extend(files);
-                write_receipt(root, profile, record)?;
-            }
-            Err(error) => warnings.push(format!(
-                "Could not redeploy {}: {}",
-                display_record_name(record),
-                error
-            )),
-        }
-    }
-
-    write_store(&installed_mods_file, &store).map_err(error_to_string)?;
-    let installed_mods = store
-        .items
-        .into_iter()
-        .filter(|record| record.profile_id == profile.id)
-        .collect();
-
-    Ok(RedeployProfileModsResult {
-        installed_mods,
-        deployed_files,
-        warnings,
-    })
-}
-
 fn read_bundle_manifest(zip: &mut ZipArchive<File>) -> Result<ProfileBundleManifest, String> {
     let manifest_file = zip
         .by_name("manifest.json")
@@ -1715,11 +2553,53 @@ fn extract_zip_file(
     if zip_file.name().ends_with('/') {
         return Err(format!("Expected a file but found a folder: {entry_name}"));
     }
+    validate_archive_relative_path(entry_name)?;
+    validate_archive_file_size(entry_name, zip_file.size(), zip_file.compressed_size())?;
     if let Some(parent) = destination_path.parent() {
         fs::create_dir_all(parent).map_err(error_to_string)?;
     }
-    let mut output = File::create(destination_path).map_err(error_to_string)?;
-    io::copy(&mut zip_file, &mut output).map_err(error_to_string)?;
+    let temporary = destination_path.with_file_name(format!(
+        ".{}.{}.extracting",
+        destination_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("bundle-file"),
+        Uuid::new_v4()
+    ));
+    let result = (|| -> Result<(), String> {
+        let mut output = File::create(&temporary).map_err(error_to_string)?;
+        copy_with_limit(&mut zip_file, &mut output, MAX_ARCHIVE_FILE_BYTES)?;
+        output.sync_all().map_err(error_to_string)?;
+        replace_file_from_path(&temporary, destination_path)
+    })();
+    if temporary.exists() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
+fn validate_zip_archive_safety(zip: &mut ZipArchive<File>) -> Result<(), String> {
+    if zip.len() > MAX_ARCHIVE_ENTRIES {
+        return Err(format!(
+            "Archive contains too many entries (maximum {}).",
+            MAX_ARCHIVE_ENTRIES
+        ));
+    }
+    let mut expanded_bytes = 0_u64;
+    for index in 0..zip.len() {
+        let file = zip.by_index(index).map_err(error_to_string)?;
+        validate_archive_relative_path(file.name())?;
+        if file.is_dir() {
+            continue;
+        }
+        validate_archive_file_size(file.name(), file.size(), file.compressed_size())?;
+        expanded_bytes = expanded_bytes
+            .checked_add(file.size())
+            .ok_or_else(|| "Archive expanded size overflowed its safety limit.".to_string())?;
+        if expanded_bytes > MAX_ARCHIVE_EXPANDED_BYTES {
+            return Err("Archive exceeds the expanded-size safety limit.".to_string());
+        }
+    }
     Ok(())
 }
 
@@ -1790,45 +2670,61 @@ fn display_record_name(record: &InstalledModRecord) -> String {
 }
 
 #[tauri::command]
-fn detect_game_setup(game_path: String) -> Result<GameDetectionResult, String> {
-    detect_game_setup_impl(Path::new(&game_path))
+async fn detect_game_setup(game_path: String) -> Result<GameDetectionResult, String> {
+    tauri::async_runtime::spawn_blocking(move || detect_game_setup_impl(Path::new(&game_path)))
+        .await
+        .map_err(error_to_string)?
 }
 
 #[tauri::command]
-fn analyze_archive_for_profile(
+async fn analyze_archive_for_profile(
     app: AppHandle,
     profile_id: String,
     archive_path: String,
 ) -> Result<ArchiveAnalysis, String> {
-    let root = store_root(&app)?;
-    let profile = get_profile(&root, &profile_id)?;
-    let scanned = scan_import_source(&root, Path::new(&archive_path))?;
-    Ok(analyze_scanned_archive(scanned, &profile))
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = store_root(&app)?;
+        let profile = get_profile(&root, &profile_id)?;
+        let scanned = scan_import_source(&root, Path::new(&archive_path))?;
+        Ok(analyze_scanned_archive(scanned, &profile))
+    })
+    .await
+    .map_err(error_to_string)?
 }
 
 #[tauri::command]
-fn install_archive(app: AppHandle, request: InstallRequest) -> Result<InstallResult, String> {
-    let root = store_root(&app)?;
-    let profile = get_profile(&root, &request.profile_id)?;
-    install_archive_impl(
-        &root,
-        &profile,
-        &request.archive_path,
-        request.archive_name.as_deref(),
-        &request.plan,
-    )
+async fn install_archive(app: AppHandle, request: InstallRequest) -> Result<InstallResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation = lock_mutations()?;
+        let root = store_root(&app)?;
+        let profile = get_profile(&root, &request.profile_id)?;
+        install_archive_impl(
+            &root,
+            &profile,
+            &request.archive_path,
+            request.archive_name.as_deref(),
+            request.package_identity,
+            &request.plan,
+        )
+    })
+    .await
+    .map_err(error_to_string)?
 }
 
 #[tauri::command]
 async fn discover_online_mods(
     app: AppHandle,
     profile_id: String,
-) -> Result<Vec<OnlineModRecord>, String> {
+    page: usize,
+    page_size: usize,
+    sort: String,
+    query: String,
+) -> Result<DiscoveryPage, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let root = store_root(&app)?;
         let profile = get_profile(&root, &profile_id)?;
         let settings = read_app_settings(&root)?;
-        discover_online_mods_for_profile(&root, &profile, &settings)
+        discover_online_mods_for_profile(&root, &profile, &settings, page, page_size, &sort, &query)
     })
     .await
     .map_err(error_to_string)?
@@ -1841,17 +2737,32 @@ async fn install_discovered_mod(
     provider: String,
     mod_id: String,
     version: Option<String>,
+    provider_game_id: Option<String>,
+    selected_file_id: Option<String>,
 ) -> Result<InstallResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _operation = lock_mutations()?;
         let root = store_root(&app)?;
         let profile = get_profile(&root, &profile_id)?;
         let settings = read_app_settings(&root)?;
 
         match provider.as_str() {
-            "thunderstore" => {
-                install_thunderstore_discovered_mod(&root, &profile, &mod_id, version)
-            }
-            "nexus" => install_nexus_discovered_mod(&root, &profile, &mod_id, &settings),
+            "thunderstore" => install_thunderstore_discovered_mod(
+                &root,
+                &profile,
+                &mod_id,
+                version.clone(),
+                provider_game_id.as_deref(),
+            ),
+            "nexus" => install_nexus_discovered_mod(
+                &root,
+                &profile,
+                &mod_id,
+                &settings,
+                version,
+                provider_game_id.as_deref(),
+                selected_file_id.as_deref(),
+            ),
             _ => Err(format!(
                 "{} discovery install is not supported in this build.",
                 provider
@@ -1863,13 +2774,139 @@ async fn install_discovered_mod(
 }
 
 #[tauri::command]
+async fn list_discovered_mod_files(
+    app: AppHandle,
+    profile_id: String,
+    provider: String,
+    mod_id: String,
+    provider_game_id: Option<String>,
+) -> Result<Vec<OnlineModFileOption>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = store_root(&app)?;
+        let profile = get_profile(&root, &profile_id)?;
+        let settings = read_app_settings(&root)?;
+        list_discovered_mod_files_impl(
+            &profile,
+            &settings,
+            &provider,
+            &mod_id,
+            provider_game_id.as_deref(),
+        )
+    })
+    .await
+    .map_err(error_to_string)?
+}
+
+#[tauri::command]
+async fn begin_nexus_browser_download(
+    app: AppHandle,
+    profile_id: String,
+    mod_id: String,
+    version: Option<String>,
+    provider_game_id: Option<String>,
+    selected_file_id: String,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation = lock_mutations()?;
+        let root = store_root(&app)?;
+        let profile = get_profile(&root, &profile_id)?;
+        let settings = read_app_settings(&root)?;
+        let api_key = settings.nexus_api_key().ok_or_else(|| {
+            "Add your Nexus API key in Settings before downloading Nexus mods.".to_string()
+        })?;
+        let (domain, nexus_mod_id) = parse_nexus_online_mod_id(&mod_id)?;
+        let verified_provider_game_id = verified_discovery_provider_game(
+            &profile,
+            "nexus",
+            provider_game_id.as_deref(),
+            Some(&domain),
+        )?;
+        let client = provider_client()?;
+        let files = fetch_nexus_mod_files(&client, api_key, &domain, nexus_mod_id)?;
+        let file = choose_requested_nexus_file(&files, Some(&selected_file_id))?
+            .ok_or_else(|| "The selected Nexus file is no longer available.".to_string())?;
+        let now = Utc::now().timestamp();
+        let pending = PendingNexusDownload {
+            profile_id,
+            domain: domain.clone(),
+            mod_id: nexus_mod_id,
+            file_id: file.file_id,
+            version: version.or_else(|| file.version.clone()),
+            provider_game_id: verified_provider_game_id,
+            created_at: now,
+        };
+        store_pending_nexus_download(&root, pending, now)?;
+
+        Ok(nexus_manager_download_page_url(
+            &domain,
+            nexus_mod_id,
+            file.file_id,
+        ))
+    })
+    .await
+    .map_err(error_to_string)?
+}
+
+#[tauri::command]
+async fn install_nexus_nxm_link(
+    app: AppHandle,
+    nxm_url: String,
+) -> Result<NexusNxmInstallResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation = lock_mutations()?;
+        let root = store_root(&app)?;
+        let settings = read_app_settings(&root)?;
+        let api_key = settings.nexus_api_key().ok_or_else(|| {
+            "Your Nexus API key is missing. Add it in Settings and try the download again."
+                .to_string()
+        })?;
+        let nxm = parse_nexus_nxm_link(&nxm_url)?;
+        let pending = find_pending_nexus_download(&root, &nxm)?;
+        let profile = get_profile(&root, &pending.profile_id)?;
+        let provider_game_id = verified_discovery_provider_game(
+            &profile,
+            "nexus",
+            Some(&pending.provider_game_id),
+            Some(&nxm.domain),
+        )?;
+        let client = provider_client()?;
+        let files = fetch_nexus_mod_files(&client, api_key, &nxm.domain, nxm.mod_id)?;
+        let file = choose_requested_nexus_file(&files, Some(&nxm.file_id.to_string()))?
+            .ok_or_else(|| "The Nexus file from this download link is no longer available.".to_string())?;
+        let links = fetch_nexus_download_links_with_nxm(&client, api_key, &nxm)?;
+        let download_url = nexus_http_download_url(&links).ok_or_else(|| {
+            "Nexus authorized the request but did not return a usable download server. Try the download again."
+                .to_string()
+        })?;
+        let install_result = install_resolved_nexus_file(
+            &root,
+            &profile,
+            &client,
+            &nxm.domain,
+            nxm.mod_id,
+            &file,
+            &download_url,
+            pending.version,
+            provider_game_id,
+        )?;
+        remove_pending_nexus_download(&root, &nxm)?;
+
+        Ok(NexusNxmInstallResult {
+            mod_id: format!("nexus:{}/{}", nxm.domain, nxm.mod_id),
+            install_result,
+        })
+    })
+    .await
+    .map_err(error_to_string)?
+}
+
+#[tauri::command]
 fn list_installed_mods(
     app: AppHandle,
     profile_id: String,
 ) -> Result<Vec<InstalledModRecord>, String> {
     let root = store_root(&app)?;
-    let profile = get_profile(&root, &profile_id)?;
-    let discovered_config_files = discover_profile_config_files(&profile);
+    get_profile(&root, &profile_id)?;
     let items = read_store::<InstalledModRecord>(&installed_mods_path(&root))
         .map_err(error_to_string)?
         .items;
@@ -1877,8 +2914,6 @@ fn list_installed_mods(
         .into_iter()
         .filter(|record| record.profile_id == profile_id)
         .map(|mut record| {
-            record.config_files =
-                resolved_config_files_for_record(&profile, &record, &discovered_config_files);
             record.display_name = record
                 .display_name
                 .as_deref()
@@ -1889,7 +2924,19 @@ fn list_installed_mods(
 }
 
 #[tauri::command]
-fn get_mod_config_details(
+async fn get_mod_config_details(
+    app: AppHandle,
+    profile_id: String,
+    installed_mod_id: String,
+) -> Result<Vec<ModConfigFile>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        get_mod_config_details_sync(app, profile_id, installed_mod_id)
+    })
+    .await
+    .map_err(error_to_string)?
+}
+
+fn get_mod_config_details_sync(
     app: AppHandle,
     profile_id: String,
     installed_mod_id: String,
@@ -1917,19 +2964,31 @@ fn update_mod_config_value(
     app: AppHandle,
     input: UpdateModConfigValueInput,
 ) -> Result<ModConfigFile, String> {
+    let _operation = lock_mutations()?;
     let root = store_root(&app)?;
     let profile = get_profile(&root, &input.profile_id)?;
     let path = PathBuf::from(&input.file_path);
 
     validate_config_file_for_edit(&root, &profile, &path)?;
     let content = fs::read_to_string(&path).map_err(error_to_string)?;
-    let next_content = match path
+    let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
-        .map(|extension| extension.to_lowercase())
-        .as_deref()
-    {
+        .map(|extension| extension.to_lowercase());
+    let next_content = match extension.as_deref() {
         Some("json") => update_json_config_content(
+            &content,
+            input.section.as_deref(),
+            &input.key,
+            &input.value,
+        )?,
+        Some("toml") => update_toml_config_content(
+            &content,
+            input.section.as_deref(),
+            &input.key,
+            &input.value,
+        )?,
+        Some("yaml") | Some("yml") => update_yaml_config_content(
             &content,
             input.section.as_deref(),
             &input.key,
@@ -1943,99 +3002,317 @@ fn update_mod_config_value(
         )?,
     };
 
-    fs::write(&path, next_content).map_err(error_to_string)?;
+    validate_structured_config_content(extension.as_deref(), &next_content)?;
+    atomic_write(&path, next_content.as_bytes()).map_err(error_to_string)?;
     read_mod_config_file(&root, &profile, &input.file_path)
 }
 
 #[tauri::command]
-fn disable_mod(
+async fn disable_mod(
     app: AppHandle,
     profile_id: String,
     installed_mod_id: String,
 ) -> Result<ModActionResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        disable_mod_sync(app, profile_id, installed_mod_id)
+    })
+    .await
+    .map_err(error_to_string)?
+}
+
+fn disable_mod_sync(
+    app: AppHandle,
+    profile_id: String,
+    installed_mod_id: String,
+) -> Result<ModActionResult, String> {
+    let _operation = lock_mutations()?;
     let root = store_root(&app)?;
     let profile = get_profile(&root, &profile_id)?;
-    update_installed_mod(&root, &installed_mod_id, |record| {
-        if record.profile_id != profile_id {
-            return Err("Installed mod does not belong to the selected profile.".to_string());
-        }
+    let path = installed_mods_path(&root);
+    let mut store = read_store::<InstalledModRecord>(&path).map_err(error_to_string)?;
+    let record_index = store
+        .items
+        .iter()
+        .position(|record| record.id == installed_mod_id && record.profile_id == profile_id)
+        .ok_or_else(|| format!("Installed mod not found: {installed_mod_id}"))?;
+    let original = store.items[record_index].clone();
+    if !original.enabled {
+        return Ok(ModActionResult {
+            profile_id,
+            installed_mod_id,
+            status: original.last_status,
+            files_changed: Vec::new(),
+            warnings: vec!["Mod is already disabled.".to_string()],
+        });
+    }
 
-        if !record.enabled {
-            return Ok(ModActionResult {
-                profile_id: profile_id.clone(),
-                installed_mod_id: installed_mod_id.clone(),
-                status: record.last_status.clone(),
-                files_changed: Vec::new(),
-                warnings: vec!["Mod is already disabled.".to_string()],
-            });
-        }
+    let files_changed = deactivate_mod_files(&root, &profile, &original)?;
+    let mut updated = original.clone();
+    updated.enabled = false;
+    updated.last_status = "disabled".to_string();
+    store.items[record_index] = updated.clone();
 
-        let files_changed = deactivate_mod_files(&root, &profile, record)?;
-        record.enabled = false;
-        record.last_status = "disabled".to_string();
+    if let Err(error) = write_receipt(&root, &profile, &updated) {
+        restore_deactivated_mods(&root, &profile, std::slice::from_ref(&original));
+        return Err(error);
+    }
+    if let Err(error) = write_store(&path, &store) {
+        restore_deactivated_mods(&root, &profile, std::slice::from_ref(&original));
+        let _ = write_receipt(&root, &profile, &original);
+        return Err(error_to_string(error));
+    }
 
-        Ok(ModActionResult {
-            profile_id: profile_id.clone(),
-            installed_mod_id: installed_mod_id.clone(),
-            status: "disabled".to_string(),
-            files_changed,
-            warnings: Vec::new(),
-        })
+    Ok(ModActionResult {
+        profile_id,
+        installed_mod_id,
+        status: "disabled".to_string(),
+        files_changed,
+        warnings: Vec::new(),
     })
 }
 
 #[tauri::command]
-fn enable_mod(
+async fn enable_mod(
     app: AppHandle,
     profile_id: String,
     installed_mod_id: String,
 ) -> Result<ModActionResult, String> {
+    tauri::async_runtime::spawn_blocking(move || enable_mod_sync(app, profile_id, installed_mod_id))
+        .await
+        .map_err(error_to_string)?
+}
+
+fn enable_mod_sync(
+    app: AppHandle,
+    profile_id: String,
+    installed_mod_id: String,
+) -> Result<ModActionResult, String> {
+    let _operation = lock_mutations()?;
     let root = store_root(&app)?;
     let profile = get_profile(&root, &profile_id)?;
-    update_installed_mod(&root, &installed_mod_id, |record| {
-        if record.profile_id != profile_id {
-            return Err("Installed mod does not belong to the selected profile.".to_string());
-        }
+    let path = installed_mods_path(&root);
+    let mut store = read_store::<InstalledModRecord>(&path).map_err(error_to_string)?;
+    let record_index = store
+        .items
+        .iter()
+        .position(|record| record.id == installed_mod_id && record.profile_id == profile_id)
+        .ok_or_else(|| format!("Installed mod not found: {installed_mod_id}"))?;
+    let original = store.items[record_index].clone();
+    if original.enabled {
+        return Ok(ModActionResult {
+            profile_id,
+            installed_mod_id,
+            status: original.last_status,
+            files_changed: Vec::new(),
+            warnings: vec!["Mod is already enabled.".to_string()],
+        });
+    }
 
-        if record.enabled {
-            return Ok(ModActionResult {
-                profile_id: profile_id.clone(),
-                installed_mod_id: installed_mod_id.clone(),
-                status: record.last_status.clone(),
-                files_changed: Vec::new(),
-                warnings: vec!["Mod is already enabled.".to_string()],
-            });
-        }
+    let plan = original.plan.clone().ok_or_else(|| {
+        "This older install record cannot be re-enabled because it has no install plan.".to_string()
+    })?;
+    let deployment = deploy_plan_transaction(
+        &root,
+        &profile,
+        &original.id,
+        Path::new(&original.archive_path),
+        &plan,
+        Some(&original.id),
+    )?;
+    let mut updated = original.clone();
+    updated.enabled = true;
+    updated.last_status = "installed".to_string();
+    updated.files_written = deployment.files_written.clone();
+    updated.backups_written = deployment.backups_written.clone();
+    updated.written_file_hashes = deployment.written_file_hashes.clone();
+    updated.config_files = config_files_from_paths(&updated.files_written);
+    store.items[record_index] = updated.clone();
 
-        let plan = record.plan.clone().ok_or_else(|| {
-            "This older install record cannot be re-enabled because it has no install plan."
-                .to_string()
-        })?;
-        let install_id = record.id.clone();
-        let archive_path = record.archive_path.clone();
-        let files_changed =
-            deploy_mod_files(&root, &profile, &install_id, &archive_path, &plan, record)?;
-        record.enabled = true;
-        record.last_status = "installed".to_string();
-        record.files_written = files_changed.clone();
-        record.config_files = config_files_from_paths(&record.files_written);
+    if let Err(error) = write_receipt(&root, &profile, &updated) {
+        deployment.rollback();
+        return Err(error);
+    }
+    if let Err(error) = write_store(&path, &store) {
+        deployment.rollback();
+        let _ = write_receipt(&root, &profile, &original);
+        return Err(error_to_string(error));
+    }
+    let files_changed = deployment.files_written.clone();
+    deployment.commit();
 
-        Ok(ModActionResult {
-            profile_id: profile_id.clone(),
-            installed_mod_id: installed_mod_id.clone(),
-            status: "installed".to_string(),
-            files_changed,
-            warnings: Vec::new(),
-        })
+    Ok(ModActionResult {
+        profile_id,
+        installed_mod_id,
+        status: "installed".to_string(),
+        files_changed,
+        warnings: Vec::new(),
     })
 }
 
 #[tauri::command]
-fn remove_mod(
+async fn set_all_profile_mods_enabled(
+    app: AppHandle,
+    profile_id: String,
+    enabled: bool,
+) -> Result<ProfileModToggleResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        set_all_profile_mods_enabled_sync(app, profile_id, enabled)
+    })
+    .await
+    .map_err(error_to_string)?
+}
+
+fn set_all_profile_mods_enabled_sync(
+    app: AppHandle,
+    profile_id: String,
+    enabled: bool,
+) -> Result<ProfileModToggleResult, String> {
+    let _operation = lock_mutations()?;
+    let root = store_root(&app)?;
+    let profile = get_profile(&root, &profile_id)?;
+    let store_path = installed_mods_path(&root);
+    let original_store = read_store::<InstalledModRecord>(&store_path).map_err(error_to_string)?;
+    let mut next_store = StoreFile {
+        version: original_store.version,
+        items: original_store.items.clone(),
+    };
+    let target_indices = next_store
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| record.profile_id == profile_id && record.enabled != enabled)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let mut files_changed = Vec::new();
+    let mut deployments = Vec::<DeploymentOutcome>::new();
+    let mut deactivated = Vec::<InstalledModRecord>::new();
+
+    if enabled {
+        for index in &target_indices {
+            next_store.items[*index].enabled = true;
+        }
+        let pending_records = target_indices
+            .iter()
+            .map(|index| next_store.items[*index].clone())
+            .collect::<Vec<_>>();
+        validate_profile_migration_plans(&profile, &pending_records)?;
+
+        for index in &target_indices {
+            let original = &original_store.items[*index];
+            let plan = original.plan.as_ref().ok_or_else(|| {
+                format!(
+                    "{} cannot be enabled because its install plan is unavailable.",
+                    display_record_name(original)
+                )
+            })?;
+            let deployment = match deploy_plan_transaction(
+                &root,
+                &profile,
+                &original.id,
+                Path::new(&original.archive_path),
+                plan,
+                Some(&original.id),
+            ) {
+                Ok(deployment) => deployment,
+                Err(error) => {
+                    for deployment in deployments.iter().rev() {
+                        deployment.rollback();
+                    }
+                    return Err(format!("{}: {error}", display_record_name(original)));
+                }
+            };
+            let updated = &mut next_store.items[*index];
+            updated.enabled = true;
+            updated.last_status = "installed".to_string();
+            updated.files_written = deployment.files_written.clone();
+            updated.backups_written = deployment.backups_written.clone();
+            updated.written_file_hashes = deployment.written_file_hashes.clone();
+            updated.config_files = config_files_from_paths(&updated.files_written);
+            files_changed.extend(deployment.files_written.clone());
+            deployments.push(deployment);
+        }
+    } else {
+        for index in &target_indices {
+            let original = original_store.items[*index].clone();
+            match deactivate_mod_files(&root, &profile, &original) {
+                Ok(files) => files_changed.extend(files),
+                Err(error) => {
+                    restore_deactivated_mods(&root, &profile, &deactivated);
+                    return Err(format!("{}: {error}", display_record_name(&original)));
+                }
+            }
+            deactivated.push(original);
+            next_store.items[*index].enabled = false;
+            next_store.items[*index].last_status = "disabled".to_string();
+        }
+    }
+
+    for index in &target_indices {
+        if let Err(error) = write_receipt(&root, &profile, &next_store.items[*index]) {
+            for deployment in deployments.iter().rev() {
+                deployment.rollback();
+            }
+            restore_deactivated_mods(&root, &profile, &deactivated);
+            for original in original_store
+                .items
+                .iter()
+                .filter(|record| record.profile_id == profile_id)
+            {
+                let _ = write_receipt(&root, &profile, original);
+            }
+            return Err(error);
+        }
+    }
+    if let Err(error) = write_store(&store_path, &next_store) {
+        for deployment in deployments.iter().rev() {
+            deployment.rollback();
+        }
+        restore_deactivated_mods(&root, &profile, &deactivated);
+        for original in original_store
+            .items
+            .iter()
+            .filter(|record| record.profile_id == profile_id)
+        {
+            let _ = write_receipt(&root, &profile, original);
+        }
+        return Err(error_to_string(error));
+    }
+    for deployment in deployments {
+        deployment.commit();
+    }
+
+    let installed_mods = next_store
+        .items
+        .into_iter()
+        .filter(|record| record.profile_id == profile_id)
+        .collect();
+    Ok(ProfileModToggleResult {
+        profile_id,
+        enabled,
+        changed_mods: target_indices.len(),
+        files_changed,
+        warnings: Vec::new(),
+        installed_mods,
+    })
+}
+
+#[tauri::command]
+async fn remove_mod(
     app: AppHandle,
     profile_id: String,
     installed_mod_id: String,
 ) -> Result<ModActionResult, String> {
+    tauri::async_runtime::spawn_blocking(move || remove_mod_sync(app, profile_id, installed_mod_id))
+        .await
+        .map_err(error_to_string)?
+}
+
+fn remove_mod_sync(
+    app: AppHandle,
+    profile_id: String,
+    installed_mod_id: String,
+) -> Result<ModActionResult, String> {
+    let _operation = lock_mutations()?;
     let root = store_root(&app)?;
     let profile = get_profile(&root, &profile_id)?;
     let path = installed_mods_path(&root);
@@ -2052,11 +3329,13 @@ fn remove_mod(
         Vec::new()
     };
 
-    let receipt_path = profile_dir(&root, &profile_id)
-        .join("receipts")
-        .join(format!("{}.json", record.id));
-    let _ = fs::remove_file(receipt_path);
-    write_store(&path, &store).map_err(error_to_string)?;
+    if let Err(error) = write_store(&path, &store) {
+        if record.enabled {
+            restore_deactivated_mods(&root, &profile, std::slice::from_ref(&record));
+        }
+        return Err(error_to_string(error));
+    }
+    cleanup_install_data(&root, &profile_id, &record.id);
 
     Ok(ModActionResult {
         profile_id,
@@ -2099,7 +3378,7 @@ fn download_update_installer(
     url: String,
     file_name: Option<String>,
 ) -> Result<String, String> {
-    let trimmed_url = validated_http_url(&url)?;
+    let trimmed_url = validated_update_url(&url)?;
     let safe_name = update_installer_file_name(&trimmed_url, file_name.as_deref())?;
     let download_dir = update_download_dir()?;
     fs::create_dir_all(&download_dir).map_err(error_to_string)?;
@@ -2113,6 +3392,16 @@ fn download_update_installer(
         .map_err(error_to_string)?;
 
     download_url_to_file(&client, &trimmed_url, &destination)?;
+    let checksum_url = format!("{trimmed_url}.sha256");
+    let expected_hash = download_update_checksum(&client, &checksum_url)?;
+    let actual_hash = sha256_file(&destination)?;
+    if !actual_hash.eq_ignore_ascii_case(&expected_hash) {
+        let _ = fs::remove_file(&destination);
+        return Err(
+            "The downloaded installer failed its SHA-256 integrity check and was deleted."
+                .to_string(),
+        );
+    }
     launch_update_installer(&destination)?;
 
     std::thread::spawn(move || {
@@ -2124,7 +3413,17 @@ fn download_update_installer(
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default();
+
+    #[cfg(windows)]
+    {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            reveal_main_window(app);
+        }));
+    }
+
+    builder
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
         .on_page_load(|webview, payload| {
             if !matches!(payload.event(), PageLoadEvent::Finished) {
@@ -2138,9 +3437,13 @@ pub fn run() {
 
             let _ = window.show();
             let _ = window.unminimize();
-            let _ = window.set_focus();
         })
         .setup(|app| {
+            #[cfg(windows)]
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                app.deep_link().register_all()?;
+            }
             setup_tray(app)?;
             Ok(())
         })
@@ -2161,7 +3464,13 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_app_settings,
             update_app_settings,
+            save_nexus_api_key,
+            scan_steam_games,
+            create_steam_profile,
+            launch_profile_game,
+            set_all_profile_mods_enabled,
             list_profiles,
+            profile_folder_exists,
             create_profile,
             rename_profile,
             remove_profile,
@@ -2174,7 +3483,10 @@ pub fn run() {
             analyze_archive_for_profile,
             install_archive,
             discover_online_mods,
+            list_discovered_mod_files,
             install_discovered_mod,
+            begin_nexus_browser_download,
+            install_nexus_nxm_link,
             list_installed_mods,
             get_mod_config_details,
             update_mod_config_value,
@@ -2191,6 +3503,13 @@ pub fn run() {
         .expect("failed to run UniLoader");
 }
 
+fn reveal_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+    }
+}
+
 fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
     let show_item = MenuItem::with_id(app, "tray-show", "Show UniLoader", true, None::<&str>)?;
     let hide_item = MenuItem::with_id(app, "tray-hide", "Hide to tray", true, None::<&str>)?;
@@ -2203,13 +3522,7 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
-            "tray-show" => {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.unminimize();
-                    let _ = window.set_focus();
-                }
-            }
+            "tray-show" => reveal_main_window(app),
             "tray-hide" => {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.hide();
@@ -2229,11 +3542,7 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
             };
 
             if button == MouseButton::Left && button_state == MouseButtonState::Up {
-                if let Some(window) = tray.app_handle().get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.unminimize();
-                    let _ = window.set_focus();
-                }
+                reveal_main_window(tray.app_handle());
             }
         });
 
@@ -2369,7 +3678,7 @@ fn score_engine(
         let lower_path = entry.relative_path.to_lowercase();
         let lower_name = entry.name.to_lowercase();
 
-        if entry.is_directory && lower_name.ends_with("_data") && entry.depth <= 2 {
+        if entry.is_directory && lower_name.ends_with("_data") && entry.depth <= 4 {
             add_score(
                 scores,
                 signals,
@@ -2388,7 +3697,7 @@ fn score_engine(
             );
         }
 
-        if !entry.is_directory && lower_name == "unityplayer.dll" && entry.depth <= 2 {
+        if !entry.is_directory && lower_name == "unityplayer.dll" && entry.depth <= 4 {
             add_score(
                 scores,
                 signals,
@@ -2554,6 +3863,22 @@ fn game_definition_by_id(game_id: &str) -> Option<&'static GameDefinition> {
         .find(|definition| definition.id.eq_ignore_ascii_case(game_id))
 }
 
+fn runtime_definitions() -> &'static [RuntimeDefinition] {
+    static RUNTIME_DEFINITIONS: OnceLock<Vec<RuntimeDefinition>> = OnceLock::new();
+    RUNTIME_DEFINITIONS
+        .get_or_init(|| {
+            parse_json_allow_bom::<Vec<RuntimeDefinition>>(RUNTIME_DEFINITIONS_JSON)
+                .expect("bundled UniLoader runtime definitions must be valid JSON")
+        })
+        .as_slice()
+}
+
+fn runtime_definition_by_id(runtime: &str) -> Option<&'static RuntimeDefinition> {
+    runtime_definitions()
+        .iter()
+        .find(|definition| definition.id.eq_ignore_ascii_case(runtime))
+}
+
 fn game_definition_matches(definition: &GameDefinition, entries: &[ProbeEntry]) -> bool {
     entries.iter().any(|entry| {
         let lower_name = entry.name.to_lowercase();
@@ -2588,7 +3913,7 @@ fn score_loaders(
         let lower_path = entry.relative_path.to_lowercase();
         let lower_name = entry.name.to_lowercase();
 
-        if lower_path == "bepinex" {
+        if lower_path == "bepinex" || lower_path.ends_with("/bepinex") {
             add_score(
                 scores,
                 signals,
@@ -2599,7 +3924,10 @@ fn score_loaders(
             );
         }
 
-        if !entry.is_directory && lower_path == "bepinex/core/bepinex.dll" {
+        if !entry.is_directory
+            && (lower_path == "bepinex/core/bepinex.dll"
+                || lower_path.ends_with("/bepinex/core/bepinex.dll"))
+        {
             add_score(
                 scores,
                 signals,
@@ -2632,7 +3960,11 @@ fn score_loaders(
             );
         }
 
-        if lower_path == "bepinex/interop" || lower_path.starts_with("bepinex/interop/") {
+        if lower_path == "bepinex/interop"
+            || lower_path.starts_with("bepinex/interop/")
+            || lower_path.contains("/bepinex/interop/")
+            || lower_path.ends_with("/bepinex/interop")
+        {
             add_score(
                 scores,
                 signals,
@@ -2691,7 +4023,7 @@ fn score_loaders(
             );
         }
 
-        if lower_path == "reframework" {
+        if lower_path == "reframework" || lower_path.ends_with("/reframework") {
             add_score(
                 scores,
                 signals,
@@ -2723,33 +4055,46 @@ fn prepare_mod_routes(
     entries: &[ProbeEntry],
 ) -> RoutePreparation {
     let mut routes = Vec::new();
+    let supported_adapters =
+        supported_adapters_for_detection(game_path, game_id, engine, loader, entries);
+    let supports = |adapter: &str| {
+        supported_adapters
+            .iter()
+            .any(|supported| supported.eq_ignore_ascii_case(adapter))
+    };
 
-    if (game_id == Some("valheim") || loader == "bepinex" || loader == "bepinex-il2cpp")
-        && (game_id == Some("valheim") || engine.starts_with("unity"))
-    {
-        push_unique_route(&mut routes, "BepInEx/plugins");
-        push_unique_route(&mut routes, "BepInEx/config");
+    if supports("bepinex") {
+        let roots = detected_loader_roots(entries, "bepinex", "BepInEx");
+        for root in roots {
+            push_unique_route(&mut routes, &format!("{root}/plugins"));
+            push_unique_route(&mut routes, &format!("{root}/config"));
+        }
     }
 
-    if engine == "unreal" || loader == "ue4ss" || game_id == Some("windrose") {
+    if supports("unreal-pak") {
         for pak_root in find_unreal_pak_roots(game_path) {
             push_unique_route(&mut routes, &format!("{}/~mods", pak_root));
         }
+    }
 
+    if supports("ue4ss") {
         for win64_root in find_unreal_win64_dirs(entries) {
             push_unique_route(&mut routes, &format!("{}/Mods", win64_root));
         }
     }
 
-    if engine == "unreal" || supports_native_script_mods(game_id, entries) {
+    if supports("script-files") {
         for script_root in native_script_routes_for_detection(game_id, entries) {
             push_unique_route(&mut routes, &script_root);
         }
     }
 
-    if engine == "re-engine" || loader == "reframework" || is_re_engine_game_id(game_id) {
-        push_unique_route(&mut routes, "reframework/autorun");
-        push_unique_route(&mut routes, "reframework/plugins");
+    if supports("reframework") {
+        let roots = detected_loader_roots(entries, "reframework", "reframework");
+        for root in roots {
+            push_unique_route(&mut routes, &format!("{root}/autorun"));
+            push_unique_route(&mut routes, &format!("{root}/plugins"));
+        }
     }
 
     let mut preparation = RoutePreparation::default();
@@ -2780,6 +4125,20 @@ fn prepare_mod_routes(
     }
 
     preparation
+}
+
+fn detected_loader_roots(entries: &[ProbeEntry], loader_dir: &str, fallback: &str) -> Vec<String> {
+    let mut roots = entries
+        .iter()
+        .filter(|entry| entry.is_directory && entry.name.eq_ignore_ascii_case(loader_dir))
+        .map(|entry| entry.relative_path.clone())
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    if roots.is_empty() {
+        roots.push(fallback.to_string());
+    }
+    roots
 }
 
 fn push_unique_route(routes: &mut Vec<String>, route: &str) {
@@ -2889,6 +4248,7 @@ fn is_re_engine_game_id(game_id: Option<&str>) -> bool {
 }
 
 fn scan_import_source(store_root: &Path, source_path: &Path) -> Result<ScannedArchive, String> {
+    cleanup_stale_import_cache(store_root);
     if source_path.is_dir() {
         return scan_folder_source(source_path, folder_import_name(source_path));
     }
@@ -2923,7 +4283,48 @@ fn scan_import_source(store_root: &Path, source_path: &Path) -> Result<ScannedAr
 fn extract_7z_to_cache(store_root: &Path, archive_path: &Path) -> Result<PathBuf, String> {
     let import_dir = cache_import_dir(store_root, archive_path);
     fs::create_dir_all(&import_dir).map_err(error_to_string)?;
-    sevenz_rust2::decompress_file(archive_path, &import_dir).map_err(error_to_string)?;
+    let mut entry_count = 0_usize;
+    let mut expanded_bytes = 0_u64;
+    sevenz_rust2::decompress_file_with_extract_fn(
+        archive_path,
+        &import_dir,
+        |entry, reader, destination| {
+            entry_count += 1;
+            if entry_count > MAX_ARCHIVE_ENTRIES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "7Z archive contains too many entries",
+                )
+                .into());
+            }
+            validate_archive_relative_path(&entry.name)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            validate_archive_file_size(&entry.name, entry.size, entry.compressed_size)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            expanded_bytes = expanded_bytes
+                .checked_add(entry.size)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "7Z size overflow"))?;
+            if expanded_bytes > MAX_ARCHIVE_EXPANDED_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "7Z archive exceeds the expanded-size safety limit",
+                )
+                .into());
+            }
+            if entry.is_directory {
+                fs::create_dir_all(destination)?;
+                return Ok(true);
+            }
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut output = File::create(destination)?;
+            copy_with_limit(reader, &mut output, MAX_ARCHIVE_FILE_BYTES)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            Ok(true)
+        },
+    )
+    .map_err(error_to_string)?;
     Ok(import_dir)
 }
 
@@ -2933,10 +4334,22 @@ fn extract_rar_to_cache(store_root: &Path, archive_path: &Path) -> Result<PathBu
     let archive = rars::ArchiveReader::read_path(archive_path)
         .map_err(|error| format!("Could not read RAR archive: {}", error))?;
     let extraction_root = import_dir.clone();
+    let total_written = Arc::new(AtomicU64::new(0));
+    let mut entry_count = 0_usize;
 
     archive
         .extract_to(None, |meta| {
+            entry_count += 1;
+            if entry_count > MAX_ARCHIVE_ENTRIES {
+                return Err(rars::Error::from(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "RAR archive contains too many entries",
+                )));
+            }
             let member_name = normalize_archive_path(&meta.name_lossy());
+            validate_archive_relative_path(&member_name).map_err(|error| {
+                rars::Error::from(io::Error::new(io::ErrorKind::InvalidData, error))
+            })?;
             let destination_path = safe_join(&extraction_root, &member_name).map_err(|error| {
                 rars::Error::from(io::Error::new(io::ErrorKind::InvalidData, error))
             })?;
@@ -2950,7 +4363,11 @@ fn extract_rar_to_cache(store_root: &Path, archive_path: &Path) -> Result<PathBu
                 fs::create_dir_all(parent)?;
             }
 
-            Ok(Box::new(File::create(destination_path)?) as Box<dyn io::Write>)
+            Ok(Box::new(LimitedExtractionWriter {
+                file: File::create(destination_path)?,
+                file_written: 0,
+                total_written: total_written.clone(),
+            }) as Box<dyn io::Write>)
         })
         .map_err(|error| format!("Could not extract RAR archive: {}", error))?;
 
@@ -2977,6 +4394,13 @@ fn scan_zip_archive(archive_path: &Path) -> Result<ScannedArchive, String> {
 
     let file = File::open(archive_path).map_err(error_to_string)?;
     let mut archive = ZipArchive::new(file).map_err(error_to_string)?;
+    if archive.len() > MAX_ARCHIVE_ENTRIES {
+        return Err(format!(
+            "ZIP archive contains too many entries (maximum {}).",
+            MAX_ARCHIVE_ENTRIES
+        ));
+    }
+    let mut expanded_bytes = 0_u64;
     let raw_paths = (0..archive.len())
         .filter_map(|index| {
             archive
@@ -2991,6 +4415,16 @@ fn scan_zip_archive(archive_path: &Path) -> Result<ScannedArchive, String> {
     for index in 0..archive.len() {
         let file = archive.by_index(index).map_err(error_to_string)?;
         let file_path = normalize_archive_path(file.name());
+        validate_archive_relative_path(&file_path)?;
+        if !file.is_dir() {
+            validate_archive_file_size(&file_path, file.size(), file.compressed_size())?;
+            expanded_bytes = expanded_bytes
+                .checked_add(file.size())
+                .ok_or_else(|| "ZIP expanded size overflowed its safety limit.".to_string())?;
+            if expanded_bytes > MAX_ARCHIVE_EXPANDED_BYTES {
+                return Err("ZIP archive exceeds the expanded-size safety limit.".to_string());
+            }
+        }
         entries.push(ArchiveEntry {
             logical_path: to_logical_path(&file_path, common_top_folder.as_deref()),
             path: file_path,
@@ -2999,7 +4433,7 @@ fn scan_zip_archive(archive_path: &Path) -> Result<ScannedArchive, String> {
         });
     }
 
-    let manifest = read_manifest(archive_path, &entries)?;
+    let (manifest, package_identity) = read_manifest(archive_path, &entries)?;
 
     Ok(ScannedArchive {
         archive_path: archive_path.to_string_lossy().to_string(),
@@ -3010,6 +4444,7 @@ fn scan_zip_archive(archive_path: &Path) -> Result<ScannedArchive, String> {
             .to_string(),
         entries,
         manifest,
+        package_identity,
     })
 }
 
@@ -3033,32 +4468,59 @@ fn scan_folder_source(folder_path: &Path, import_name: String) -> Result<Scanned
         });
     }
 
-    let manifest = read_folder_manifest(folder_path, &entries)?;
+    let (manifest, package_identity) = read_folder_manifest(folder_path, &entries)?;
 
     Ok(ScannedArchive {
         archive_path: folder_path.to_string_lossy().to_string(),
         archive_name: import_name,
         entries,
         manifest,
+        package_identity,
     })
 }
 
 fn collect_folder_relative_paths(folder_path: &Path) -> Result<Vec<String>, String> {
     let mut paths = Vec::new();
-    let mut queue = VecDeque::from([folder_path.to_path_buf()]);
+    let mut queue = VecDeque::from([(folder_path.to_path_buf(), 0_usize)]);
+    let mut total_bytes = 0_u64;
 
-    while let Some(current_path) = queue.pop_front() {
+    while let Some((current_path, depth)) = queue.pop_front() {
+        if depth > MAX_IMPORT_SCAN_DEPTH {
+            return Err(format!(
+                "Folder import is nested too deeply (maximum {}).",
+                MAX_IMPORT_SCAN_DEPTH
+            ));
+        }
         let dirents = fs::read_dir(&current_path).map_err(error_to_string)?;
         for dirent in dirents {
             let dirent = dirent.map_err(error_to_string)?;
+            let file_type = dirent.file_type().map_err(error_to_string)?;
+            if file_type.is_symlink() {
+                continue;
+            }
             let absolute_path = dirent.path();
             let relative_path = absolute_path
                 .strip_prefix(folder_path)
                 .map_err(error_to_string)
                 .map(to_portable_path)?;
-            if dirent.file_type().map_err(error_to_string)?.is_dir() {
-                queue.push_back(absolute_path);
-            } else {
+            validate_archive_relative_path(&relative_path)?;
+            if file_type.is_dir() {
+                queue.push_back((absolute_path, depth + 1));
+            } else if file_type.is_file() {
+                if paths.len() >= MAX_ARCHIVE_ENTRIES {
+                    return Err(format!(
+                        "Folder import contains too many files (maximum {}).",
+                        MAX_ARCHIVE_ENTRIES
+                    ));
+                }
+                let size = dirent.metadata().map_err(error_to_string)?.len();
+                validate_archive_file_size(&relative_path, size, size)?;
+                total_bytes = total_bytes
+                    .checked_add(size)
+                    .ok_or_else(|| "Folder import size overflowed its safety limit.".to_string())?;
+                if total_bytes > MAX_ARCHIVE_EXPANDED_BYTES {
+                    return Err("Folder import exceeds the total-size safety limit.".to_string());
+                }
                 paths.push(relative_path);
             }
         }
@@ -3067,7 +4529,73 @@ fn collect_folder_relative_paths(folder_path: &Path) -> Result<Vec<String>, Stri
     Ok(paths)
 }
 
+struct LimitedExtractionWriter {
+    file: File,
+    file_written: u64,
+    total_written: Arc<AtomicU64>,
+}
+
+impl Write for LimitedExtractionWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let next_file_size = self.file_written.saturating_add(buffer.len() as u64);
+        if next_file_size > MAX_ARCHIVE_FILE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "RAR entry exceeds the per-file safety limit",
+            ));
+        }
+        let previous_total = self
+            .total_written
+            .fetch_add(buffer.len() as u64, Ordering::Relaxed);
+        if previous_total.saturating_add(buffer.len() as u64) > MAX_ARCHIVE_EXPANDED_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "RAR archive exceeds the expanded-size safety limit",
+            ));
+        }
+        let written = self.file.write(buffer)?;
+        self.file_written = self.file_written.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+fn cleanup_stale_import_cache(store_root: &Path) {
+    let cache_root = store_root.join("cache").join("imports");
+    let Ok(entries) = fs::read_dir(&cache_root) else {
+        return;
+    };
+    let max_age = Duration::from_secs((IMPORT_CACHE_MAX_AGE_HOURS as u64) * 60 * 60);
+    for entry in entries.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if modified.elapsed().map(|age| age > max_age).unwrap_or(false) {
+            let path = entry.path();
+            if metadata.is_dir() {
+                let _ = fs::remove_dir_all(path);
+            } else {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+}
+
 fn analyze_scanned_archive(scanned: ScannedArchive, profile: &GameProfile) -> ArchiveAnalysis {
+    analyze_scanned_archive_with_identity(scanned, profile, None)
+}
+
+fn analyze_scanned_archive_with_identity(
+    scanned: ScannedArchive,
+    profile: &GameProfile,
+    source_identity: Option<PackageIdentity>,
+) -> ArchiveAnalysis {
     let mut plans = vec![
         bepinex_plan(&scanned, profile),
         native_script_plan(&scanned, profile),
@@ -3086,15 +4614,155 @@ fn analyze_scanned_archive(scanned: ScannedArchive, profile: &GameProfile) -> Ar
             .partial_cmp(&a.confidence)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    let recommended_plan = plans.first().cloned();
+    let mut package_identity =
+        merge_package_identity(scanned.package_identity.clone(), source_identity);
+    for plan in plans.iter().filter(|plan| plan.adapter_id != "loose-files") {
+        push_unique_string_value(&mut package_identity.mod_types, &plan.adapter_id);
+    }
+    if let Some(best_confidence) = plans
+        .iter()
+        .filter(|plan| plan.adapter_id != "loose-files")
+        .map(|plan| plan.confidence)
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+    {
+        package_identity.confidence = package_identity.confidence.max(best_confidence);
+    }
+
+    let mut first_block_reason = None;
+    let recommended_plan = plans.iter().find_map(|plan| {
+        if plan.adapter_id == "loose-files" || plan.requires_confirmation {
+            return None;
+        }
+        if let Some(reason) = incompatible_package_reason(profile, plan, Some(&package_identity)) {
+            if first_block_reason.is_none() {
+                first_block_reason = Some(reason);
+            }
+            return None;
+        }
+        Some(plan.clone())
+    });
+    let supported_mod_types = supported_adapters_for_profile(profile);
+    let compatibility = if let Some(plan) = recommended_plan.as_ref() {
+        CompatibilityResult {
+            status: "compatible".to_string(),
+            reason: format!(
+                "{} matches the verified {} install route.",
+                plan.adapter_name,
+                profile_game_label(profile)
+            ),
+            confidence: plan
+                .confidence
+                .min(package_identity.confidence.max(plan.confidence)),
+            game_id: profile.game_id.clone(),
+            provider_game_id: package_identity.provider_game_id.clone(),
+            detected_mod_types: package_identity.mod_types.clone(),
+            supported_mod_types,
+        }
+    } else {
+        CompatibilityResult {
+            status: "blocked".to_string(),
+            reason: first_block_reason.unwrap_or_else(|| {
+                "UniLoader could not identify a verified automatic install route for this package. No game files were changed."
+                    .to_string()
+            }),
+            confidence: package_identity.confidence,
+            game_id: profile.game_id.clone(),
+            provider_game_id: package_identity.provider_game_id.clone(),
+            detected_mod_types: package_identity.mod_types.clone(),
+            supported_mod_types,
+        }
+    };
 
     ArchiveAnalysis {
         archive_path: scanned.archive_path,
         archive_name: scanned.archive_name,
         entries: scanned.entries,
         manifest: scanned.manifest,
+        package_identity,
+        compatibility,
         plans,
         recommended_plan,
+    }
+}
+
+fn merge_package_identity(
+    embedded: Option<PackageIdentity>,
+    source: Option<PackageIdentity>,
+) -> PackageIdentity {
+    let mut identity = source
+        .or_else(|| embedded.clone())
+        .unwrap_or_else(|| PackageIdentity {
+            provider: "unknown".to_string(),
+            package_id: None,
+            version: None,
+            provider_game_id: None,
+            mod_types: Vec::new(),
+            dependencies: Vec::new(),
+            evidence: Vec::new(),
+            confidence: 0.0,
+        });
+
+    if let Some(embedded) = embedded {
+        if identity.provider == "unknown" {
+            identity.provider = embedded.provider.clone();
+        } else if embedded.provider != "unknown" && embedded.provider != identity.provider {
+            push_unique_string_value(
+                &mut identity.evidence,
+                &format!(
+                    "Download source is {}; embedded metadata is {}",
+                    identity.provider, embedded.provider
+                ),
+            );
+        }
+        if identity.package_id.is_none() {
+            identity.package_id = embedded.package_id;
+        }
+        if identity.version.is_none() {
+            identity.version = embedded.version;
+        }
+        if identity.provider_game_id.is_none() {
+            identity.provider_game_id = embedded.provider_game_id;
+        }
+        for mod_type in embedded.mod_types {
+            push_unique_string_value(&mut identity.mod_types, &mod_type);
+        }
+        for dependency in embedded.dependencies {
+            push_unique_string_value(&mut identity.dependencies, &dependency);
+        }
+        for evidence in embedded.evidence {
+            push_unique_string_value(&mut identity.evidence, &evidence);
+        }
+        identity.confidence = identity.confidence.max(embedded.confidence);
+    }
+
+    identity
+}
+
+fn push_unique_string_value(values: &mut Vec<String>, value: &str) {
+    if !values
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(value))
+    {
+        values.push(value.to_string());
+    }
+}
+
+fn provider_source_identity(
+    provider: &str,
+    package_id: String,
+    version: Option<String>,
+    provider_game_id: Option<String>,
+    evidence: &str,
+) -> PackageIdentity {
+    PackageIdentity {
+        provider: provider.to_string(),
+        package_id: Some(package_id),
+        version,
+        provider_game_id,
+        mod_types: Vec::new(),
+        dependencies: Vec::new(),
+        evidence: vec![evidence.to_string()],
+        confidence: 0.98,
     }
 }
 
@@ -3531,6 +5199,7 @@ struct InstallMetadata {
     package_id: Option<String>,
     dependency_string: Option<String>,
     display_name: Option<String>,
+    package_identity: Option<PackageIdentity>,
 }
 
 struct InstallOptions<'a> {
@@ -3540,11 +5209,47 @@ struct InstallOptions<'a> {
     dependency_depth: usize,
 }
 
+#[derive(Debug)]
+struct DeploymentRollbackEntry {
+    destination: PathBuf,
+    immediate_backup: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct DeploymentOutcome {
+    files_written: Vec<String>,
+    backups_written: Vec<String>,
+    written_file_hashes: HashMap<String, String>,
+    transaction_root: PathBuf,
+    rollback_entries: Vec<DeploymentRollbackEntry>,
+}
+
+impl DeploymentOutcome {
+    fn commit(self) {
+        let _ = fs::remove_dir_all(self.transaction_root);
+    }
+
+    fn rollback(&self) {
+        for entry in self.rollback_entries.iter().rev() {
+            if let Some(backup) = &entry.immediate_backup {
+                if let Some(parent) = entry.destination.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = replace_file_from_path(backup, &entry.destination);
+            } else if entry.destination.exists() {
+                let _ = fs::remove_file(&entry.destination);
+            }
+        }
+        let _ = fs::remove_dir_all(&self.transaction_root);
+    }
+}
+
 fn install_archive_impl(
     store_root: &Path,
     profile: &GameProfile,
     archive_path: &str,
     archive_name: Option<&str>,
+    package_identity: Option<PackageIdentity>,
     plan: &InstallPlan,
 ) -> Result<InstallResult, String> {
     let mut visited_dependencies = HashSet::new();
@@ -3556,6 +5261,7 @@ fn install_archive_impl(
         InstallOptions {
             metadata: InstallMetadata {
                 archive_name: archive_name.map(str::to_string),
+                package_identity,
                 ..InstallMetadata::default()
             },
             resolve_dependencies: true,
@@ -3563,6 +5269,35 @@ fn install_archive_impl(
             dependency_depth: 0,
         },
     )
+}
+
+fn prepare_install_source_for_deployment(
+    store_root: &Path,
+    source_path: &Path,
+) -> Result<PathBuf, String> {
+    if source_path.is_dir() {
+        return Ok(source_path.to_path_buf());
+    }
+    if !source_path.is_file() {
+        return Err(format!(
+            "Import source no longer exists: {}",
+            source_path.to_string_lossy()
+        ));
+    }
+
+    match source_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("zip") => Ok(source_path.to_path_buf()),
+        Some("7z" | "rar") => scan_import_source(store_root, source_path)
+            .map(|scanned| PathBuf::from(scanned.archive_path)),
+        _ => {
+            Err("Only .zip, .7z, .rar, and folder imports are supported in this build.".to_string())
+        }
+    }
 }
 
 fn install_archive_impl_with_metadata(
@@ -3582,9 +5317,14 @@ fn install_archive_impl_with_metadata(
     if dependency_depth > MAX_DEPENDENCY_DEPTH {
         return Err("Dependency chain is too deep to install safely.".to_string());
     }
-    if let Some(reason) = incompatible_install_plan_reason(profile, plan) {
+    if let Some(reason) =
+        incompatible_package_reason(profile, plan, metadata.package_identity.as_ref())
+    {
         return Err(reason);
     }
+    let original_source_path = Path::new(archive_path);
+    let prepared_source_path =
+        prepare_install_source_for_deployment(store_root, original_source_path)?;
     if let Some(reason) =
         duplicate_installed_mod_reason(store_root, profile, plan, archive_path, &metadata)?
     {
@@ -3593,20 +5333,9 @@ fn install_archive_impl_with_metadata(
 
     let install_id = Uuid::new_v4().to_string();
     let installed_at = now_string();
-    let original_source_path = Path::new(archive_path);
     let managed_source_path =
-        materialize_import_source(store_root, profile, &install_id, original_source_path)?;
-    let source_path = managed_source_path.as_path();
-    let mut archive = if source_path.is_dir() {
-        None
-    } else {
-        let archive_file = File::open(source_path).map_err(error_to_string)?;
-        Some(ZipArchive::new(archive_file).map_err(error_to_string)?)
-    };
-    let profile_root = profile_dir(store_root, &profile.id);
-    let backup_root = profile_backup_dir(store_root, &profile.id, &install_id);
-    let mut files_written = Vec::new();
-    let mut backups_written = Vec::new();
+        materialize_import_source(store_root, profile, &install_id, &prepared_source_path)
+            .map_err(|error| format!("Could not stage the mod package: {error}"))?;
     let mut warnings = plan.warnings.clone();
 
     if resolve_dependencies {
@@ -3619,112 +5348,96 @@ fn install_archive_impl_with_metadata(
         )?);
     }
 
-    for mapping in &plan.mappings {
-        let source_file_path = if archive.is_none() {
-            let source_file_path = safe_join(source_path, &mapping.source_path)?;
-            if !source_file_path.is_file() {
-                warnings.push(format!(
-                    "Skipped missing folder entry: {}",
-                    mapping.source_path
-                ));
-                continue;
-            }
-            Some(source_file_path)
-        } else {
-            if archive
-                .as_mut()
-                .and_then(|archive| archive.by_name(&mapping.source_path).ok())
-                .is_none()
-            {
-                warnings.push(format!(
-                    "Skipped missing archive entry: {}",
-                    mapping.source_path
-                ));
-                continue;
-            }
-            None
-        };
-
-        let target_root = if mapping.target_root == "game" {
-            PathBuf::from(&profile.game_path)
-        } else {
-            profile_root.clone()
-        };
-        let destination_path = safe_join(&target_root, &mapping.target_relative_path)?;
-
-        if let Some(parent) = destination_path.parent() {
-            fs::create_dir_all(parent).map_err(error_to_string)?;
+    let deployment = match deploy_plan_transaction(
+        store_root,
+        profile,
+        &install_id,
+        &managed_source_path,
+        plan,
+        None,
+    ) {
+        Ok(deployment) => deployment,
+        Err(error) => {
+            cleanup_install_data(store_root, &profile.id, &install_id);
+            return Err(error);
         }
-
-        if mapping.target_root == "game" && destination_path.exists() {
-            let backup_path = safe_join(&backup_root, &mapping.target_relative_path)?;
-            if let Some(parent) = backup_path.parent() {
-                fs::create_dir_all(parent).map_err(error_to_string)?;
-            }
-            fs::copy(&destination_path, &backup_path).map_err(error_to_string)?;
-            backups_written.push(backup_path.to_string_lossy().to_string());
-        }
-
-        let mut out_file = File::create(&destination_path).map_err(error_to_string)?;
-        if let Some(archive) = archive.as_mut() {
-            let mut zip_file = archive
-                .by_name(&mapping.source_path)
-                .map_err(error_to_string)?;
-            io::copy(&mut zip_file, &mut out_file).map_err(error_to_string)?;
-        } else if let Some(source_file_path) = source_file_path {
-            let mut source_file = File::open(source_file_path).map_err(error_to_string)?;
-            io::copy(&mut source_file, &mut out_file).map_err(error_to_string)?;
-        }
-        files_written.push(destination_path.to_string_lossy().to_string());
-    }
-
-    let dependencies = plan
-        .dependencies
-        .iter()
-        .map(|dependency| refresh_dependency_status(store_root, profile, dependency))
-        .collect::<Vec<_>>();
-    let archive_name = metadata.archive_name.clone().unwrap_or_else(|| {
-        original_source_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("mod.zip")
-            .to_string()
-    });
-    let managed_archive_path = managed_source_path.to_string_lossy().to_string();
-    let display_name = install_display_name(store_root, &managed_archive_path, plan, &metadata);
-
-    let record = InstalledModRecord {
-        id: install_id.clone(),
-        profile_id: profile.id.clone(),
-        archive_path: managed_archive_path.clone(),
-        archive_name,
-        display_name: Some(display_name),
-        package_id: metadata.package_id,
-        dependency_string: metadata.dependency_string,
-        adapter_id: plan.adapter_id.clone(),
-        summary: plan.summary.clone(),
-        installed_at: installed_at.clone(),
-        files_written: files_written.clone(),
-        backups_written: backups_written.clone(),
-        dependencies,
-        config_files: config_files_from_paths(&files_written),
-        enabled: true,
-        last_status: "installed".to_string(),
-        plan: Some(plan.clone()),
     };
 
-    add_installed_mod(store_root, record.clone())?;
-    write_receipt(store_root, profile, &record)?;
+    let finalize = (|| -> Result<InstallResult, String> {
+        let dependencies = plan
+            .dependencies
+            .iter()
+            .map(|dependency| refresh_dependency_status(store_root, profile, dependency))
+            .collect::<Vec<_>>();
+        let archive_name = metadata.archive_name.clone().unwrap_or_else(|| {
+            original_source_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("mod.zip")
+                .to_string()
+        });
+        let managed_archive_path = managed_source_path.to_string_lossy().to_string();
+        let display_name = install_display_name(store_root, &managed_archive_path, plan, &metadata);
+        let package_id = metadata.package_id.clone().or_else(|| {
+            metadata
+                .package_identity
+                .as_ref()
+                .and_then(|identity| identity.package_id.clone())
+        });
 
-    Ok(InstallResult {
-        profile_id: profile.id.clone(),
-        archive_path: managed_archive_path,
-        installed_mod_id: install_id,
-        installed_at,
-        files_written,
-        backups_written,
-        warnings,
-    })
+        let record = InstalledModRecord {
+            id: install_id.clone(),
+            profile_id: profile.id.clone(),
+            archive_path: managed_archive_path.clone(),
+            archive_name,
+            display_name: Some(display_name),
+            package_id,
+            dependency_string: metadata.dependency_string,
+            adapter_id: plan.adapter_id.clone(),
+            summary: plan.summary.clone(),
+            installed_at: installed_at.clone(),
+            files_written: deployment.files_written.clone(),
+            backups_written: deployment.backups_written.clone(),
+            written_file_hashes: deployment.written_file_hashes.clone(),
+            dependencies,
+            config_files: config_files_from_paths(&deployment.files_written),
+            enabled: true,
+            last_status: "installed".to_string(),
+            plan: Some(plan.clone()),
+        };
+
+        write_receipt(store_root, profile, &record)
+            .map_err(|error| format!("Could not save the install receipt: {error}"))?;
+        if let Err(error) = add_installed_mod(store_root, record) {
+            let receipt_path = profile_dir(store_root, &profile.id)
+                .join("receipts")
+                .join(format!("{}.json", install_id));
+            let _ = fs::remove_file(receipt_path);
+            return Err(format!("Could not save the installed-mod record: {error}"));
+        }
+
+        Ok(InstallResult {
+            profile_id: profile.id.clone(),
+            archive_path: managed_archive_path,
+            installed_mod_id: install_id.clone(),
+            installed_at: installed_at.clone(),
+            files_written: deployment.files_written.clone(),
+            backups_written: deployment.backups_written.clone(),
+            warnings,
+        })
+    })();
+
+    match finalize {
+        Ok(result) => {
+            deployment.commit();
+            Ok(result)
+        }
+        Err(error) => {
+            deployment.rollback();
+            cleanup_install_data(store_root, &profile.id, &install_id);
+            Err(error)
+        }
+    }
 }
 
 fn attach_manifest_dependencies(
@@ -3745,8 +5458,50 @@ fn attach_manifest_dependencies(
     plan
 }
 
+fn incompatible_package_reason(
+    profile: &GameProfile,
+    plan: &InstallPlan,
+    identity: Option<&PackageIdentity>,
+) -> Option<String> {
+    if let Some(identity) = identity {
+        if let Some(reason) = incompatible_provider_game_reason(profile, identity) {
+            return Some(reason);
+        }
+    }
+    incompatible_install_plan_reason(profile, plan)
+}
+
+fn incompatible_provider_game_reason(
+    profile: &GameProfile,
+    identity: &PackageIdentity,
+) -> Option<String> {
+    let actual = identity.provider_game_id.as_deref()?.trim();
+    if actual.is_empty() {
+        return None;
+    }
+    let definition = profile.game_id.as_deref().and_then(game_definition_by_id)?;
+    let expected = match identity.provider.as_str() {
+        "thunderstore" => definition.thunderstore_community.as_deref(),
+        "nexus" => definition.nexus_game_domain.as_deref(),
+        "curseforge" => definition.curseforge_game_id.as_deref(),
+        _ => None,
+    };
+
+    if let Some(expected) = expected {
+        if compact_provider_slug(actual) != compact_provider_slug(expected) {
+            return Some(format!(
+                "This {} package belongs to provider game '{}', but the selected profile is {}. No files were installed.",
+                provider_label(&identity.provider),
+                actual,
+                definition.display_name
+            ));
+        }
+    }
+    None
+}
+
 fn incompatible_install_plan_reason(profile: &GameProfile, plan: &InstallPlan) -> Option<String> {
-    match plan.adapter_id.as_str() {
+    let engine_reason = match plan.adapter_id.as_str() {
         "unreal-pak" | "ue4ss" if profile.engine != "unreal" => Some(format!(
             "{} mods are for Unreal Engine games, but this profile is detected as {}.",
             plan.adapter_name,
@@ -3771,6 +5526,121 @@ fn incompatible_install_plan_reason(profile: &GameProfile, plan: &InstallPlan) -
             ))
         }
         _ => None,
+    };
+    if engine_reason.is_some() {
+        return engine_reason;
+    }
+
+    if plan.adapter_id == "loose-files" || plan.requires_confirmation {
+        return Some(
+            "UniLoader could not identify a safe game-specific install layout, so the package was not deployed."
+                .to_string(),
+        );
+    }
+
+    let supported_adapters = supported_adapters_for_profile(profile);
+    if supported_adapters.is_empty() {
+        return Some(format!(
+            "UniLoader could not prove a safe mod installation route from {}'s folder yet.",
+            profile_game_label(profile)
+        ));
+    }
+    if !supported_adapters
+        .iter()
+        .any(|adapter| adapter.eq_ignore_ascii_case(&plan.adapter_id))
+    {
+        let supported = supported_adapters
+            .iter()
+            .map(|adapter| adapter_display_name(adapter).to_string())
+            .collect::<Vec<_>>();
+        return Some(format!(
+            "This is a {}, but {} only supports {}. No files were installed.",
+            plan.adapter_name,
+            profile_game_label(profile),
+            join_human_list(&supported)
+        ));
+    }
+
+    None
+}
+
+fn supported_adapters_for_profile(profile: &GameProfile) -> Vec<String> {
+    let game_path = Path::new(&profile.game_path);
+    let entries = if profile
+        .game_id
+        .as_deref()
+        .and_then(game_definition_by_id)
+        .is_some()
+    {
+        Vec::new()
+    } else {
+        walk_game_folder(game_path)
+    };
+    supported_adapters_for_detection(
+        game_path,
+        profile.game_id.as_deref(),
+        &profile.engine,
+        &profile.loader,
+        &entries,
+    )
+}
+
+fn supported_adapters_for_detection(
+    game_path: &Path,
+    game_id: Option<&str>,
+    engine: &str,
+    loader: &str,
+    entries: &[ProbeEntry],
+) -> Vec<String> {
+    if let Some(definition) = game_id.and_then(game_definition_by_id) {
+        return definition.supported_adapters.clone();
+    }
+
+    let mut adapters = Vec::new();
+    if engine.starts_with("unity") || loader.starts_with("bepinex") {
+        push_unique_string_value(&mut adapters, "bepinex");
+    }
+    if engine == "unreal" && !find_unreal_pak_roots(game_path).is_empty() {
+        push_unique_string_value(&mut adapters, "unreal-pak");
+    }
+    if engine == "unreal" && supports_native_script_mods(game_id, entries) {
+        push_unique_string_value(&mut adapters, "script-files");
+    }
+    if engine == "unreal" && loader == "ue4ss" && !find_unreal_win64_dirs(entries).is_empty() {
+        push_unique_string_value(&mut adapters, "ue4ss");
+    }
+    if engine == "re-engine" || loader == "reframework" {
+        push_unique_string_value(&mut adapters, "reframework");
+    }
+    adapters
+}
+
+fn profile_game_label(profile: &GameProfile) -> String {
+    profile
+        .game_id
+        .as_deref()
+        .and_then(game_definition_by_id)
+        .map(|definition| definition.display_name.clone())
+        .unwrap_or_else(|| profile.name.clone())
+}
+
+fn adapter_display_name(adapter: &str) -> &str {
+    match adapter {
+        "bepinex" => "BepInEx mods",
+        "script-files" => "native script mods",
+        "ue4ss" => "UE4SS mods",
+        "reframework" => "REFramework mods",
+        "unreal-pak" => "Unreal Pak mods",
+        _ => adapter,
+    }
+}
+
+fn provider_label(provider: &str) -> &str {
+    match provider {
+        "thunderstore" => "Thunderstore",
+        "nexus" => "Nexus Mods",
+        "curseforge" => "CurseForge",
+        _ => provider,
     }
 }
 
@@ -3931,44 +5801,19 @@ fn runtime_dependency_definition(
         return definition.clone();
     }
 
-    match runtime {
-        "bepinex-il2cpp" => RuntimeDependencyDefinition {
-            id: "runtime:bepinex-il2cpp".to_string(),
-            name: "BepInEx Unity IL2CPP x64".to_string(),
-            provider: "bepinbuilds".to_string(),
-            source: "bepinbuilds:bepinex_be#BepInEx-Unity.IL2CPP-win-x64-*.zip".to_string(),
-            notes: Some(
-                "Official BepInEx bleeding-edge IL2CPP build for Windows x64 Unity games."
-                    .to_string(),
-            ),
-        },
-        "ue4ss" => RuntimeDependencyDefinition {
-            id: "runtime:ue4ss".to_string(),
-            name: "UE4SS".to_string(),
-            provider: "github-release".to_string(),
-            source: "github-release:UE4SS-RE/RE-UE4SS#UE4SS_v*.zip".to_string(),
-            notes: Some(
-                "Official latest UE4SS release for Unreal Engine script and hook mods."
-                    .to_string(),
-            ),
-        },
-        "reframework" => RuntimeDependencyDefinition {
-            id: "runtime:reframework".to_string(),
-            name: "REFramework".to_string(),
-            provider: "github-release".to_string(),
-            source: "github-release:praydog/REFramework-nightly#REFramework.zip".to_string(),
-            notes: Some(
-                "Official REFramework release. Game-specific assets can be supplied by game definitions."
-                    .to_string(),
-            ),
-        },
-        _ => RuntimeDependencyDefinition {
-            id: "runtime:bepinex".to_string(),
-            name: "BepInEx Mono x64".to_string(),
-            provider: "github-release".to_string(),
-            source: "github-release:BepInEx/BepInEx#BepInEx_win_x64_*.zip".to_string(),
-            notes: Some("Official stable BepInEx 5 Windows x64 build for Mono Unity games.".to_string()),
-        },
+    if let Some(definition) = runtime_definition_by_id(runtime) {
+        return definition.dependency.clone();
+    }
+
+    RuntimeDependencyDefinition {
+        id: format!("runtime:{runtime}"),
+        name: humanize_mod_display_name(runtime),
+        provider: "manual".to_string(),
+        source: format!("runtime:{runtime}"),
+        notes: Some(
+            "This runtime needs a registry definition before UniLoader can install it automatically."
+                .to_string(),
+        ),
     }
 }
 
@@ -4122,36 +5967,197 @@ fn discover_online_mods_for_profile(
     store_root: &Path,
     profile: &GameProfile,
     settings: &AppSettings,
-) -> Result<Vec<OnlineModRecord>, String> {
+    page: usize,
+    page_size: usize,
+    sort: &str,
+    query: &str,
+) -> Result<DiscoveryPage, String> {
+    let page = page.max(1);
+    let page_size = page_size.clamp(1, MAX_DISCOVERY_PAGE_SIZE);
+    let offset = (page - 1).saturating_mul(page_size);
+    let needed = offset.saturating_add(page_size);
     let mut results = Vec::new();
     let mut provider_errors = Vec::new();
+    let mut provider_total = 0_usize;
 
     if let Some(community) = thunderstore_community_for_profile(profile) {
         match discover_thunderstore_community_mods(store_root, profile, &community) {
-            Ok(records) => results.extend(records),
+            Ok(records) => {
+                provider_total = provider_total.saturating_add(records.len());
+                results.extend(records);
+            }
             Err(error) => provider_errors.push(format!("Thunderstore: {error}")),
         }
     }
 
     if let Some(domain) = nexus_domain_for_profile(profile) {
-        match discover_nexus_mods_for_profile(profile, &domain, settings.nexus_api_ready()) {
-            Ok(records) => results.extend(records),
+        let fetch_count = if query.trim().is_empty() {
+            needed
+        } else {
+            needed.saturating_mul(5).clamp(200, 500)
+        };
+        match discover_nexus_mods_for_profile(
+            profile,
+            &domain,
+            settings.nexus_api_ready(),
+            fetch_count,
+            sort,
+        ) {
+            Ok((records, total)) => {
+                provider_total = provider_total.saturating_add(total);
+                results.extend(records);
+            }
             Err(error) => provider_errors.push(format!("Nexus Mods: {error}")),
         }
     }
 
-    results.sort_by(|first, second| {
-        second
-            .downloads
-            .cmp(&first.downloads)
-            .then_with(|| second.rating_score.cmp(&first.rating_score))
-            .then_with(|| first.name.to_lowercase().cmp(&second.name.to_lowercase()))
-    });
+    let unfiltered_result_count = results.len();
+    results.retain(|record| !is_external_mod_manager_listing(record));
+    provider_total = provider_total.saturating_sub(unfiltered_result_count - results.len());
+
+    let normalized_query = query.trim().to_lowercase();
+    if !normalized_query.is_empty() {
+        results.retain(|record| online_mod_matches_query(record, &normalized_query));
+        provider_total = results.len();
+    }
+    sort_online_mods(&mut results, sort);
     if results.is_empty() && !provider_errors.is_empty() {
         return Err(provider_errors.join(" "));
     }
 
-    Ok(results)
+    let items = results
+        .into_iter()
+        .skip(offset)
+        .take(page_size)
+        .collect::<Vec<_>>();
+    Ok(DiscoveryPage {
+        has_more: offset.saturating_add(items.len()) < provider_total,
+        items,
+        total: provider_total,
+        page,
+        page_size,
+    })
+}
+
+fn is_external_mod_manager_listing(record: &OnlineModRecord) -> bool {
+    let name = record.name.to_lowercase();
+    let description = record.description.to_lowercase();
+    let combined = format!("{name} {description}");
+
+    let external_name_markers = [
+        "gale mod manager",
+        "nexus mod manager",
+        "mod organizer 2",
+        "r2modman",
+        "thunderstore mod manager",
+        "thunderstore app",
+        "vortex mod manager",
+        "vortex extension",
+        "vortex support",
+    ];
+    if external_name_markers
+        .iter()
+        .any(|marker| name.contains(marker))
+    {
+        return true;
+    }
+
+    let in_game_markers = [
+        "in-game mod manager",
+        "in game mod manager",
+        "ingame mod manager",
+        "configuration manager",
+        "config manager",
+        "configuration menu",
+        "config menu",
+        "mod browser",
+        "mod menu",
+        "mod viewer",
+    ];
+    if in_game_markers
+        .iter()
+        .any(|marker| combined.contains(marker))
+    {
+        return false;
+    }
+
+    let external_listing_markers = [
+        "thunderstore mod manager",
+        "thunderstore manager",
+        "thunderstore app",
+        "r2modman",
+        "r2modmanplus",
+        "nexus mod manager",
+        "mod organizer 2",
+        "vortex mod manager",
+        "vortex extension",
+        "vortex support",
+        "support for vortex",
+        "support for thunderstore",
+        "overwolf app",
+        "curseforge app",
+        "desktop mod manager",
+        "external mod manager",
+        "mod manager for thunderstore",
+        "manager for nexus mods",
+    ];
+    if external_listing_markers
+        .iter()
+        .any(|marker| combined.contains(marker))
+    {
+        return true;
+    }
+
+    let describes_manager = combined.contains("mod manager")
+        || combined.contains("mod-manager")
+        || combined.contains("modmanager");
+    let external_ecosystem = combined.contains("thunderstore")
+        || combined.contains("nexus mods")
+        || combined.contains("r2modman")
+        || combined.contains("vortex")
+        || combined.contains("overwolf")
+        || combined.contains("curseforge");
+
+    describes_manager && external_ecosystem
+}
+
+fn online_mod_matches_query(record: &OnlineModRecord, query: &str) -> bool {
+    format!(
+        "{} {} {} {} {}",
+        record.name,
+        record.owner,
+        record.description,
+        record.provider_label,
+        record.categories.join(" ")
+    )
+    .to_lowercase()
+    .contains(query)
+}
+
+fn sort_online_mods(records: &mut [OnlineModRecord], sort: &str) {
+    records.sort_by(|first, second| match sort {
+        "newest" => online_mod_timestamp(second)
+            .cmp(&online_mod_timestamp(first))
+            .then_with(|| second.downloads.cmp(&first.downloads)),
+        "oldest" => online_mod_timestamp(first)
+            .cmp(&online_mod_timestamp(second))
+            .then_with(|| second.downloads.cmp(&first.downloads)),
+        _ => second
+            .downloads
+            .cmp(&first.downloads)
+            .then_with(|| second.rating_score.cmp(&first.rating_score))
+            .then_with(|| first.name.to_lowercase().cmp(&second.name.to_lowercase())),
+    });
+}
+
+fn online_mod_timestamp(record: &OnlineModRecord) -> i64 {
+    record
+        .updated_at
+        .as_deref()
+        .or(record.created_at.as_deref())
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.timestamp())
+        .unwrap_or(0)
 }
 
 fn thunderstore_community_for_profile(profile: &GameProfile) -> Option<String> {
@@ -4180,11 +6186,56 @@ fn nexus_domain_for_profile(profile: &GameProfile) -> Option<String> {
     auto_detect_nexus_domain(profile)
 }
 
+fn verified_discovery_provider_game(
+    profile: &GameProfile,
+    provider: &str,
+    supplied_provider_game_id: Option<&str>,
+    package_provider_game_id: Option<&str>,
+) -> Result<String, String> {
+    let expected = match provider {
+        "thunderstore" => thunderstore_community_for_profile(profile),
+        "nexus" => nexus_domain_for_profile(profile),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        format!(
+            "UniLoader could not verify the {} game catalogue for {}.",
+            provider_label(provider),
+            profile_game_label(profile)
+        )
+    })?;
+    let actual = package_provider_game_id
+        .or(supplied_provider_game_id)
+        .unwrap_or(expected.as_str());
+
+    if let Some(supplied) = supplied_provider_game_id {
+        if compact_provider_slug(supplied) != compact_provider_slug(actual) {
+            return Err(format!(
+                "The selected {} result no longer matches its provider game catalogue. Refresh Discovery and try again.",
+                provider_label(provider)
+            ));
+        }
+    }
+    if compact_provider_slug(actual) != compact_provider_slug(&expected) {
+        return Err(format!(
+            "This {} mod belongs to '{}', but the selected profile is linked to '{}'. No files were installed.",
+            provider_label(provider),
+            actual,
+            expected
+        ));
+    }
+
+    Ok(expected)
+}
+
 fn auto_detect_thunderstore_community(profile: &GameProfile) -> Option<String> {
-    let client = provider_client().ok()?;
-    provider_slug_candidates(profile)
-        .into_iter()
-        .find(|candidate| thunderstore_community_available(&client, candidate))
+    cached_provider_mapping("thunderstore", profile, || {
+        let client = provider_client().ok()?;
+        let candidates = provider_slug_candidates(profile);
+        parallel_first_map(&candidates, &|candidate| {
+            thunderstore_community_available(&client, candidate).then(|| candidate.to_string())
+        })
+    })
 }
 
 fn thunderstore_community_available(client: &Client, community: &str) -> bool {
@@ -4201,23 +6252,94 @@ fn thunderstore_community_available(client: &Client, community: &str) -> bool {
 }
 
 fn auto_detect_nexus_domain(profile: &GameProfile) -> Option<String> {
-    let client = provider_client().ok()?;
-
-    for candidate in provider_slug_candidates(profile) {
-        if nexus_domain_has_mods(&client, &candidate) {
-            return Some(candidate);
+    cached_provider_mapping("nexus", profile, || {
+        let client = provider_client().ok()?;
+        let slugs = provider_slug_candidates(profile);
+        if let Some(domain) = parallel_first_map(&slugs, &|candidate| {
+            nexus_domain_has_mods(&client, candidate).then(|| candidate.to_string())
+        }) {
+            return Some(domain);
         }
-    }
 
-    for name in provider_name_candidates(profile) {
-        if let Some(domain) = fetch_nexus_game_domain_by_name(&client, &name) {
-            if nexus_domain_has_mods(&client, &domain) {
-                return Some(domain);
+        let names = provider_name_candidates(profile);
+        parallel_first_map(&names, &|name| {
+            let domain = fetch_nexus_game_domain_by_name(&client, name)?;
+            nexus_domain_has_mods(&client, &domain).then_some(domain)
+        })
+    })
+}
+
+fn cached_provider_mapping<F>(provider: &str, profile: &GameProfile, resolve: F) -> Option<String>
+where
+    F: FnOnce() -> Option<String>,
+{
+    let game_identity = Path::new(&profile.game_path)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(&profile.game_path))
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_lowercase();
+    let cache_key = format!("{provider}:{game_identity}");
+    if let Ok(cache) = PROVIDER_MAPPING_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        if let Some(entry) = cache.get(&cache_key) {
+            let ttl = if entry.value.is_some() {
+                Duration::from_secs(PROVIDER_MAPPING_CACHE_HOURS * 60 * 60)
+            } else {
+                Duration::from_secs(PROVIDER_MAPPING_NEGATIVE_CACHE_MINUTES * 60)
+            };
+            if entry.fetched_at.elapsed() < ttl {
+                return entry.value.clone();
             }
         }
     }
 
-    None
+    let value = resolve();
+    if let Ok(mut cache) = PROVIDER_MAPPING_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        cache.insert(
+            cache_key,
+            ProviderMappingCacheEntry {
+                fetched_at: Instant::now(),
+                value: value.clone(),
+            },
+        );
+    }
+    value
+}
+
+fn parallel_first_map<T, F>(items: &[String], mapper: &F) -> Option<T>
+where
+    T: Send,
+    F: Fn(&str) -> Option<T> + Sync,
+{
+    if items.is_empty() {
+        return None;
+    }
+    let worker_count = items.len().min(4);
+    std::thread::scope(|scope| {
+        let handles = (0..worker_count)
+            .map(|worker_index| {
+                scope.spawn(move || {
+                    items
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| index % worker_count == worker_index)
+                        .find_map(|(index, item)| mapper(item).map(|value| (index, value)))
+                })
+            })
+            .collect::<Vec<_>>();
+
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok().flatten())
+            .min_by_key(|(index, _)| *index)
+            .map(|(_, value)| value)
+    })
 }
 
 fn nexus_domain_has_mods(client: &Client, domain: &str) -> bool {
@@ -4381,25 +6503,15 @@ fn discover_thunderstore_community_mods(
     profile: &GameProfile,
     community: &str,
 ) -> Result<Vec<OnlineModRecord>, String> {
-    let client = thunderstore_client()?;
-    let url = format!(
-        "{}/{}/api/v1/package/",
-        THUNDERSTORE_COMMUNITY_API_BASE,
-        sanitize_url_path_segment(community)
-    );
-    let packages = client
-        .get(url)
-        .send()
-        .map_err(error_to_string)?
-        .error_for_status()
-        .map_err(error_to_string)?
-        .json::<Vec<ThunderstoreCommunityPackage>>()
-        .map_err(error_to_string)?;
+    let packages = fetch_thunderstore_community_packages(community)?;
+    let installed_keys = installed_package_identity_keys(store_root, &profile.id)?;
 
     let mut records = packages
         .into_iter()
         .filter(is_discoverable_thunderstore_package)
-        .filter_map(|package| thunderstore_package_to_online_mod(store_root, profile, package))
+        .filter_map(|package| {
+            thunderstore_package_to_online_mod(profile, community, package, &installed_keys)
+        })
         .collect::<Vec<_>>();
 
     records.sort_by(|first, second| {
@@ -4410,6 +6522,46 @@ fn discover_thunderstore_community_mods(
             .then_with(|| first.name.to_lowercase().cmp(&second.name.to_lowercase()))
     });
     Ok(records)
+}
+
+fn fetch_thunderstore_community_packages(
+    community: &str,
+) -> Result<Vec<ThunderstoreCommunityPackage>, String> {
+    let cache = THUNDERSTORE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cached_packages = cache
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(community).cloned())
+        .filter(|entry| entry.fetched_at.elapsed() < Duration::from_secs(10 * 60));
+    let packages = if let Some(entry) = cached_packages {
+        entry.packages
+    } else {
+        let client = thunderstore_client()?;
+        let url = format!(
+            "{}/{}/api/v1/package/",
+            THUNDERSTORE_COMMUNITY_API_BASE,
+            sanitize_url_path_segment(community)
+        );
+        let packages = client
+            .get(url)
+            .send()
+            .map_err(error_to_string)?
+            .error_for_status()
+            .map_err(error_to_string)?
+            .json::<Vec<ThunderstoreCommunityPackage>>()
+            .map_err(error_to_string)?;
+        if let Ok(mut cache) = cache.lock() {
+            cache.insert(
+                community.to_string(),
+                ThunderstoreCacheEntry {
+                    fetched_at: Instant::now(),
+                    packages: packages.clone(),
+                },
+            );
+        }
+        packages
+    };
+    Ok(packages)
 }
 
 fn is_discoverable_thunderstore_package(package: &ThunderstoreCommunityPackage) -> bool {
@@ -4428,9 +6580,10 @@ fn is_discoverable_thunderstore_package(package: &ThunderstoreCommunityPackage) 
 }
 
 fn thunderstore_package_to_online_mod(
-    store_root: &Path,
     profile: &GameProfile,
+    community: &str,
     package: ThunderstoreCommunityPackage,
+    installed_keys: &HashSet<String>,
 ) -> Option<OnlineModRecord> {
     let latest = latest_active_thunderstore_version(&package)?.clone();
     let package_ref = ThunderstorePackageRef {
@@ -4440,8 +6593,8 @@ fn thunderstore_package_to_online_mod(
     };
     let package_id = thunderstore_package_id(&package_ref);
     let dependency_string = thunderstore_dependency_string(&package_ref, &latest.version_number);
-    let installed =
-        thunderstore_package_installed(store_root, profile, &package_id, Some(&dependency_string));
+    let installed = installed_keys.contains(&format!("package:{}", package_id.to_lowercase()))
+        || installed_keys.contains(&format!("dependency:{}", dependency_string.to_lowercase()));
     let total_downloads = package
         .versions
         .iter()
@@ -4461,6 +6614,7 @@ fn thunderstore_package_to_online_mod(
         provider: "thunderstore".to_string(),
         provider_label: "Thunderstore".to_string(),
         game_id: profile.game_id.clone(),
+        provider_game_id: Some(community.to_string()),
         name: humanize_mod_display_name(&package.full_name),
         owner: package.owner,
         version: latest.version_number,
@@ -4481,24 +6635,48 @@ fn thunderstore_package_to_online_mod(
     })
 }
 
+fn installed_package_identity_keys(
+    store_root: &Path,
+    profile_id: &str,
+) -> Result<HashSet<String>, String> {
+    let store = read_store::<InstalledModRecord>(&installed_mods_path(store_root))
+        .map_err(error_to_string)?;
+    let mut keys = HashSet::new();
+    for record in store
+        .items
+        .iter()
+        .filter(|record| record.profile_id == profile_id && record.enabled)
+    {
+        if let Some(package_id) = &record.package_id {
+            keys.insert(format!("package:{}", package_id.to_lowercase()));
+        }
+        if let Some(dependency) = &record.dependency_string {
+            keys.insert(format!("dependency:{}", dependency.to_lowercase()));
+        }
+    }
+    Ok(keys)
+}
+
 fn discover_nexus_mods_for_profile(
     profile: &GameProfile,
     domain: &str,
     nexus_api_ready: bool,
-) -> Result<Vec<OnlineModRecord>, String> {
+    max_results: usize,
+    sort: &str,
+) -> Result<(Vec<OnlineModRecord>, usize), String> {
     let client = provider_client()?;
     let mut records = Vec::new();
     let mut offset = 0usize;
     let mut total_count = usize::MAX;
 
-    while offset < total_count && records.len() < NEXUS_MAX_DISCOVERY_RESULTS {
-        let remaining = NEXUS_MAX_DISCOVERY_RESULTS.saturating_sub(records.len());
+    while offset < total_count && records.len() < max_results {
+        let remaining = max_results.saturating_sub(records.len());
         let page_size = remaining.min(NEXUS_DISCOVERY_PAGE_SIZE);
         if page_size == 0 {
             break;
         }
 
-        let page = fetch_nexus_mod_page(&client, domain, offset, page_size)?;
+        let page = fetch_nexus_mod_page_sorted(&client, domain, offset, page_size, sort)?;
         total_count = page.total_count;
         let returned_count = page.nodes.len();
 
@@ -4515,7 +6693,17 @@ fn discover_nexus_mods_for_profile(
         offset += returned_count;
     }
 
-    Ok(records)
+    Ok((records, total_count.min(usize::MAX - 1)))
+}
+
+fn fetch_nexus_mod_page_sorted(
+    client: &Client,
+    domain: &str,
+    offset: usize,
+    count: usize,
+    sort: &str,
+) -> Result<NexusModPage, String> {
+    fetch_nexus_mod_page_with_sort(client, domain, offset, count, sort)
 }
 
 fn fetch_nexus_mod_page(
@@ -4523,6 +6711,16 @@ fn fetch_nexus_mod_page(
     domain: &str,
     offset: usize,
     count: usize,
+) -> Result<NexusModPage, String> {
+    fetch_nexus_mod_page_with_sort(client, domain, offset, count, "downloads")
+}
+
+fn fetch_nexus_mod_page_with_sort(
+    client: &Client,
+    domain: &str,
+    offset: usize,
+    count: usize,
+    sort: &str,
 ) -> Result<NexusModPage, String> {
     const NEXUS_DISCOVERY_QUERY: &str = r#"
         query UniLoaderDiscoverMods(
@@ -4557,6 +6755,11 @@ fn fetch_nexus_mod_page(
         }
     "#;
 
+    let sort_value = match sort {
+        "newest" => serde_json::json!({ "updatedAt": { "direction": "DESC" } }),
+        "oldest" => serde_json::json!({ "createdAt": { "direction": "ASC" } }),
+        _ => serde_json::json!({ "downloads": { "direction": "DESC" } }),
+    };
     let body = serde_json::json!({
         "query": NEXUS_DISCOVERY_QUERY,
         "variables": {
@@ -4566,7 +6769,7 @@ fn fetch_nexus_mod_page(
                 "adultContent": [{ "value": false, "op": "EQUALS" }],
                 "status": [{ "value": "published", "op": "EQUALS" }]
             },
-            "sort": [{ "downloads": { "direction": "DESC" } }],
+            "sort": [sort_value],
             "offset": offset,
             "count": count
         }
@@ -4690,11 +6893,11 @@ fn nexus_mod_to_online_mod(
         .or(node.thumbnail_url)
         .or(node.picture_url);
     let install_note = if nexus_api_ready {
-        "Uses your saved Nexus API key to request the mod file download."
+        "Choose a file to install it through UniLoader."
     } else if node.direct_download_enabled {
         "Add a Nexus API key in Settings to enable direct install for Nexus mods."
     } else {
-        "Add a Nexus API key in Settings to try a direct install, or open the Nexus page to download manually."
+        "Add a Nexus API key in Settings to enable Nexus installs."
     };
 
     Some(OnlineModRecord {
@@ -4702,6 +6905,7 @@ fn nexus_mod_to_online_mod(
         provider: "nexus".to_string(),
         provider_label: "Nexus Mods".to_string(),
         game_id: profile.game_id.clone(),
+        provider_game_id: Some(domain.to_string()),
         name,
         owner: node
             .author
@@ -4777,19 +6981,214 @@ fn latest_active_thunderstore_version(
         .or_else(|| package.versions.first())
 }
 
+fn list_discovered_mod_files_impl(
+    profile: &GameProfile,
+    settings: &AppSettings,
+    provider: &str,
+    mod_id: &str,
+    supplied_provider_game_id: Option<&str>,
+) -> Result<Vec<OnlineModFileOption>, String> {
+    match provider {
+        "nexus" => list_nexus_mod_files(profile, settings, mod_id, supplied_provider_game_id),
+        "thunderstore" => {
+            list_thunderstore_mod_versions(profile, mod_id, supplied_provider_game_id)
+        }
+        _ => Err(format!(
+            "{} does not expose selectable files in this build.",
+            provider
+        )),
+    }
+}
+
+fn list_nexus_mod_files(
+    profile: &GameProfile,
+    settings: &AppSettings,
+    mod_id: &str,
+    supplied_provider_game_id: Option<&str>,
+) -> Result<Vec<OnlineModFileOption>, String> {
+    let api_key = settings.nexus_api_key().ok_or_else(|| {
+        "Add your Nexus API key in Settings before loading this mod's files.".to_string()
+    })?;
+    let (domain, nexus_mod_id) = parse_nexus_online_mod_id(mod_id)?;
+    verified_discovery_provider_game(profile, "nexus", supplied_provider_game_id, Some(&domain))?;
+
+    let client = provider_client()?;
+    let account = validate_nexus_api_key(api_key)?;
+    let mut files = fetch_nexus_mod_files(&client, api_key, &domain, nexus_mod_id)?;
+    files.retain(nexus_file_supported);
+    files.sort_by(|first, second| {
+        nexus_file_category_score(second)
+            .cmp(&nexus_file_category_score(first))
+            .then_with(|| {
+                second
+                    .is_primary
+                    .unwrap_or(false)
+                    .cmp(&first.is_primary.unwrap_or(false))
+            })
+            .then_with(|| {
+                second
+                    .uploaded_timestamp
+                    .unwrap_or_default()
+                    .cmp(&first.uploaded_timestamp.unwrap_or_default())
+            })
+    });
+
+    Ok(files
+        .into_iter()
+        .map(|file| OnlineModFileOption {
+            id: file.file_id.to_string(),
+            name: nexus_file_display_name(&file),
+            version: file
+                .version
+                .as_deref()
+                .and_then(|value| non_empty_string(value.trim())),
+            category: file
+                .category_name
+                .as_deref()
+                .and_then(|value| non_empty_string(value.trim())),
+            description: file.description.clone().and_then(|description| {
+                non_empty_string(clean_nexus_summary(Some(description)).trim())
+            }),
+            file_name: file.file_name.clone(),
+            file_size: nexus_file_size(&file),
+            uploaded_at: nexus_file_uploaded_at(&file),
+            primary: file.is_primary.unwrap_or(false),
+            action: if account.is_premium {
+                "direct".to_string()
+            } else {
+                "browser".to_string()
+            },
+            download_page_url: Some(nexus_file_page_url(&domain, nexus_mod_id, file.file_id)),
+        })
+        .collect())
+}
+
+fn list_thunderstore_mod_versions(
+    profile: &GameProfile,
+    mod_id: &str,
+    supplied_provider_game_id: Option<&str>,
+) -> Result<Vec<OnlineModFileOption>, String> {
+    let raw_id = mod_id
+        .strip_prefix("thunderstore:")
+        .ok_or_else(|| format!("Invalid Thunderstore mod id: {}", mod_id))?;
+    let package_ref = parse_thunderstore_token(raw_id, None).ok_or_else(|| {
+        format!(
+            "Could not parse Thunderstore package reference from {}.",
+            mod_id
+        )
+    })?;
+    let community = verified_discovery_provider_game(
+        profile,
+        "thunderstore",
+        supplied_provider_game_id,
+        supplied_provider_game_id,
+    )?;
+    let packages = fetch_thunderstore_community_packages(&community)?;
+    let package = packages
+        .into_iter()
+        .find(|package| {
+            package.owner.eq_ignore_ascii_case(&package_ref.namespace)
+                && package.name.eq_ignore_ascii_case(&package_ref.name)
+        })
+        .ok_or_else(|| {
+            format!(
+                "Thunderstore no longer lists {}/{} for this game.",
+                package_ref.namespace, package_ref.name
+            )
+        })?;
+    let primary_version =
+        latest_active_thunderstore_version(&package).map(|version| version.version_number.clone());
+    let package_url = package.package_url.clone();
+    let mut versions = package.versions;
+    versions.retain(|version| version.is_active);
+    versions.sort_by(|first, second| {
+        second
+            .date_created
+            .cmp(&first.date_created)
+            .then_with(|| second.version_number.cmp(&first.version_number))
+    });
+
+    Ok(versions
+        .into_iter()
+        .map(|version| OnlineModFileOption {
+            id: version.version_number.clone(),
+            name: format!("Version {}", version.version_number),
+            version: Some(version.version_number.clone()),
+            category: Some("Release".to_string()),
+            description: non_empty_string(version.description.trim()),
+            file_name: Some(format!("{}.zip", version.full_name)),
+            file_size: version.file_size,
+            uploaded_at: version.date_created,
+            primary: primary_version.as_deref() == Some(version.version_number.as_str()),
+            action: "direct".to_string(),
+            download_page_url: package_url.clone(),
+        })
+        .collect())
+}
+
+fn nexus_file_size(file: &NexusFileRecord) -> Option<u64> {
+    file.size
+        .or_else(|| file.size_kb.map(|size| size.saturating_mul(1024)))
+}
+
+fn nexus_file_uploaded_at(file: &NexusFileRecord) -> Option<String> {
+    file.uploaded_time.clone().or_else(|| {
+        file.uploaded_timestamp.and_then(|timestamp| {
+            chrono::DateTime::<Utc>::from_timestamp(timestamp as i64, 0)
+                .map(|value| value.to_rfc3339())
+        })
+    })
+}
+
+fn nexus_file_page_url(domain: &str, mod_id: u64, file_id: u64) -> String {
+    format!(
+        "{}/{}/mods/{}?tab=files&file_id={}",
+        NEXUS_SITE_BASE,
+        sanitize_url_path_segment(domain),
+        mod_id,
+        file_id
+    )
+}
+
+fn nexus_manager_download_page_url(domain: &str, mod_id: u64, file_id: u64) -> String {
+    format!(
+        "{}/{}/mods/{}?tab=files&file_id={}&nmm=1",
+        NEXUS_SITE_BASE,
+        sanitize_url_path_segment(domain),
+        mod_id,
+        file_id
+    )
+}
+
 fn install_nexus_discovered_mod(
     store_root: &Path,
     profile: &GameProfile,
     mod_id: &str,
     settings: &AppSettings,
+    version: Option<String>,
+    supplied_provider_game_id: Option<&str>,
+    selected_file_id: Option<&str>,
 ) -> Result<InstallResult, String> {
     let api_key = settings.nexus_api_key().ok_or_else(|| {
         "Add your Nexus API key in Settings before installing Nexus mods.".to_string()
     })?;
     let (domain, nexus_mod_id) = parse_nexus_online_mod_id(mod_id)?;
+    let provider_game_id = verified_discovery_provider_game(
+        profile,
+        "nexus",
+        supplied_provider_game_id,
+        Some(&domain),
+    )?;
     let client = provider_client()?;
+    let account = validate_nexus_api_key(api_key)?;
+    if !account.is_premium {
+        return Err(
+            "Your Nexus key is valid, but Nexus only gives direct API download links to Premium accounts. Open the selected file's Nexus download page and use its browser download instead."
+                .to_string(),
+        );
+    }
     let files = fetch_nexus_mod_files(&client, api_key, &domain, nexus_mod_id)?;
-    let file = choose_nexus_file(&files).ok_or_else(|| {
+    let file = choose_requested_nexus_file(&files, selected_file_id)?.ok_or_else(|| {
         "Nexus returned no installable files for this mod. Open the mod page and download manually."
             .to_string()
     })?;
@@ -4798,48 +7197,74 @@ fn install_nexus_discovered_mod(
         "Nexus did not return a direct HTTP download link for this file. It may require opening the Nexus page or using an NXM handler."
             .to_string()
     })?;
-    let archive_path = download_nexus_file(
+
+    install_resolved_nexus_file(
         store_root,
+        profile,
         &client,
         &domain,
         nexus_mod_id,
         &file,
         &download_url,
-    )?;
+        version,
+        provider_game_id,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_resolved_nexus_file(
+    store_root: &Path,
+    profile: &GameProfile,
+    client: &Client,
+    domain: &str,
+    nexus_mod_id: u64,
+    file: &NexusFileRecord,
+    download_url: &str,
+    version: Option<String>,
+    provider_game_id: String,
+) -> Result<InstallResult, String> {
+    let archive_path =
+        download_nexus_file(store_root, client, domain, nexus_mod_id, file, download_url)?;
+    let package_id = format!("nexus:{}/{}", domain, nexus_mod_id);
+    let source_identity = provider_source_identity(
+        "nexus",
+        package_id.clone(),
+        version,
+        Some(provider_game_id),
+        "Nexus Mods discovery result and file download",
+    );
     let scanned = scan_import_source(store_root, &archive_path)?;
-    let analysis = analyze_scanned_archive(scanned, profile);
-    let plan = analysis.recommended_plan.ok_or_else(|| {
-        format!(
-            "Downloaded {}, but UniLoader could not identify a safe automatic install layout.",
-            nexus_file_display_name(&file)
-        )
-    })?;
+    let analysis = analyze_scanned_archive_with_identity(scanned, profile, Some(source_identity));
+    let install_source_path = analysis.archive_path.clone();
+    let package_identity = analysis.package_identity.clone();
+    let plan = analysis
+        .recommended_plan
+        .ok_or_else(|| analysis.compatibility.reason.clone())?;
 
     if plan.adapter_id == "loose-files" || plan.requires_confirmation {
         return Err(format!(
             "{} downloaded, but UniLoader could not identify a safe automatic install layout.",
-            nexus_file_display_name(&file)
+            nexus_file_display_name(file)
         ));
     }
 
-    let archive_path_string = archive_path.to_string_lossy().to_string();
-    let package_id = format!("nexus:{}/{}", domain, nexus_mod_id);
     let dependency_string = Some(format!("{}#{}", package_id, file.file_id));
     let mut visited_dependencies = HashSet::new();
     install_archive_impl_with_metadata(
         store_root,
         profile,
-        &archive_path_string,
+        &install_source_path,
         &plan,
         InstallOptions {
             metadata: InstallMetadata {
                 archive_name: file
                     .file_name
                     .clone()
-                    .or_else(|| Some(nexus_file_display_name(&file))),
+                    .or_else(|| Some(nexus_file_display_name(file))),
                 package_id: Some(package_id),
                 dependency_string,
-                display_name: Some(nexus_file_display_name(&file)),
+                display_name: Some(nexus_file_display_name(file)),
+                package_identity: Some(package_identity),
             },
             resolve_dependencies: true,
             visited_dependencies: &mut visited_dependencies,
@@ -4859,6 +7284,162 @@ fn parse_nexus_online_mod_id(mod_id: &str) -> Result<(String, u64), String> {
         .parse::<u64>()
         .map_err(|_| format!("Invalid Nexus mod id: {}", mod_id))?;
     Ok((sanitize_url_path_segment(domain), nexus_mod_id))
+}
+
+fn parse_nexus_nxm_link(raw: &str) -> Result<NexusNxmLink, String> {
+    let invalid = || {
+        "Nexus sent an invalid download handoff. Return to the file page and click Slow download again.".to_string()
+    };
+    let parsed = url::Url::parse(raw).map_err(|_| invalid())?;
+    if parsed.scheme() != "nxm"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.port().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(invalid());
+    }
+
+    let domain = parsed.host_str().ok_or_else(invalid)?.to_ascii_lowercase();
+    if domain.is_empty()
+        || domain.len() > 100
+        || !sanitize_url_path_segment(&domain).eq_ignore_ascii_case(&domain)
+    {
+        return Err(invalid());
+    }
+
+    let segments = parsed
+        .path_segments()
+        .ok_or_else(invalid)?
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.len() != 4 || segments[0] != "mods" || segments[2] != "files" {
+        return Err(invalid());
+    }
+    let mod_id = segments[1].parse::<u64>().map_err(|_| invalid())?;
+    let file_id = segments[3].parse::<u64>().map_err(|_| invalid())?;
+    if mod_id == 0 || file_id == 0 {
+        return Err(invalid());
+    }
+
+    let mut key = None;
+    let mut expires = None;
+    let mut user_id = None;
+    for (name, value) in parsed.query_pairs() {
+        match name.as_ref() {
+            "key" => {
+                if key.is_some() {
+                    return Err(invalid());
+                }
+                key = Some(value.into_owned());
+            }
+            "expires" => {
+                if expires.is_some() {
+                    return Err(invalid());
+                }
+                expires = Some(value.into_owned());
+            }
+            "user_id" => {
+                if user_id.is_some() {
+                    return Err(invalid());
+                }
+                user_id = Some(value.into_owned());
+            }
+            _ => {}
+        }
+    }
+
+    let key = key.ok_or_else(invalid)?;
+    if key.is_empty() || key.len() > 1024 || key.chars().any(char::is_whitespace) {
+        return Err(invalid());
+    }
+    let expires = expires
+        .ok_or_else(invalid)?
+        .parse::<i64>()
+        .map_err(|_| invalid())?;
+    if expires < Utc::now().timestamp() - 30 {
+        return Err("This Nexus download authorization expired. Return to the file page and click Slow download again.".to_string());
+    }
+    let user_id = user_id
+        .ok_or_else(invalid)?
+        .parse::<u64>()
+        .map_err(|_| invalid())?;
+    if user_id == 0 {
+        return Err(invalid());
+    }
+
+    Ok(NexusNxmLink {
+        domain,
+        mod_id,
+        file_id,
+        key,
+        expires,
+        user_id,
+    })
+}
+
+fn pending_nexus_download_is_fresh(pending: &PendingNexusDownload, now: i64) -> bool {
+    pending.created_at <= now + 60
+        && now.saturating_sub(pending.created_at)
+            <= NEXUS_PENDING_DOWNLOAD_TTL_MINUTES.saturating_mul(60)
+}
+
+fn store_pending_nexus_download(
+    store_root: &Path,
+    pending: PendingNexusDownload,
+    now: i64,
+) -> Result<(), String> {
+    let path = pending_nexus_downloads_path(store_root);
+    let mut store = read_store::<PendingNexusDownload>(&path).map_err(error_to_string)?;
+    store.items.retain(|existing| {
+        pending_nexus_download_is_fresh(existing, now)
+            && !(existing.profile_id == pending.profile_id
+                && existing.domain.eq_ignore_ascii_case(&pending.domain)
+                && existing.mod_id == pending.mod_id
+                && existing.file_id == pending.file_id)
+    });
+    store.items.push(pending);
+    write_store(&path, &store).map_err(error_to_string)
+}
+
+fn find_pending_nexus_download(
+    store_root: &Path,
+    nxm: &NexusNxmLink,
+) -> Result<PendingNexusDownload, String> {
+    let path = pending_nexus_downloads_path(store_root);
+    let mut store = read_store::<PendingNexusDownload>(&path).map_err(error_to_string)?;
+    let now = Utc::now().timestamp();
+    let original_len = store.items.len();
+    store
+        .items
+        .retain(|pending| pending_nexus_download_is_fresh(pending, now));
+    if store.items.len() != original_len {
+        write_store(&path, &store).map_err(error_to_string)?;
+    }
+
+    store
+        .items
+        .into_iter()
+        .find(|pending| {
+            pending.domain.eq_ignore_ascii_case(&nxm.domain)
+                && pending.mod_id == nxm.mod_id
+                && pending.file_id == nxm.file_id
+        })
+        .ok_or_else(|| {
+            "UniLoader did not request this Nexus download, or the request expired. Start it again from Discovery."
+                .to_string()
+        })
+}
+
+fn remove_pending_nexus_download(store_root: &Path, nxm: &NexusNxmLink) -> Result<(), String> {
+    let path = pending_nexus_downloads_path(store_root);
+    let mut store = read_store::<PendingNexusDownload>(&path).map_err(error_to_string)?;
+    store.items.retain(|pending| {
+        !(pending.domain.eq_ignore_ascii_case(&nxm.domain)
+            && pending.mod_id == nxm.mod_id
+            && pending.file_id == nxm.file_id)
+    });
+    write_store(&path, &store).map_err(error_to_string)
 }
 
 fn fetch_nexus_mod_files(
@@ -4896,13 +7477,59 @@ fn fetch_nexus_download_links(
         mod_id,
         file_id
     );
-    nexus_api_get(client, &url, api_key)
+    let response = nexus_api_get(client, &url, api_key)
         .send()
-        .map_err(error_to_string)?
+        .map_err(error_to_string)?;
+    if response.status().as_u16() == 403 {
+        return Err(
+            "Nexus requires this download to be started on its website. Choose the file and use the browser handoff."
+                .to_string(),
+        );
+    }
+    response
         .error_for_status()
         .map_err(error_to_string)?
         .json::<Vec<NexusDownloadLink>>()
         .map_err(error_to_string)
+}
+
+fn fetch_nexus_download_links_with_nxm(
+    client: &Client,
+    api_key: &str,
+    nxm: &NexusNxmLink,
+) -> Result<Vec<NexusDownloadLink>, String> {
+    let url = format!(
+        "https://api.nexusmods.com/v1/games/{}/mods/{}/files/{}/download_link.json",
+        sanitize_url_path_segment(&nxm.domain),
+        nxm.mod_id,
+        nxm.file_id
+    );
+    let expires = nxm.expires.to_string();
+    let user_id = nxm.user_id.to_string();
+    let response = nexus_api_get(client, &url, api_key)
+        .query(&[
+            ("key", nxm.key.as_str()),
+            ("expires", expires.as_str()),
+            ("user_id", user_id.as_str()),
+        ])
+        .send()
+        .map_err(|_| "Could not contact Nexus to finish the authorized download.".to_string())?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(if status.as_u16() == 403 {
+            "Nexus rejected this download authorization. Return to the file page and click Slow download again."
+                .to_string()
+        } else {
+            format!(
+                "Nexus could not finish the authorized download (HTTP {}). Try again.",
+                status.as_u16()
+            )
+        });
+    }
+
+    response.json::<Vec<NexusDownloadLink>>().map_err(|_| {
+        "Nexus returned invalid download-server data. Try the download again.".to_string()
+    })
 }
 
 fn nexus_api_get(client: &Client, url: &str, api_key: &str) -> reqwest::blocking::RequestBuilder {
@@ -4912,6 +7539,58 @@ fn nexus_api_get(client: &Client, url: &str, api_key: &str) -> reqwest::blocking
         .header("Application-Name", "UniLoader")
         .header("Application-Version", env!("CARGO_PKG_VERSION"))
         .header("Accept", "application/json")
+}
+
+fn validate_nexus_api_key(api_key: &str) -> Result<NexusUserValidation, String> {
+    let client = provider_client()?;
+    let response = nexus_api_get(
+        &client,
+        "https://api.nexusmods.com/v1/users/validate.json",
+        api_key,
+    )
+    .send()
+    .map_err(|error| format!("Could not validate the Nexus API key: {error}"))?;
+
+    if response.status().is_success() {
+        return response.json::<NexusUserValidation>().map_err(|error| {
+            format!("Nexus validated the key but returned invalid account data: {error}")
+        });
+    }
+    if response.status().as_u16() == 401 || response.status().as_u16() == 403 {
+        return Err(
+            "Nexus Mods rejected this API key. Request a personal API key and paste the full value."
+                .to_string(),
+        );
+    }
+
+    Err(format!(
+        "Nexus Mods could not validate the API key right now (HTTP {}). Please try again.",
+        response.status()
+    ))
+}
+
+fn choose_requested_nexus_file(
+    files: &[NexusFileRecord],
+    selected_file_id: Option<&str>,
+) -> Result<Option<NexusFileRecord>, String> {
+    let Some(selected_file_id) = selected_file_id else {
+        return Ok(choose_nexus_file(files));
+    };
+    let parsed_file_id = selected_file_id
+        .parse::<u64>()
+        .map_err(|_| "The selected Nexus file id is invalid.".to_string())?;
+    let file = files
+        .iter()
+        .find(|file| file.file_id == parsed_file_id)
+        .cloned()
+        .ok_or_else(|| "The selected Nexus file is no longer available.".to_string())?;
+    if !nexus_file_supported(&file) {
+        return Err(
+            "The selected Nexus file is not a ZIP, 7Z, or RAR archive that UniLoader can install."
+                .to_string(),
+        );
+    }
+    Ok(Some(file))
 }
 
 fn choose_nexus_file(files: &[NexusFileRecord]) -> Option<NexusFileRecord> {
@@ -5018,6 +7697,7 @@ fn install_thunderstore_discovered_mod(
     profile: &GameProfile,
     mod_id: &str,
     version: Option<String>,
+    supplied_provider_game_id: Option<&str>,
 ) -> Result<InstallResult, String> {
     let raw_id = mod_id
         .strip_prefix("thunderstore:")
@@ -5028,6 +7708,12 @@ fn install_thunderstore_discovered_mod(
             mod_id
         )
     })?;
+    let provider_game_id = verified_discovery_provider_game(
+        profile,
+        "thunderstore",
+        supplied_provider_game_id,
+        supplied_provider_game_id,
+    )?;
     let package_version = fetch_thunderstore_package_version(&package_ref)?;
     let resolved_ref = ThunderstorePackageRef {
         namespace: package_ref.namespace.clone(),
@@ -5046,14 +7732,19 @@ fn install_thunderstore_discovered_mod(
     }
 
     let archive_path = download_thunderstore_package(store_root, &resolved_ref, &package_version)?;
+    let source_identity = provider_source_identity(
+        "thunderstore",
+        package_id.clone(),
+        Some(package_version.version_number.clone()),
+        Some(provider_game_id),
+        "Thunderstore community catalogue and package manifest",
+    );
     let scanned = scan_zip_archive(&archive_path)?;
-    let analysis = analyze_scanned_archive(scanned, profile);
-    let mut plan = analysis.recommended_plan.ok_or_else(|| {
-        format!(
-            "Could not find a safe install route for {}.",
-            package_version.full_name
-        )
-    })?;
+    let analysis = analyze_scanned_archive_with_identity(scanned, profile, Some(source_identity));
+    let package_identity = analysis.package_identity.clone();
+    let mut plan = analysis
+        .recommended_plan
+        .ok_or_else(|| analysis.compatibility.reason.clone())?;
 
     for dependency_string in &package_version.dependencies {
         let parsed = parse_thunderstore_dependency(dependency_string);
@@ -5082,6 +7773,7 @@ fn install_thunderstore_discovered_mod(
                 package_id: Some(package_id),
                 dependency_string: Some(dependency_string),
                 display_name: Some(package_version.full_name),
+                package_identity: Some(package_identity),
             },
             resolve_dependencies: true,
             visited_dependencies: &mut visited_dependencies,
@@ -5164,6 +7856,7 @@ fn install_thunderstore_dependency(
                 package_id: Some(package_id),
                 dependency_string: Some(dependency_string),
                 display_name: Some(package_version.full_name.clone()),
+                package_identity: None,
             },
             resolve_dependencies: true,
             visited_dependencies,
@@ -5232,6 +7925,7 @@ fn install_release_dependency(
                     release_ref.source_key, release_ref.version
                 )),
                 display_name: Some(release_ref.display_name.clone()),
+                package_identity: None,
             },
             resolve_dependencies: true,
             visited_dependencies,
@@ -5385,14 +8079,9 @@ fn profile_refresh_warnings(
     warnings
 }
 
-fn runtime_from_dependency(dependency: &DependencySpec) -> Option<&'static str> {
-    match dependency.id.as_str() {
-        "runtime:bepinex" => Some("bepinex"),
-        "runtime:bepinex-il2cpp" => Some("bepinex-il2cpp"),
-        "runtime:ue4ss" => Some("ue4ss"),
-        "runtime:reframework" => Some("reframework"),
-        _ => None,
-    }
+fn runtime_from_dependency(dependency: &DependencySpec) -> Option<&str> {
+    let (kind, runtime) = dependency.id.split_once(':')?;
+    (kind.eq_ignore_ascii_case("runtime") && !runtime.trim().is_empty()).then_some(runtime)
 }
 
 fn runtime_installed(profile: &GameProfile, runtime: &str) -> bool {
@@ -5401,74 +8090,133 @@ fn runtime_installed(profile: &GameProfile, runtime: &str) -> bool {
         return false;
     }
 
+    let Some(definition) = runtime_definition_by_id(runtime) else {
+        return false;
+    };
     let entries = walk_game_folder(game_path);
-    let has_bepinex_core = entries.iter().any(|entry| {
-        !entry.is_directory
-            && entry
-                .relative_path
-                .eq_ignore_ascii_case("BepInEx/core/BepInEx.dll")
-    });
-    let has_bepinex_folder = entries
+    definition
+        .detection_rules
         .iter()
-        .any(|entry| entry.is_directory && entry.relative_path.eq_ignore_ascii_case("BepInEx"));
-    let has_doorstop_config = entries
-        .iter()
-        .any(|entry| !entry.is_directory && entry.name.eq_ignore_ascii_case("doorstop_config.ini"));
-    let has_winhttp = entries
-        .iter()
-        .any(|entry| !entry.is_directory && entry.name.eq_ignore_ascii_case("winhttp.dll"));
+        .any(|rule| runtime_detection_rule_matches(profile, &entries, rule))
+}
 
-    match runtime {
-        "bepinex" => has_bepinex_core || (has_bepinex_folder && has_doorstop_config && has_winhttp),
-        "bepinex-il2cpp" => {
-            let has_interop = entries.iter().any(|entry| {
-                entry.relative_path.eq_ignore_ascii_case("BepInEx/interop")
-                    || entry
-                        .relative_path
-                        .to_lowercase()
-                        .starts_with("bepinex/interop/")
-            });
-            let has_dotnet = entries
+fn runtime_detection_rule_matches(
+    profile: &GameProfile,
+    entries: &[ProbeEntry],
+    rule: &RuntimeDetectionRule,
+) -> bool {
+    if rule.all.is_empty() && rule.any.is_empty() {
+        return false;
+    }
+
+    rule.all
+        .iter()
+        .all(|marker| runtime_detection_marker_matches(profile, entries, marker))
+        && (rule.any.is_empty()
+            || rule
+                .any
                 .iter()
-                .any(|entry| entry.relative_path.eq_ignore_ascii_case("dotnet"));
-            has_bepinex_core && (has_interop || has_dotnet || profile.engine == "unity-il2cpp")
-        }
-        "ue4ss" => entries.iter().any(|entry| {
+                .any(|marker| runtime_detection_marker_matches(profile, entries, marker)))
+}
+
+fn runtime_detection_marker_matches(
+    profile: &GameProfile,
+    entries: &[ProbeEntry],
+    marker: &str,
+) -> bool {
+    let Some((kind, expected)) = marker.split_once(':') else {
+        return false;
+    };
+    let expected = normalize_archive_path(expected.trim());
+
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "profile-engine" => profile.engine.eq_ignore_ascii_case(&expected),
+        "profile-loader" => profile.loader.eq_ignore_ascii_case(&expected),
+        "file" => entries.iter().any(|entry| {
             !entry.is_directory
-                && (entry.name.eq_ignore_ascii_case("UE4SS.dll")
-                    || entry.name.eq_ignore_ascii_case("UE4SS-settings.ini"))
+                && normalize_archive_path(&entry.relative_path).eq_ignore_ascii_case(&expected)
         }),
-        "reframework" => {
-            let has_reframework_folder = entries.iter().any(|entry| {
-                entry.relative_path.eq_ignore_ascii_case("reframework")
-                    || entry
-                        .relative_path
-                        .to_lowercase()
-                        .starts_with("reframework/")
-            });
-            let has_reframework_bootstrap = entries
-                .iter()
-                .any(|entry| !entry.is_directory && entry.name.eq_ignore_ascii_case("dinput8.dll"));
-            let has_revision_file = entries.iter().any(|entry| {
-                !entry.is_directory && entry.name.eq_ignore_ascii_case("reframework_revision.txt")
-            });
-            has_reframework_bootstrap && (has_reframework_folder || has_revision_file)
-        }
+        "file-name" => entries
+            .iter()
+            .any(|entry| !entry.is_directory && entry.name.eq_ignore_ascii_case(&expected)),
+        "dir" => entries.iter().any(|entry| {
+            entry.is_directory
+                && normalize_archive_path(&entry.relative_path).eq_ignore_ascii_case(&expected)
+        }),
+        "dir-prefix" => entries.iter().any(|entry| {
+            entry.is_directory && path_matches_or_is_below(&entry.relative_path, expected.as_str())
+        }),
+        "path" => entries.iter().any(|entry| {
+            normalize_archive_path(&entry.relative_path).eq_ignore_ascii_case(&expected)
+        }),
+        "path-prefix" => entries
+            .iter()
+            .any(|entry| path_matches_or_is_below(&entry.relative_path, expected.as_str())),
         _ => false,
     }
+}
+
+fn path_matches_or_is_below(path: &str, expected: &str) -> bool {
+    let normalized_path = normalize_archive_path(path).to_ascii_lowercase();
+    let normalized_expected = normalize_archive_path(expected).to_ascii_lowercase();
+    normalized_path == normalized_expected
+        || normalized_path.starts_with(&format!("{normalized_expected}/"))
 }
 
 fn thunderstore_runtime_available(
     profile: &GameProfile,
     package_ref: &ThunderstorePackageRef,
 ) -> bool {
-    if package_ref.namespace.eq_ignore_ascii_case("denikson")
-        && package_ref.name.eq_ignore_ascii_case("BepInExPack_Valheim")
-    {
-        return runtime_installed(profile, "bepinex");
+    runtime_definitions().iter().any(|definition| {
+        runtime_definition_applies_to_profile(definition, profile)
+            && runtime_provider_package_matches(
+                definition,
+                "thunderstore",
+                Some(&package_ref.namespace),
+                &package_ref.name,
+            )
+            && runtime_installed(profile, &definition.id)
+    })
+}
+
+fn runtime_definition_applies_to_profile(
+    definition: &RuntimeDefinition,
+    profile: &GameProfile,
+) -> bool {
+    if definition.profile_engines.is_empty() && definition.profile_loaders.is_empty() {
+        return true;
     }
 
-    false
+    definition
+        .profile_engines
+        .iter()
+        .any(|engine| engine.eq_ignore_ascii_case(&profile.engine))
+        || definition
+            .profile_loaders
+            .iter()
+            .any(|loader| loader.eq_ignore_ascii_case(&profile.loader))
+}
+
+fn runtime_provider_package_matches(
+    definition: &RuntimeDefinition,
+    provider: &str,
+    namespace: Option<&str>,
+    package_name: &str,
+) -> bool {
+    definition.provider_packages.iter().any(|package| {
+        package.provider.eq_ignore_ascii_case(provider)
+            && (package.namespace_patterns.is_empty()
+                || namespace.is_some_and(|value| {
+                    package
+                        .namespace_patterns
+                        .iter()
+                        .any(|pattern| wildcard_match(pattern, value))
+                }))
+            && package
+                .package_patterns
+                .iter()
+                .any(|pattern| wildcard_match(pattern, package_name))
+    })
 }
 
 fn thunderstore_package_installed(
@@ -5601,35 +8349,43 @@ fn fetch_thunderstore_package_version(
     package_ref: &ThunderstorePackageRef,
 ) -> Result<ThunderstoreVersion, String> {
     let client = thunderstore_client()?;
+    if let Some(requested_version) = &package_ref.version {
+        let version_url = thunderstore_package_version_url(package_ref, requested_version);
+        return client
+            .get(version_url)
+            .send()
+            .map_err(error_to_string)?
+            .error_for_status()
+            .map_err(|error| {
+                format!(
+                    "Thunderstore package {}/{} does not have version {}: {}",
+                    package_ref.namespace, package_ref.name, requested_version, error
+                )
+            })?
+            .json::<ThunderstoreVersion>()
+            .map_err(error_to_string);
+    }
+
     let url = format!(
         "{}/{}/{}",
         THUNDERSTORE_API_BASE, package_ref.namespace, package_ref.name
     );
-    let response = client
+    client
         .get(url)
         .send()
         .map_err(error_to_string)?
         .error_for_status()
         .map_err(error_to_string)?
         .json::<ThunderstorePackageResponse>()
-        .map_err(error_to_string)?;
+        .map(|response| response.latest)
+        .map_err(error_to_string)
+}
 
-    if let Some(requested_version) = &package_ref.version {
-        response
-            .versions
-            .iter()
-            .chain(std::iter::once(&response.latest))
-            .find(|version| version.version_number == *requested_version)
-            .cloned()
-            .ok_or_else(|| {
-                format!(
-                    "Thunderstore package {}/{} does not have version {}.",
-                    package_ref.namespace, package_ref.name, requested_version
-                )
-            })
-    } else {
-        Ok(response.latest)
-    }
+fn thunderstore_package_version_url(package_ref: &ThunderstorePackageRef, version: &str) -> String {
+    format!(
+        "{}/{}/{}/{}",
+        THUNDERSTORE_API_BASE, package_ref.namespace, package_ref.name, version
+    )
 }
 
 fn download_thunderstore_package(
@@ -5824,6 +8580,7 @@ fn download_release_archive(
 }
 
 fn download_url_to_file(client: &Client, url: &str, destination: &Path) -> Result<(), String> {
+    validate_https_url(url)?;
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).map_err(error_to_string)?;
     }
@@ -5836,9 +8593,37 @@ fn download_url_to_file(client: &Client, url: &str, destination: &Path) -> Resul
     let mut response = client
         .get(url)
         .send()
-        .map_err(error_to_string)?
+        .map_err(|error| format!("Download request failed: {}", error.without_url()))?
         .error_for_status()
-        .map_err(error_to_string)?;
+        .map_err(|error| {
+            error
+                .status()
+                .map(|status| format!("Download server returned HTTP {}.", status.as_u16()))
+                .unwrap_or_else(|| "The download server rejected the request.".to_string())
+        })?;
+
+    let archive_extension = destination
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .filter(|extension| matches!(extension.as_str(), "zip" | "7z" | "rar"));
+    if archive_extension.is_some() {
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if content_type.starts_with("text/")
+            || content_type.contains("application/json")
+            || content_type.contains("application/problem+json")
+        {
+            return Err(
+                "The download provider returned a webpage or message instead of a mod archive. Start the download again."
+                    .to_string(),
+            );
+        }
+    }
 
     if let Some(content_length) = response.content_length() {
         if content_length > MAX_DOWNLOAD_BYTES {
@@ -5851,16 +8636,92 @@ fn download_url_to_file(client: &Client, url: &str, destination: &Path) -> Resul
     }
 
     let mut file = File::create(&temp_path).map_err(error_to_string)?;
-    let bytes_written = io::copy(&mut response, &mut file).map_err(error_to_string)?;
-    file.flush().map_err(error_to_string)?;
+    let bytes_written = match copy_with_limit(&mut response, &mut file, MAX_DOWNLOAD_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
+        }
+    };
+    file.sync_all().map_err(error_to_string)?;
+    drop(file);
 
     if bytes_written == 0 {
         let _ = fs::remove_file(&temp_path);
         return Err("Download completed, but the downloaded file was empty.".to_string());
     }
 
-    fs::rename(&temp_path, destination).map_err(error_to_string)?;
-    Ok(())
+    if let Some(extension) = archive_extension.as_deref() {
+        if let Err(error) = validate_downloaded_archive(&temp_path, extension) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
+        }
+    }
+
+    let result = replace_file_from_path(&temp_path, destination);
+    let _ = fs::remove_file(&temp_path);
+    result
+}
+
+fn validate_downloaded_archive(path: &Path, extension: &str) -> Result<(), String> {
+    match extension {
+        "zip" => {
+            let file = File::open(path).map_err(error_to_string)?;
+            let archive = ZipArchive::new(file).map_err(|_| {
+                "The download provider returned an incomplete or invalid ZIP archive. Start the download again."
+                    .to_string()
+            })?;
+            if archive.is_empty() {
+                return Err(
+                    "The download provider returned an empty ZIP archive. Start the download again."
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
+        "7z" => validate_archive_signature(path, &[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C], "7Z"),
+        "rar" => {
+            let mut file = File::open(path).map_err(error_to_string)?;
+            let mut header = [0_u8; 8];
+            let read = file.read(&mut header).map_err(error_to_string)?;
+            let rar4 = read >= 7 && header[..7] == [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00];
+            let rar5 = read >= 8 && header == [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00];
+            if rar4 || rar5 {
+                Ok(())
+            } else {
+                Err(
+                    "The download provider returned an incomplete or invalid RAR archive. Start the download again."
+                        .to_string(),
+                )
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_archive_signature(path: &Path, signature: &[u8], label: &str) -> Result<(), String> {
+    let mut file = File::open(path).map_err(error_to_string)?;
+    let mut header = vec![0_u8; signature.len()];
+    let valid = file
+        .read_exact(&mut header)
+        .map(|_| header == signature)
+        .unwrap_or(false);
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "The download provider returned an incomplete or invalid {label} archive. Start the download again."
+        ))
+    }
+}
+
+fn validate_https_url(value: &str) -> Result<url::Url, String> {
+    let parsed =
+        url::Url::parse(value).map_err(|error| format!("Invalid download URL: {error}"))?;
+    if parsed.scheme() != "https" || parsed.host_str().is_none() {
+        return Err("Downloads must use a valid HTTPS URL.".to_string());
+    }
+    Ok(parsed)
 }
 
 fn thunderstore_client() -> Result<Client, String> {
@@ -5869,8 +8730,9 @@ fn thunderstore_client() -> Result<Client, String> {
 
 fn provider_client() -> Result<Client, String> {
     Client::builder()
-        .user_agent("UniLoader/0.2")
-        .timeout(Duration::from_secs(45))
+        .user_agent(format!("UniLoader/{}", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(30))
         .build()
         .map_err(error_to_string)
 }
@@ -6048,24 +8910,392 @@ fn copy_dir_contents(source_root: &Path, destination_root: &Path) -> Result<(), 
     Ok(())
 }
 
-fn update_installed_mod<F>(
+#[derive(Debug)]
+struct PreparedDeploymentFile {
+    staged_path: PathBuf,
+    destination: PathBuf,
+    target_relative_path: String,
+    is_game_file: bool,
+}
+
+fn deploy_plan_transaction(
     store_root: &Path,
-    installed_mod_id: &str,
-    mut updater: F,
-) -> Result<ModActionResult, String>
-where
-    F: FnMut(&mut InstalledModRecord) -> Result<ModActionResult, String>,
-{
-    let path = installed_mods_path(store_root);
-    let mut store = read_store::<InstalledModRecord>(&path).map_err(error_to_string)?;
-    let record = store
-        .items
-        .iter_mut()
-        .find(|record| record.id == installed_mod_id)
-        .ok_or_else(|| format!("Installed mod not found: {}", installed_mod_id))?;
-    let result = updater(record)?;
-    write_store(&path, &store).map_err(error_to_string)?;
-    Ok(result)
+    profile: &GameProfile,
+    install_id: &str,
+    source_path: &Path,
+    plan: &InstallPlan,
+    excluded_mod_id: Option<&str>,
+) -> Result<DeploymentOutcome, String> {
+    if plan.mappings.is_empty() {
+        return Err("The selected install plan does not contain any files.".to_string());
+    }
+    if plan.mappings.len() > MAX_ARCHIVE_ENTRIES {
+        return Err(format!(
+            "The install plan contains too many files (maximum {}).",
+            MAX_ARCHIVE_ENTRIES
+        ));
+    }
+
+    let transaction_root = profile_dir(store_root, &profile.id)
+        .join("transactions")
+        .join(Uuid::new_v4().to_string());
+    let stage_root = transaction_root.join("stage");
+    let rollback_root = transaction_root.join("rollback");
+    fs::create_dir_all(&stage_root).map_err(error_to_string)?;
+    fs::create_dir_all(&rollback_root).map_err(error_to_string)?;
+
+    let result = (|| -> Result<DeploymentOutcome, String> {
+        let mut archive = if source_path.is_dir() {
+            None
+        } else {
+            let archive_file = File::open(source_path).map_err(error_to_string)?;
+            Some(ZipArchive::new(archive_file).map_err(error_to_string)?)
+        };
+        let profile_root = profile_dir(store_root, &profile.id);
+        let mut prepared = Vec::with_capacity(plan.mappings.len());
+        let mut destination_keys = HashSet::new();
+        let mut expanded_bytes = 0_u64;
+
+        for (index, mapping) in plan.mappings.iter().enumerate() {
+            validate_archive_relative_path(&mapping.source_path)?;
+            validate_archive_relative_path(&mapping.target_relative_path)?;
+
+            let target_root = if mapping.target_root == "game" {
+                PathBuf::from(&profile.game_path)
+            } else {
+                profile_root.clone()
+            };
+            let destination = safe_join(&target_root, &mapping.target_relative_path)?;
+            let destination_key =
+                normalize_filesystem_identity(destination.to_string_lossy().as_ref());
+            if !destination_keys.insert(destination_key.clone()) {
+                return Err(format!(
+                    "The install plan maps more than one file to {}.",
+                    destination.to_string_lossy()
+                ));
+            }
+
+            if mapping.target_root == "game" {
+                if let Some(owner) =
+                    enabled_file_owner(store_root, &profile.id, &destination_key, excluded_mod_id)?
+                {
+                    return Err(format!(
+                        "File conflict: {} is already managed by {}. Disable or remove that mod first.",
+                        mapping.target_relative_path,
+                        display_record_name(&owner)
+                    ));
+                }
+            }
+
+            let staged_path = stage_root.join(format!("{index}.bin"));
+            let file_size = if let Some(archive) = archive.as_mut() {
+                let mut zip_file = archive
+                    .by_name(&mapping.source_path)
+                    .map_err(|_| format!("Archive entry is missing: {}", mapping.source_path))?;
+                validate_archive_file_size(
+                    &mapping.source_path,
+                    zip_file.size(),
+                    zip_file.compressed_size(),
+                )?;
+                let mut output = File::create(&staged_path).map_err(error_to_string)?;
+                copy_with_limit(&mut zip_file, &mut output, MAX_ARCHIVE_FILE_BYTES)?
+            } else {
+                let source_file = safe_join(source_path, &mapping.source_path)?;
+                if !source_file.is_file() {
+                    return Err(format!("Folder entry is missing: {}", mapping.source_path));
+                }
+                let size = source_file.metadata().map_err(error_to_string)?.len();
+                validate_archive_file_size(&mapping.source_path, size, size)?;
+                let mut input = File::open(&source_file).map_err(error_to_string)?;
+                let mut output = File::create(&staged_path).map_err(error_to_string)?;
+                copy_with_limit(&mut input, &mut output, MAX_ARCHIVE_FILE_BYTES)?
+            };
+            expanded_bytes = expanded_bytes
+                .checked_add(file_size)
+                .ok_or_else(|| "The expanded mod size overflowed its safety limit.".to_string())?;
+            if expanded_bytes > MAX_ARCHIVE_EXPANDED_BYTES {
+                return Err(format!(
+                    "The mod expands beyond UniLoader's {} GB safety limit.",
+                    MAX_ARCHIVE_EXPANDED_BYTES / 1024 / 1024 / 1024
+                ));
+            }
+
+            prepared.push(PreparedDeploymentFile {
+                staged_path,
+                destination,
+                target_relative_path: mapping.target_relative_path.clone(),
+                is_game_file: mapping.target_root == "game",
+            });
+        }
+
+        let backup_root = profile_backup_dir(store_root, &profile.id, install_id);
+        let mut files_written = Vec::with_capacity(prepared.len());
+        let mut backups_written = Vec::new();
+        let mut written_file_hashes = HashMap::new();
+        let mut rollback_entries = Vec::new();
+
+        for (index, file) in prepared.iter().enumerate() {
+            let immediate_backup = if file.destination.exists() {
+                let backup = rollback_root.join(format!("{index}.bin"));
+                fs::copy(&file.destination, &backup).map_err(error_to_string)?;
+                Some(backup)
+            } else {
+                None
+            };
+            rollback_entries.push(DeploymentRollbackEntry {
+                destination: file.destination.clone(),
+                immediate_backup,
+            });
+
+            if file.is_game_file && file.destination.exists() {
+                let backup_path = safe_join(&backup_root, &file.target_relative_path)?;
+                if !backup_path.exists() {
+                    if let Some(parent) = backup_path.parent() {
+                        fs::create_dir_all(parent).map_err(error_to_string)?;
+                    }
+                    fs::copy(&file.destination, &backup_path).map_err(error_to_string)?;
+                }
+                backups_written.push(backup_path.to_string_lossy().to_string());
+            }
+
+            if let Err(error) = replace_file_from_path(&file.staged_path, &file.destination) {
+                let outcome = DeploymentOutcome {
+                    files_written,
+                    backups_written,
+                    written_file_hashes,
+                    transaction_root: transaction_root.clone(),
+                    rollback_entries,
+                };
+                outcome.rollback();
+                return Err(error);
+            }
+
+            let destination_string = file.destination.to_string_lossy().to_string();
+            written_file_hashes.insert(destination_string.clone(), sha256_file(&file.destination)?);
+            files_written.push(destination_string);
+        }
+
+        Ok(DeploymentOutcome {
+            files_written,
+            backups_written,
+            written_file_hashes,
+            transaction_root: transaction_root.clone(),
+            rollback_entries,
+        })
+    })();
+
+    if result.is_err() && transaction_root.exists() {
+        let _ = fs::remove_dir_all(&transaction_root);
+    }
+    result
+}
+
+fn enabled_file_owner(
+    store_root: &Path,
+    profile_id: &str,
+    destination_key: &str,
+    excluded_mod_id: Option<&str>,
+) -> Result<Option<InstalledModRecord>, String> {
+    let store = read_store::<InstalledModRecord>(&installed_mods_path(store_root))
+        .map_err(error_to_string)?;
+    Ok(store.items.into_iter().find(|record| {
+        record.profile_id == profile_id
+            && record.enabled
+            && excluded_mod_id != Some(record.id.as_str())
+            && record
+                .files_written
+                .iter()
+                .any(|path| normalize_filesystem_identity(path) == destination_key)
+    }))
+}
+
+fn validate_archive_relative_path(path: &str) -> Result<(), String> {
+    let normalized = normalize_archive_path(path);
+    let depth = Path::new(&normalized).components().count();
+    if depth > MAX_ARCHIVE_PATH_DEPTH {
+        return Err(format!(
+            "Archive path is nested too deeply (maximum {}): {}",
+            MAX_ARCHIVE_PATH_DEPTH, path
+        ));
+    }
+    if normalized.len() > 1024 {
+        return Err("An archive path exceeds UniLoader's safety limit.".to_string());
+    }
+    Ok(())
+}
+
+fn validate_archive_file_size(path: &str, size: u64, compressed_size: u64) -> Result<(), String> {
+    if size > MAX_ARCHIVE_FILE_BYTES {
+        return Err(format!("Archive file is too large: {path}"));
+    }
+    if compressed_size > 0 && size / compressed_size.max(1) > MAX_ARCHIVE_COMPRESSION_RATIO {
+        return Err(format!(
+            "Archive file has an unsafe compression ratio: {path}"
+        ));
+    }
+    Ok(())
+}
+
+fn copy_with_limit<R: Read + ?Sized, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    limit: u64,
+) -> Result<u64, String> {
+    let mut limited = reader.take(limit.saturating_add(1));
+    let copied = io::copy(&mut limited, writer).map_err(error_to_string)?;
+    if copied > limit {
+        return Err(format!(
+            "A file exceeded UniLoader's {} MB safety limit.",
+            limit / 1024 / 1024
+        ));
+    }
+    Ok(copied)
+}
+
+fn replace_file_from_path(source: &Path, destination: &Path) -> Result<(), String> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(error_to_string)?;
+    }
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("mod-file");
+    let temporary = destination.with_file_name(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+    let result = (|| -> Result<(), String> {
+        fs::copy(source, &temporary).map_err(|error| {
+            format!(
+                "Could not stage {} for {}: {error}",
+                source.to_string_lossy(),
+                destination.to_string_lossy()
+            )
+        })?;
+        File::options()
+            .read(true)
+            .write(true)
+            .open(&temporary)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| format!("Could not flush {}: {error}", temporary.to_string_lossy()))?;
+        if destination.exists() {
+            fs::remove_file(destination).map_err(|error| {
+                format!(
+                    "Could not replace existing file {}: {error}",
+                    destination.to_string_lossy()
+                )
+            })?;
+        }
+        fs::rename(&temporary, destination).map_err(|error| {
+            format!(
+                "Could not activate {}: {error}",
+                destination.to_string_lossy()
+            )
+        })
+    })();
+    if temporary.exists() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file = File::open(path).map_err(error_to_string)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(error_to_string)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn cleanup_install_data(store_root: &Path, profile_id: &str, install_id: &str) {
+    let _ = fs::remove_dir_all(profile_package_dir(store_root, profile_id, install_id));
+    let _ = fs::remove_dir_all(profile_backup_dir(store_root, profile_id, install_id));
+    let receipt = profile_dir(store_root, profile_id)
+        .join("receipts")
+        .join(format!("{install_id}.json"));
+    let _ = fs::remove_file(receipt);
+}
+
+fn restore_deactivated_mods(
+    store_root: &Path,
+    profile: &GameProfile,
+    records: &[InstalledModRecord],
+) {
+    for record in records {
+        let Some(plan) = record.plan.clone() else {
+            continue;
+        };
+        let mut restored = record.clone();
+        let install_id = restored.id.clone();
+        let archive_path = restored.archive_path.clone();
+        let _ = deploy_mod_files(
+            store_root,
+            profile,
+            &install_id,
+            &archive_path,
+            &plan,
+            &mut restored,
+        );
+    }
+}
+
+fn validate_profile_migration_plans(
+    profile: &GameProfile,
+    records: &[InstalledModRecord],
+) -> Result<(), String> {
+    let mut destinations = HashMap::<String, String>::new();
+    for record in records
+        .iter()
+        .filter(|record| record.profile_id == profile.id && record.enabled)
+    {
+        let plan = record.plan.as_ref().ok_or_else(|| {
+            format!(
+                "{} cannot be migrated because its install plan is unavailable.",
+                display_record_name(record)
+            )
+        })?;
+        if let Some(reason) = incompatible_install_plan_reason(profile, plan) {
+            return Err(format!("{}: {reason}", display_record_name(record)));
+        }
+        for mapping in plan
+            .mappings
+            .iter()
+            .filter(|mapping| mapping.target_root == "game")
+        {
+            let destination =
+                safe_join(Path::new(&profile.game_path), &mapping.target_relative_path)?;
+            let key = normalize_filesystem_identity(destination.to_string_lossy().as_ref());
+            if let Some(owner) = destinations.insert(key, display_record_name(record)) {
+                return Err(format!(
+                    "{} and {} both target {}. Resolve this conflict before changing folders.",
+                    owner,
+                    display_record_name(record),
+                    mapping.target_relative_path
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rollback_profile_migration(
+    store_root: &Path,
+    old_profile: &GameProfile,
+    new_profile: &GameProfile,
+    migrated_records: &[InstalledModRecord],
+    old_records: &[InstalledModRecord],
+) {
+    for record in migrated_records.iter().rev() {
+        let _ = deactivate_mod_files(store_root, new_profile, record);
+        let _ = fs::remove_dir_all(profile_backup_dir(store_root, &new_profile.id, &record.id));
+    }
+    restore_deactivated_mods(store_root, old_profile, old_records);
+    for record in old_records {
+        let _ = write_receipt(store_root, old_profile, record);
+    }
 }
 
 fn deactivate_mod_files(
@@ -6073,35 +9303,108 @@ fn deactivate_mod_files(
     profile: &GameProfile,
     record: &InstalledModRecord,
 ) -> Result<Vec<String>, String> {
-    let mut files_changed = Vec::new();
+    let backup_root = profile_backup_dir(store_root, &profile.id, &record.id);
+    let transaction_root = profile_dir(store_root, &profile.id)
+        .join("transactions")
+        .join(Uuid::new_v4().to_string());
+    fs::create_dir_all(&transaction_root).map_err(error_to_string)?;
+
+    let mut affected_paths = record
+        .files_written
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    for backup_path in &record.backups_written {
+        let backup = PathBuf::from(backup_path);
+        if let Ok(relative_path) = backup.strip_prefix(&backup_root) {
+            let target = safe_join(
+                Path::new(&profile.game_path),
+                &to_portable_path(relative_path),
+            )?;
+            if !affected_paths.iter().any(|path| path == &target) {
+                affected_paths.push(target);
+            }
+        }
+    }
 
     for file_path in &record.files_written {
         let path = PathBuf::from(file_path);
-        if path.exists() {
-            fs::remove_file(&path).map_err(error_to_string)?;
-            files_changed.push(path.to_string_lossy().to_string());
+        if !path.exists() {
+            continue;
+        }
+        if let Some(expected_hash) = record.written_file_hashes.get(file_path) {
+            let current_hash = sha256_file(&path)?;
+            if &current_hash != expected_hash {
+                let _ = fs::remove_dir_all(&transaction_root);
+                return Err(format!(
+                    "UniLoader did not disable {} because it was modified after installation: {}",
+                    display_record_name(record),
+                    path.to_string_lossy()
+                ));
+            }
         }
     }
 
-    let backup_root = profile_backup_dir(store_root, &profile.id, &record.id);
-    for backup_path in &record.backups_written {
-        let backup = PathBuf::from(backup_path);
-        if !backup.exists() {
-            continue;
-        }
-
-        let Ok(relative_path) = backup.strip_prefix(&backup_root) else {
-            continue;
+    let mut snapshots = Vec::with_capacity(affected_paths.len());
+    for (index, path) in affected_paths.iter().enumerate() {
+        let snapshot = if path.exists() {
+            let snapshot = transaction_root.join(format!("{index}.bin"));
+            fs::copy(path, &snapshot).map_err(error_to_string)?;
+            Some(snapshot)
+        } else {
+            None
         };
-        let target = PathBuf::from(&profile.game_path).join(relative_path);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).map_err(error_to_string)?;
-        }
-        fs::copy(&backup, &target).map_err(error_to_string)?;
-        files_changed.push(target.to_string_lossy().to_string());
+        snapshots.push(DeploymentRollbackEntry {
+            destination: path.clone(),
+            immediate_backup: snapshot,
+        });
     }
 
-    Ok(files_changed)
+    let operation = (|| -> Result<Vec<String>, String> {
+        let mut files_changed = Vec::new();
+        for file_path in &record.files_written {
+            let path = PathBuf::from(file_path);
+            if path.exists() {
+                fs::remove_file(&path).map_err(error_to_string)?;
+                files_changed.push(path.to_string_lossy().to_string());
+            }
+        }
+
+        for backup_path in &record.backups_written {
+            let backup = PathBuf::from(backup_path);
+            if !backup.exists() {
+                continue;
+            }
+            let Ok(relative_path) = backup.strip_prefix(&backup_root) else {
+                continue;
+            };
+            let target = safe_join(
+                Path::new(&profile.game_path),
+                &to_portable_path(relative_path),
+            )?;
+            replace_file_from_path(&backup, &target)?;
+            files_changed.push(target.to_string_lossy().to_string());
+        }
+        Ok(files_changed)
+    })();
+
+    match operation {
+        Ok(files_changed) => {
+            let _ = fs::remove_dir_all(transaction_root);
+            Ok(files_changed)
+        }
+        Err(error) => {
+            for snapshot in snapshots.iter().rev() {
+                if let Some(source) = &snapshot.immediate_backup {
+                    let _ = replace_file_from_path(source, &snapshot.destination);
+                } else if snapshot.destination.exists() {
+                    let _ = fs::remove_file(&snapshot.destination);
+                }
+            }
+            let _ = fs::remove_dir_all(transaction_root);
+            Err(error)
+        }
+    }
 }
 
 fn deploy_mod_files(
@@ -6113,77 +9416,19 @@ fn deploy_mod_files(
     record: &mut InstalledModRecord,
 ) -> Result<Vec<String>, String> {
     let source_path = Path::new(archive_path);
-    let mut archive = if source_path.is_dir() {
-        None
-    } else {
-        let archive_file = File::open(source_path).map_err(error_to_string)?;
-        Some(ZipArchive::new(archive_file).map_err(error_to_string)?)
-    };
-    let profile_root = profile_dir(store_root, &profile.id);
-    let backup_root = profile_backup_dir(store_root, &profile.id, install_id);
-    let mut files_written = Vec::new();
-
-    for mapping in &plan.mappings {
-        let source_file_path = if archive.is_none() {
-            let source_file_path = safe_join(source_path, &mapping.source_path)?;
-            if !source_file_path.is_file() {
-                return Err(format!(
-                    "Skipped missing folder entry: {}",
-                    mapping.source_path
-                ));
-            }
-            Some(source_file_path)
-        } else {
-            if archive
-                .as_mut()
-                .and_then(|archive| archive.by_name(&mapping.source_path).ok())
-                .is_none()
-            {
-                return Err(format!(
-                    "Skipped missing archive entry: {}",
-                    mapping.source_path
-                ));
-            }
-            None
-        };
-
-        let target_root = if mapping.target_root == "game" {
-            PathBuf::from(&profile.game_path)
-        } else {
-            profile_root.clone()
-        };
-        let destination_path = safe_join(&target_root, &mapping.target_relative_path)?;
-
-        if let Some(parent) = destination_path.parent() {
-            fs::create_dir_all(parent).map_err(error_to_string)?;
-        }
-
-        if mapping.target_root == "game" && destination_path.exists() {
-            let backup_path = safe_join(&backup_root, &mapping.target_relative_path)?;
-            if !backup_path.exists() {
-                if let Some(parent) = backup_path.parent() {
-                    fs::create_dir_all(parent).map_err(error_to_string)?;
-                }
-                fs::copy(&destination_path, &backup_path).map_err(error_to_string)?;
-                record
-                    .backups_written
-                    .push(backup_path.to_string_lossy().to_string());
-            }
-        }
-
-        let mut out_file = File::create(&destination_path).map_err(error_to_string)?;
-        if let Some(archive) = archive.as_mut() {
-            let mut zip_file = archive
-                .by_name(&mapping.source_path)
-                .map_err(error_to_string)?;
-            io::copy(&mut zip_file, &mut out_file).map_err(error_to_string)?;
-        } else if let Some(source_file_path) = source_file_path {
-            let mut source_file = File::open(source_file_path).map_err(error_to_string)?;
-            io::copy(&mut source_file, &mut out_file).map_err(error_to_string)?;
-        }
-        files_written.push(destination_path.to_string_lossy().to_string());
-    }
-
+    let deployment = deploy_plan_transaction(
+        store_root,
+        profile,
+        install_id,
+        source_path,
+        plan,
+        Some(&record.id),
+    )?;
+    record.files_written = deployment.files_written.clone();
+    record.backups_written = deployment.backups_written.clone();
+    record.written_file_hashes = deployment.written_file_hashes.clone();
+    let files_written = deployment.files_written.clone();
+    deployment.commit();
     Ok(files_written)
 }
 
@@ -6260,6 +9505,10 @@ fn adopt_existing_native_script_mods(
             installed_at,
             files_written: vec![script_file.absolute_path.to_string_lossy().to_string()],
             backups_written: Vec::new(),
+            written_file_hashes: HashMap::from([(
+                script_file.absolute_path.to_string_lossy().to_string(),
+                sha256_file(&script_file.absolute_path)?,
+            )]),
             dependencies: Vec::new(),
             config_files: Vec::new(),
             enabled: true,
@@ -6348,6 +9597,18 @@ fn discover_native_script_files_in_dir(
 
 fn normalize_filesystem_identity(path: &str) -> String {
     path.replace('\\', "/").to_lowercase()
+}
+
+fn normalize_profile_game_path(path: &str) -> String {
+    let trimmed = path.trim();
+    #[cfg(target_os = "windows")]
+    {
+        trimmed.replace('/', "\\")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        trimmed.to_string()
+    }
 }
 
 fn discover_profile_config_files(profile: &GameProfile) -> Vec<String> {
@@ -6729,6 +9990,14 @@ fn validate_config_file_for_edit(
         return Err("Config path exists, but it is not a file.".to_string());
     }
 
+    if fs::symlink_metadata(path)
+        .map_err(error_to_string)?
+        .file_type()
+        .is_symlink()
+    {
+        return Err("Symbolic-link config files are not edited for safety.".to_string());
+    }
+
     if !is_supported_config_file(path) {
         return Err("This file type is not editable as a config file yet.".to_string());
     }
@@ -6760,6 +10029,8 @@ fn parse_mod_config_entries(path: &Path, content: &str) -> Vec<ModConfigEntry> {
         .as_deref()
     {
         Some("json") => parse_json_config_entries(content),
+        Some("toml") => parse_toml_config_entries(content),
+        Some("yaml") | Some("yml") => parse_yaml_config_entries(content),
         _ => parse_key_value_config_entries(content),
     }
 }
@@ -6820,6 +10091,245 @@ fn json_config_value_type(value: &serde_json::Value) -> &'static str {
         serde_json::Value::String(_) => "string",
         serde_json::Value::Array(_) => "array",
         serde_json::Value::Object(_) => "object",
+    }
+}
+
+fn parse_toml_config_entries(content: &str) -> Vec<ModConfigEntry> {
+    let Ok(document) = content.parse::<toml_edit::DocumentMut>() else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    flatten_toml_table(document.as_table(), Vec::new(), &mut entries);
+    entries
+}
+
+fn flatten_toml_table(
+    table: &toml_edit::Table,
+    path: Vec<String>,
+    entries: &mut Vec<ModConfigEntry>,
+) {
+    for (key, item) in table.iter() {
+        let mut next_path = path.clone();
+        next_path.push(key.to_string());
+        match item {
+            toml_edit::Item::Table(nested) => {
+                flatten_toml_table(nested, next_path, entries);
+            }
+            toml_edit::Item::Value(value) => {
+                let section = if path.is_empty() {
+                    None
+                } else {
+                    Some(path.join("."))
+                };
+                entries.push(ModConfigEntry {
+                    section,
+                    key: key.to_string(),
+                    value: toml_config_value_display(value),
+                    value_type: Some(value.type_name().to_string()),
+                    default_value: None,
+                    description: None,
+                });
+            }
+            toml_edit::Item::ArrayOfTables(_) | toml_edit::Item::None => {}
+        }
+    }
+}
+
+fn toml_config_value_display(value: &toml_edit::Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string().trim().to_string())
+}
+
+fn update_toml_config_content(
+    content: &str,
+    section: Option<&str>,
+    key: &str,
+    next_value: &str,
+) -> Result<String, String> {
+    let mut document = content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(error_to_string)?;
+    let mut current = document.as_item_mut();
+    for part in section
+        .unwrap_or_default()
+        .split('.')
+        .filter(|part| !part.trim().is_empty())
+    {
+        current = current
+            .get_mut(part)
+            .ok_or_else(|| format!("Config section not found: {part}"))?;
+    }
+    let target = current
+        .get_mut(key)
+        .and_then(toml_edit::Item::as_value_mut)
+        .ok_or_else(|| format!("Setting not found: {key}"))?;
+    *target = typed_toml_config_value(target, next_value)?;
+    Ok(document.to_string())
+}
+
+fn typed_toml_config_value(
+    current: &toml_edit::Value,
+    next_value: &str,
+) -> Result<toml_edit::Value, String> {
+    if current.is_str() {
+        return Ok(toml_edit::Value::from(next_value));
+    }
+
+    let candidate = format!("value = {}", next_value.trim())
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| format!("Invalid TOML value: {error}"))?
+        .get("value")
+        .and_then(toml_edit::Item::as_value)
+        .cloned()
+        .ok_or_else(|| "Invalid TOML value.".to_string())?;
+
+    if candidate.type_name() != current.type_name() {
+        return Err(format!(
+            "This setting requires a {} value.",
+            current.type_name()
+        ));
+    }
+    Ok(candidate)
+}
+
+fn parse_yaml_config_entries(content: &str) -> Vec<ModConfigEntry> {
+    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(content) else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    flatten_yaml_config_value(&value, Vec::new(), &mut entries);
+    entries
+}
+
+fn flatten_yaml_config_value(
+    value: &serde_yaml::Value,
+    path: Vec<String>,
+    entries: &mut Vec<ModConfigEntry>,
+) {
+    if let serde_yaml::Value::Mapping(map) = value {
+        for (key, value) in map {
+            let Some(key) = key.as_str() else {
+                continue;
+            };
+            let mut next_path = path.clone();
+            next_path.push(key.to_string());
+            flatten_yaml_config_value(value, next_path, entries);
+        }
+        return;
+    }
+
+    let key = path.last().cloned().unwrap_or_else(|| "value".to_string());
+    let section = if path.len() > 1 {
+        Some(path[..path.len() - 1].join("."))
+    } else {
+        None
+    };
+    entries.push(ModConfigEntry {
+        section,
+        key,
+        value: yaml_config_value_display(value),
+        value_type: Some(yaml_config_value_type(value).to_string()),
+        default_value: None,
+        description: None,
+    });
+}
+
+fn yaml_config_value_display(value: &serde_yaml::Value) -> String {
+    match value {
+        serde_yaml::Value::String(value) => value.clone(),
+        _ => serde_yaml::to_string(value)
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+    }
+}
+
+fn yaml_config_value_type(value: &serde_yaml::Value) -> &'static str {
+    match value {
+        serde_yaml::Value::Null => "null",
+        serde_yaml::Value::Bool(_) => "bool",
+        serde_yaml::Value::Number(_) => "number",
+        serde_yaml::Value::String(_) => "string",
+        serde_yaml::Value::Sequence(_) => "array",
+        serde_yaml::Value::Mapping(_) => "object",
+        serde_yaml::Value::Tagged(_) => "tagged",
+    }
+}
+
+fn update_yaml_config_content(
+    content: &str,
+    section: Option<&str>,
+    key: &str,
+    next_value: &str,
+) -> Result<String, String> {
+    let mut root = serde_yaml::from_str::<serde_yaml::Value>(content).map_err(error_to_string)?;
+    let mut path = section
+        .map(|section| {
+            section
+                .split('.')
+                .filter(|part| !part.trim().is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    path.push(key.to_string());
+
+    let target = yaml_value_at_path_mut(&mut root, &path)
+        .ok_or_else(|| format!("Setting not found: {key}"))?;
+    *target = typed_yaml_config_value(target, next_value)?;
+    serde_yaml::to_string(&root).map_err(error_to_string)
+}
+
+fn yaml_value_at_path_mut<'a>(
+    value: &'a mut serde_yaml::Value,
+    path: &[String],
+) -> Option<&'a mut serde_yaml::Value> {
+    let mut current = value;
+    for part in path {
+        let serde_yaml::Value::Mapping(map) = current else {
+            return None;
+        };
+        current = map.get_mut(serde_yaml::Value::String(part.clone()))?;
+    }
+    Some(current)
+}
+
+fn typed_yaml_config_value(
+    current: &serde_yaml::Value,
+    next_value: &str,
+) -> Result<serde_yaml::Value, String> {
+    if matches!(current, serde_yaml::Value::String(_)) {
+        return Ok(serde_yaml::Value::String(next_value.to_string()));
+    }
+    let candidate =
+        serde_yaml::from_str::<serde_yaml::Value>(next_value).map_err(error_to_string)?;
+    if yaml_config_value_type(&candidate) != yaml_config_value_type(current) {
+        return Err(format!(
+            "This setting requires a {} value.",
+            yaml_config_value_type(current)
+        ));
+    }
+    Ok(candidate)
+}
+
+fn validate_structured_config_content(
+    extension: Option<&str>,
+    content: &str,
+) -> Result<(), String> {
+    match extension {
+        Some("json") => serde_json::from_str::<serde_json::Value>(content)
+            .map(|_| ())
+            .map_err(error_to_string),
+        Some("toml") => content
+            .parse::<toml_edit::DocumentMut>()
+            .map(|_| ())
+            .map_err(error_to_string),
+        Some("yaml") | Some("yml") => serde_yaml::from_str::<serde_yaml::Value>(content)
+            .map(|_| ())
+            .map_err(error_to_string),
+        _ => Ok(()),
     }
 }
 
@@ -7114,8 +10624,12 @@ fn config_files_from_paths(paths: &[String]) -> Vec<String> {
                 || lower_path.contains("/reframework/autorun/")
                 || lower_path.ends_with(".cfg")
                 || lower_path.ends_with(".ini")
+                || lower_path.ends_with(".conf")
+                || lower_path.ends_with(".config")
                 || lower_path.ends_with(".json")
                 || lower_path.ends_with(".toml")
+                || lower_path.ends_with(".yaml")
+                || lower_path.ends_with(".yml")
         })
         .cloned()
         .collect()
@@ -7413,11 +10927,11 @@ fn mapping(
 fn read_manifest(
     archive_path: &Path,
     entries: &[ArchiveEntry],
-) -> Result<Option<ThunderstoreManifest>, String> {
+) -> Result<(Option<ThunderstoreManifest>, Option<PackageIdentity>), String> {
     let Some(manifest_entry) = entries.iter().find(|entry| {
         !entry.is_directory && entry.logical_path.eq_ignore_ascii_case("manifest.json")
     }) else {
-        return Ok(None);
+        return Ok((None, None));
     };
 
     let archive_file = File::open(archive_path).map_err(error_to_string)?;
@@ -7428,26 +10942,114 @@ fn read_manifest(
     let mut manifest_content = String::new();
     io::Read::read_to_string(&mut manifest_file, &mut manifest_content).map_err(error_to_string)?;
 
-    parse_json_allow_bom::<ThunderstoreManifest>(&manifest_content)
-        .map(Some)
-        .map_err(error_to_string)
+    parse_embedded_package_manifest(&manifest_content)
 }
 
 fn read_folder_manifest(
     folder_path: &Path,
     entries: &[ArchiveEntry],
-) -> Result<Option<ThunderstoreManifest>, String> {
+) -> Result<(Option<ThunderstoreManifest>, Option<PackageIdentity>), String> {
     let Some(manifest_entry) = entries.iter().find(|entry| {
         !entry.is_directory && entry.logical_path.eq_ignore_ascii_case("manifest.json")
     }) else {
-        return Ok(None);
+        return Ok((None, None));
     };
 
     let manifest_path = safe_join(folder_path, &manifest_entry.path)?;
     let manifest_content = fs::read_to_string(manifest_path).map_err(error_to_string)?;
-    parse_json_allow_bom::<ThunderstoreManifest>(&manifest_content)
-        .map(Some)
-        .map_err(error_to_string)
+    parse_embedded_package_manifest(&manifest_content)
+}
+
+fn parse_embedded_package_manifest(
+    manifest_content: &str,
+) -> Result<(Option<ThunderstoreManifest>, Option<PackageIdentity>), String> {
+    let value = parse_json_allow_bom::<serde_json::Value>(manifest_content)
+        .map_err(|error| format!("Could not read package manifest.json: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "Package manifest.json must contain a JSON object.".to_string())?;
+
+    let has_thunderstore_version =
+        object.contains_key("version_number") || object.contains_key("versionNumber");
+    if object.contains_key("name") && has_thunderstore_version {
+        let manifest = serde_json::from_value::<ThunderstoreManifest>(value)
+            .map_err(|error| format!("Invalid Thunderstore manifest.json: {error}"))?;
+        let dependencies = manifest.dependencies.clone().unwrap_or_default();
+        let identity = PackageIdentity {
+            provider: "thunderstore".to_string(),
+            package_id: Some(format!(
+                "thunderstore-manifest:{}",
+                compact_provider_slug(&manifest.name)
+            )),
+            version: Some(manifest.version_number.clone()),
+            provider_game_id: None,
+            mod_types: Vec::new(),
+            dependencies,
+            evidence: vec!["Thunderstore manifest.json".to_string()],
+            confidence: 0.82,
+        };
+        return Ok((Some(manifest), Some(identity)));
+    }
+
+    let is_curseforge = object.contains_key("manifestType")
+        || object.contains_key("manifestVersion")
+        || (object.contains_key("minecraft") && object.contains_key("files"));
+    if is_curseforge {
+        let name = json_string_field(object, &["name"]);
+        let version = json_string_field(object, &["version"]);
+        let provider_game_id = if object.contains_key("minecraft") {
+            Some("minecraft".to_string())
+        } else {
+            json_string_field(object, &["gameId", "game"])
+        };
+        let dependencies = object
+            .get("files")
+            .and_then(|files| files.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|file| {
+                let project_id = file.get("projectID").or_else(|| file.get("projectId"))?;
+                let file_id = file.get("fileID").or_else(|| file.get("fileId"));
+                Some(match file_id {
+                    Some(file_id) => format!("curseforge:{project_id}#{file_id}"),
+                    None => format!("curseforge:{project_id}"),
+                })
+            })
+            .collect::<Vec<_>>();
+        let package_id = name
+            .as_deref()
+            .map(compact_provider_slug)
+            .filter(|name| !name.is_empty())
+            .map(|name| format!("curseforge-manifest:{name}"));
+        return Ok((
+            None,
+            Some(PackageIdentity {
+                provider: "curseforge".to_string(),
+                package_id,
+                version,
+                provider_game_id,
+                mod_types: Vec::new(),
+                dependencies,
+                evidence: vec!["CurseForge manifest.json".to_string()],
+                confidence: 0.78,
+            }),
+        ));
+    }
+
+    Ok((None, None))
+}
+
+fn json_string_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter().find_map(|key| {
+        object.get(*key).and_then(|value| match value {
+            serde_json::Value::String(value) => non_empty_string(value.trim()),
+            serde_json::Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        })
+    })
 }
 
 fn normalize_archive_path(path: &str) -> String {
@@ -7803,7 +11405,7 @@ fn walk_game_folder(root: &Path) -> Vec<ProbeEntry> {
 
             if is_directory
                 && child_depth < MAX_SCAN_DEPTH
-                && (child_depth <= 1 || should_descend_into(&portable_path, &name))
+                && (child_depth <= 3 || should_descend_into(&portable_path, &name))
             {
                 queue.push_back((dirent.path(), child_relative_path, child_depth));
             }
@@ -7878,6 +11480,19 @@ fn choose_highest(scores: &HashMap<String, i32>, fallback: &str) -> String {
 }
 
 fn recommend_loader(game_id: Option<&str>, engine: &str, entries: &[ProbeEntry]) -> String {
+    if let Some(definition) = game_id.and_then(game_definition_by_id) {
+        if let Some(runtime) = definition.bootstrap_runtimes.first() {
+            return runtime.clone();
+        }
+        if !definition.supported_adapters.is_empty() {
+            return "none".to_string();
+        }
+    }
+
+    if game_id.is_none() {
+        return "none".to_string();
+    }
+
     if engine == "unreal" && supports_native_script_mods(game_id, entries) {
         return "none".to_string();
     }
@@ -7926,7 +11541,7 @@ fn write_receipt(
         fs::create_dir_all(parent).map_err(error_to_string)?;
     }
     let content = serde_json::to_string_pretty(record).map_err(error_to_string)?;
-    fs::write(receipt_path, format!("{}\n", content)).map_err(error_to_string)
+    atomic_write(&receipt_path, format!("{}\n", content).as_bytes()).map_err(error_to_string)
 }
 
 fn get_profile(store_root: &Path, profile_id: &str) -> Result<GameProfile, String> {
@@ -7957,8 +11572,19 @@ fn ensure_app_settings(path: &Path) -> io::Result<()> {
 fn read_app_settings(root: &Path) -> Result<AppSettings, String> {
     let path = settings_path(root);
     ensure_app_settings(&path).map_err(error_to_string)?;
-    let raw = fs::read_to_string(path).map_err(error_to_string)?;
-    parse_json_allow_bom::<AppSettings>(&raw).map_err(error_to_string)
+    let mut settings = read_json_with_backup::<AppSettings>(&path).map_err(error_to_string)?;
+
+    if !settings.nexus_api_key.trim().is_empty() {
+        let legacy_key = settings.nexus_api_key.trim().to_string();
+        write_nexus_api_key(Some(&legacy_key))?;
+        settings.nexus_api_key.clear();
+        settings.nexus_api_key_configured = true;
+        write_app_settings(root, &settings)?;
+    }
+
+    settings.nexus_api_key = read_nexus_api_key()?.unwrap_or_default();
+    settings.nexus_api_key_configured = !settings.nexus_api_key.is_empty();
+    Ok(settings)
 }
 
 fn write_app_settings(root: &Path, settings: &AppSettings) -> Result<(), String> {
@@ -7966,12 +11592,37 @@ fn write_app_settings(root: &Path, settings: &AppSettings) -> Result<(), String>
 }
 
 fn write_app_settings_raw(path: &Path, settings: &AppSettings) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let content = serde_json::to_string_pretty(settings)
+    let mut persisted = settings.clone();
+    persisted.nexus_api_key.clear();
+    let content = serde_json::to_string_pretty(&persisted)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    fs::write(path, format!("{}\n", content))
+    atomic_write(path, format!("{}\n", content).as_bytes())
+}
+
+fn read_nexus_api_key() -> Result<Option<String>, String> {
+    let entry =
+        keyring::Entry::new(NEXUS_KEYRING_SERVICE, NEXUS_KEYRING_USER).map_err(error_to_string)?;
+    match entry.get_password() {
+        Ok(value) if !value.trim().is_empty() => Ok(Some(value)),
+        Ok(_) | Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(format!(
+            "Could not read the Nexus API key from Windows Credential Manager: {error}"
+        )),
+    }
+}
+
+fn write_nexus_api_key(value: Option<&str>) -> Result<(), String> {
+    let entry =
+        keyring::Entry::new(NEXUS_KEYRING_SERVICE, NEXUS_KEYRING_USER).map_err(error_to_string)?;
+    match value {
+        Some(value) => entry
+            .set_password(value)
+            .map_err(|error| format!("Could not save the Nexus API key securely: {error}")),
+        None => match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(format!("Could not remove the Nexus API key: {error}")),
+        },
+    }
 }
 
 fn profiles_path(root: &Path) -> PathBuf {
@@ -7984,6 +11635,10 @@ fn settings_path(root: &Path) -> PathBuf {
 
 fn installed_mods_path(root: &Path) -> PathBuf {
     root.join("installed-mods.json")
+}
+
+fn pending_nexus_downloads_path(root: &Path) -> PathBuf {
+    root.join("pending-nexus-downloads.json")
 }
 
 fn profile_dir(root: &Path, profile_id: &str) -> PathBuf {
@@ -8023,20 +11678,115 @@ where
     T: Serialize + DeserializeOwned,
 {
     ensure_store::<T>(path)?;
-    let raw = fs::read_to_string(path)?;
-    parse_json_allow_bom(&raw).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    read_json_with_backup(path)
 }
 
 fn write_store<T>(path: &Path, store: &StoreFile<T>) -> io::Result<()>
 where
     T: Serialize + DeserializeOwned,
 {
+    let content = serde_json::to_string_pretty(store)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    atomic_write(path, format!("{}\n", content).as_bytes())
+}
+
+fn lock_mutations() -> Result<MutexGuard<'static, ()>, String> {
+    MUTATION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "UniLoader's operation queue was poisoned by an earlier failure.".to_string())
+}
+
+fn read_json_with_backup<T>(path: &Path) -> io::Result<T>
+where
+    T: DeserializeOwned,
+{
+    let primary = fs::read_to_string(path)
+        .and_then(|raw| parse_json_allow_bom(&raw).map_err(invalid_data_error));
+    if primary.is_ok() {
+        return primary;
+    }
+
+    let backup_path = backup_path_for(path);
+    let backup_raw = fs::read_to_string(&backup_path)?;
+    let recovered = parse_json_allow_bom::<T>(&backup_raw).map_err(invalid_data_error)?;
+    atomic_restore(path, backup_raw.as_bytes())?;
+    Ok(recovered)
+}
+
+fn invalid_data_error(error: serde_json::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
+}
+
+fn backup_path_for(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("store.json");
+    path.with_file_name(format!("{file_name}.bak"))
+}
+
+fn atomic_write(path: &Path, content: &[u8]) -> io::Result<()> {
+    let _guard = STORE_WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| io::Error::other("UniLoader's storage lock was poisoned"))?;
+    atomic_write_unlocked(path, content)
+}
+
+fn atomic_write_unlocked(path: &Path, content: &[u8]) -> io::Result<()> {
+    atomic_write_unlocked_with_backup(path, content, true)
+}
+
+fn atomic_restore(path: &Path, content: &[u8]) -> io::Result<()> {
+    let _guard = STORE_WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| io::Error::other("UniLoader's storage lock was poisoned"))?;
+    atomic_write_unlocked_with_backup(path, content, false)
+}
+
+fn atomic_write_unlocked_with_backup(
+    path: &Path,
+    content: &[u8],
+    preserve_previous: bool,
+) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let content = serde_json::to_string_pretty(store)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    fs::write(path, format!("{}\n", content))
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("store.json");
+    let temporary_path = path.with_file_name(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+    let backup_path = backup_path_for(path);
+
+    let write_result = (|| -> io::Result<()> {
+        let mut temporary = File::create(&temporary_path)?;
+        temporary.write_all(content)?;
+        temporary.sync_all()?;
+
+        if path.exists() && preserve_previous {
+            fs::copy(path, &backup_path)?;
+        }
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+
+        if let Err(error) = fs::rename(&temporary_path, path) {
+            if !path.exists() && backup_path.exists() {
+                let _ = fs::copy(&backup_path, path);
+            }
+            return Err(error);
+        }
+        Ok(())
+    })();
+
+    if temporary_path.exists() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    write_result
 }
 
 fn parse_json_allow_bom<T>(raw: &str) -> serde_json::Result<T>
@@ -8144,8 +11894,16 @@ fn update_installer_asset_score(name: &str) -> Option<i32> {
 fn open_folder_in_shell(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        Command::new("explorer")
-            .arg(path)
+        let explorer_target =
+            PathBuf::from(normalize_profile_game_path(path.to_string_lossy().as_ref()));
+        if !explorer_target.is_dir() {
+            return Err(format!(
+                "Folder no longer exists: {}",
+                explorer_target.to_string_lossy()
+            ));
+        }
+        Command::new("explorer.exe")
+            .arg(explorer_target)
             .spawn()
             .map(|_| ())
             .map_err(error_to_string)
@@ -8167,7 +11925,7 @@ fn open_folder_in_shell(path: &Path) -> Result<(), String> {
 }
 
 fn open_url_in_shell(url: &str) -> Result<(), String> {
-    let trimmed_url = validated_http_url(url)?;
+    let trimmed_url = validated_shell_url(url)?;
 
     #[cfg(target_os = "windows")]
     {
@@ -8194,17 +11952,56 @@ fn open_url_in_shell(url: &str) -> Result<(), String> {
     }
 }
 
-fn validated_http_url(url: &str) -> Result<String, String> {
+fn validated_shell_url(url: &str) -> Result<String, String> {
     let trimmed_url = url.trim();
-    if !(trimmed_url.starts_with("https://") || trimmed_url.starts_with("http://")) {
-        return Err("Only http and https links can be opened.".to_string());
-    }
-
     if trimmed_url.chars().any(char::is_control) {
         return Err("Link contains invalid control characters.".to_string());
     }
-
+    if trimmed_url.starts_with("steam://") {
+        return Ok(trimmed_url.to_string());
+    }
+    validate_https_url(trimmed_url)?;
     Ok(trimmed_url.to_string())
+}
+
+fn validated_update_url(value: &str) -> Result<String, String> {
+    let parsed = validate_https_url(value.trim())?;
+    if parsed.host_str() != Some("github.com") {
+        return Err("Updates can only be downloaded from GitHub releases.".to_string());
+    }
+    let expected_prefix = format!("/{APP_UPDATE_REPOSITORY}/releases/download/");
+    if !parsed.path().starts_with(&expected_prefix) {
+        return Err("The update URL is not an official UniLoader release asset.".to_string());
+    }
+    Ok(parsed.to_string())
+}
+
+fn download_update_checksum(client: &Client, checksum_url: &str) -> Result<String, String> {
+    validated_update_url(checksum_url.trim_end_matches(".sha256"))?;
+    let mut response = client
+        .get(checksum_url)
+        .send()
+        .map_err(error_to_string)?
+        .error_for_status()
+        .map_err(|error| {
+            format!("The release is missing its required SHA-256 checksum: {error}")
+        })?;
+    let mut bytes = Vec::new();
+    response
+        .by_ref()
+        .take(4097)
+        .read_to_end(&mut bytes)
+        .map_err(error_to_string)?;
+    if bytes.len() > 4096 {
+        return Err("The update checksum file is unexpectedly large.".to_string());
+    }
+    let text = String::from_utf8(bytes).map_err(error_to_string)?;
+    let hash = text
+        .split_whitespace()
+        .next()
+        .filter(|value| value.len() == 64 && value.chars().all(|ch| ch.is_ascii_hexdigit()))
+        .ok_or_else(|| "The update checksum file is invalid.".to_string())?;
+    Ok(hash.to_lowercase())
 }
 
 fn update_download_dir() -> Result<PathBuf, String> {
@@ -8259,12 +12056,366 @@ fn launch_update_installer(path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    fn online_mod_fixture(name: &str, description: &str) -> OnlineModRecord {
+        OnlineModRecord {
+            id: format!("test:{}", sanitize_file_segment(name)),
+            provider: "thunderstore".to_string(),
+            provider_label: "Thunderstore".to_string(),
+            game_id: Some("test-game".to_string()),
+            provider_game_id: Some("test-game".to_string()),
+            name: name.to_string(),
+            owner: "Test Author".to_string(),
+            version: "1.0.0".to_string(),
+            description: description.to_string(),
+            categories: Vec::new(),
+            downloads: 100,
+            rating_score: 0,
+            dependency_count: 0,
+            file_size: None,
+            icon_url: None,
+            package_url: None,
+            website_url: None,
+            installed: false,
+            created_at: None,
+            updated_at: None,
+            install_supported: true,
+            install_note: None,
+        }
+    }
+
+    #[test]
+    fn downloaded_archive_validation_accepts_archives_and_rejects_web_payloads() {
+        let root = temp_game_dir("downloaded-archive-validation");
+        fs::create_dir_all(&root).unwrap();
+
+        let valid_zip = root.join("valid.download");
+        let output = File::create(&valid_zip).unwrap();
+        let mut zip = ZipWriter::new(output);
+        add_bytes_to_zip(&mut zip, "plugin/mod.dll", b"mod payload").unwrap();
+        zip.finish().unwrap();
+        assert!(validate_downloaded_archive(&valid_zip, "zip").is_ok());
+
+        let fake_zip = root.join("provider-message.download");
+        fs::write(&fake_zip, b"<html>download authorization expired</html>").unwrap();
+        let error = validate_downloaded_archive(&fake_zip, "zip").unwrap_err();
+        assert!(error.contains("invalid ZIP archive"));
+
+        let valid_7z = root.join("valid-7z.download");
+        fs::write(&valid_7z, [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, 0, 0]).unwrap();
+        assert!(validate_downloaded_archive(&valid_7z, "7z").is_ok());
+
+        let valid_rar = root.join("valid-rar.download");
+        fs::write(&valid_rar, [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00]).unwrap();
+        assert!(validate_downloaded_archive(&valid_rar, "rar").is_ok());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn assert_supported_import_deploys(
+        root: &Path,
+        import_path: &Path,
+        prepared_as_directory: bool,
+    ) {
+        let store_root = root.join("store");
+        let game_root = root.join("game");
+        fs::create_dir_all(game_root.join("R5/Content/Paks/~mods")).unwrap();
+        let scanned = scan_import_source(&store_root, import_path).unwrap();
+        assert_eq!(
+            Path::new(&scanned.archive_path).is_dir(),
+            prepared_as_directory
+        );
+
+        let mut profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        let analysis = analyze_scanned_archive(scanned, &profile);
+        let plan = analysis.recommended_plan.clone().unwrap();
+        let result = install_archive_impl(
+            &store_root,
+            &profile,
+            import_path.to_string_lossy().as_ref(),
+            import_path.file_name().and_then(|name| name.to_str()),
+            Some(analysis.package_identity),
+            &plan,
+        )
+        .unwrap();
+
+        assert!(!result.files_written.is_empty());
+        assert!(game_root
+            .join("R5/Content/Paks/~mods/FutureMod_P.pak")
+            .is_file());
+        assert_eq!(
+            Path::new(&result.archive_path).is_dir(),
+            prepared_as_directory
+        );
+    }
+
+    #[test]
+    fn zip_imports_deploy_from_their_archive_source() {
+        let root = temp_game_dir("zip-install-source");
+        fs::create_dir_all(&root).unwrap();
+        let archive_path = root.join("FutureMod.zip");
+        let output = File::create(&archive_path).unwrap();
+        let mut zip = ZipWriter::new(output);
+        add_bytes_to_zip(&mut zip, "FutureMod_P.pak", b"future mod").unwrap();
+        zip.finish().unwrap();
+
+        assert_supported_import_deploys(&root, &archive_path, false);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn seven_zip_imports_deploy_from_their_extracted_source() {
+        let root = temp_game_dir("seven-zip-install-source");
+        let source_root = root.join("source");
+        touch(&source_root, "FutureMod_P.pak");
+        let archive_path = root.join("FutureMod.7z");
+        sevenz_rust2::compress_to_path(&source_root, &archive_path).unwrap();
+
+        assert_supported_import_deploys(&root, &archive_path, true);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rar_imports_deploy_from_their_extracted_source() {
+        let root = temp_game_dir("rar-install-source");
+        fs::create_dir_all(&root).unwrap();
+        let archive_path = root.join("FutureMod.rar");
+        let entries = [rars::rar50::StoredEntry {
+            name: b"FutureMod_P.pak",
+            data: b"future mod",
+            mtime: None,
+            attributes: 0x20,
+            host_os: 3,
+        }];
+        let archive = rars::rar50::Rar50Writer::new(rars::rar50::WriterOptions::default())
+            .stored_entries(&entries)
+            .finish()
+            .unwrap();
+        fs::write(&archive_path, archive).unwrap();
+
+        assert_supported_import_deploys(&root, &archive_path, true);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn folder_imports_deploy_from_their_directory_source() {
+        let root = temp_game_dir("folder-install-source");
+        let source_root = root.join("FutureMod");
+        touch(&source_root, "FutureMod_P.pak");
+
+        assert_supported_import_deploys(&root, &source_root, true);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn steam_app_id_is_inferred_from_the_adjacent_manifest() {
+        let library = temp_game_dir("steam-profile-artwork");
+        let steamapps = library.join("steamapps");
+        let game_path = steamapps.join("common").join("Windrose");
+        fs::create_dir_all(&game_path).unwrap();
+        fs::write(
+            steamapps.join("appmanifest_3041230.acf"),
+            r#""AppState"
+{
+    "appid"        "3041230"
+    "name"         "Windrose"
+    "installdir"   "Windrose"
+}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            infer_steam_app_id_for_game_path(&game_path).as_deref(),
+            Some("3041230")
+        );
+        assert!(infer_steam_app_id_for_game_path(&library.join("StandaloneGame")).is_none());
+
+        let _ = fs::remove_dir_all(library);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn profile_game_paths_use_native_windows_separators() {
+        assert_eq!(
+            normalize_profile_game_path("d:/steam\\steamapps/common/Windrose"),
+            "d:\\steam\\steamapps\\common\\Windrose"
+        );
+        assert_eq!(
+            normalize_profile_game_path("//server/share/Games/Windrose"),
+            "\\\\server\\share\\Games\\Windrose"
+        );
+    }
+
+    #[test]
+    fn selected_nexus_file_is_used_instead_of_the_recommended_default() {
+        let files = vec![
+            NexusFileRecord {
+                file_id: 10,
+                name: "2x minerals".to_string(),
+                version: Some("2x".to_string()),
+                category_name: Some("MAIN".to_string()),
+                is_primary: Some(true),
+                uploaded_timestamp: Some(10),
+                uploaded_time: None,
+                file_name: Some("minerals-2x.zip".to_string()),
+                size: Some(100),
+                size_kb: None,
+                description: None,
+            },
+            NexusFileRecord {
+                file_id: 20,
+                name: "10x minerals".to_string(),
+                version: Some("10x".to_string()),
+                category_name: Some("OPTIONAL".to_string()),
+                is_primary: Some(false),
+                uploaded_timestamp: Some(20),
+                uploaded_time: None,
+                file_name: Some("minerals-10x.7z".to_string()),
+                size: Some(200),
+                size_kb: None,
+                description: None,
+            },
+        ];
+
+        assert_eq!(choose_nexus_file(&files).unwrap().file_id, 10);
+        assert_eq!(
+            choose_requested_nexus_file(&files, Some("20"))
+                .unwrap()
+                .unwrap()
+                .file_id,
+            20
+        );
+        assert!(choose_requested_nexus_file(&files, Some("999")).is_err());
+    }
+
+    #[test]
+    fn nexus_manager_download_page_requests_an_nxm_handoff() {
+        assert_eq!(
+            nexus_manager_download_page_url("stardewvalley", 49335, 175386),
+            "https://www.nexusmods.com/stardewvalley/mods/49335?tab=files&file_id=175386&nmm=1"
+        );
+    }
+
+    #[test]
+    fn signed_nxm_links_are_parsed_without_trusting_extra_query_fields() {
+        let expires = Utc::now().timestamp() + 600;
+        let parsed = parse_nexus_nxm_link(&format!(
+            "nxm://stardewvalley/mods/49335/files/175386?key=abc_DEF-123&expires={expires}&user_id=42&campaign=test"
+        ))
+        .unwrap();
+
+        assert_eq!(parsed.domain, "stardewvalley");
+        assert_eq!(parsed.mod_id, 49335);
+        assert_eq!(parsed.file_id, 175386);
+        assert_eq!(parsed.key, "abc_DEF-123");
+        assert_eq!(parsed.expires, expires);
+        assert_eq!(parsed.user_id, 42);
+    }
+
+    #[test]
+    fn malformed_or_expired_nxm_links_are_rejected() {
+        let future = Utc::now().timestamp() + 600;
+        let expired = Utc::now().timestamp() - 60;
+
+        assert!(parse_nexus_nxm_link(&format!(
+            "https://stardewvalley/mods/1/files/2?key=test&expires={future}&user_id=42"
+        ))
+        .is_err());
+        assert!(parse_nexus_nxm_link(&format!(
+            "nxm://stardewvalley/mods/1/files/2?expires={future}&user_id=42"
+        ))
+        .is_err());
+        assert!(parse_nexus_nxm_link(&format!(
+            "nxm://stardewvalley/mods/1/files/2?key=test&expires={expired}&user_id=42"
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn thunderstore_dependency_versions_keep_their_dotted_version_path() {
+        let package_ref = ThunderstorePackageRef {
+            namespace: "Zehs".to_string(),
+            name: "REPOLib".to_string(),
+            version: Some("3.0.0".to_string()),
+        };
+
+        assert_eq!(
+            thunderstore_package_version_url(&package_ref, "3.0.0"),
+            "https://thunderstore.io/api/experimental/package/Zehs/REPOLib/3.0.0"
+        );
+    }
+
+    #[test]
+    fn discovery_hides_external_managers_but_keeps_in_game_management_mods() {
+        assert!(is_external_mod_manager_listing(&online_mod_fixture(
+            "Kesomannen Gale Mod Manager",
+            "A modern and lightweight alternative mod manager for Thunderstore."
+        )));
+        assert!(is_external_mod_manager_listing(&online_mod_fixture(
+            "unreal shimloader",
+            "Thunderstore Mod Manager and r2modmanPlus support for RE-UE4SS."
+        )));
+        assert!(is_external_mod_manager_listing(&online_mod_fixture(
+            "Vortex Extension",
+            "Adds support for this game to Vortex."
+        )));
+
+        assert!(!is_external_mod_manager_listing(&online_mod_fixture(
+            "BepInEx Configuration Manager",
+            "An in-game configuration manager for installed plugins."
+        )));
+        assert!(!is_external_mod_manager_listing(&online_mod_fixture(
+            "Server Mod Browser",
+            "Browse and inspect server-side mods from inside the game."
+        )));
+    }
+
     #[test]
     fn update_version_comparison_handles_multi_digit_segments() {
         assert!(is_newer_version("0.10.0", "0.2.0"));
         assert!(is_newer_version("v1.0.0", "0.9.9"));
         assert!(!is_newer_version("0.1.0", "0.1.0"));
         assert!(!is_newer_version("0.1.0", "0.2.0"));
+    }
+
+    #[test]
+    fn corrupted_json_store_recovers_without_destroying_its_backup() {
+        let root = temp_game_dir("store-recovery");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("records.json");
+        let first = StoreFile::<DependencySpec> {
+            version: 1,
+            items: Vec::new(),
+        };
+        let second = StoreFile {
+            version: 1,
+            items: vec![DependencySpec {
+                id: "runtime:test".to_string(),
+                name: "Test Runtime".to_string(),
+                version: Some("1.0".to_string()),
+                provider: "manual".to_string(),
+                required: true,
+                status: "missing".to_string(),
+                source: None,
+                notes: None,
+            }],
+        };
+
+        write_store(&path, &first).unwrap();
+        write_store(&path, &second).unwrap();
+        fs::write(&path, "not json").unwrap();
+
+        let recovered = read_store::<DependencySpec>(&path).unwrap();
+        assert!(recovered.items.is_empty());
+        let backup = fs::read_to_string(backup_path_for(&path)).unwrap();
+        let backup_store = parse_json_allow_bom::<StoreFile<DependencySpec>>(&backup).unwrap();
+        assert!(backup_store.items.is_empty());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -8299,6 +12450,7 @@ mod tests {
             name: "My Friends Server".to_string(),
             game_path: "D:/Steam/steamapps/common/Windrose".to_string(),
             game_id: Some("windrose".to_string()),
+            steam_app_id: None,
             engine: "unreal".to_string(),
             loader: "ue4ss".to_string(),
             created_at: now_string(),
@@ -8313,6 +12465,7 @@ mod tests {
             name: "Coop Pack".to_string(),
             game_path: "D:/Steam/steamapps/common/DragonWilds".to_string(),
             game_id: None,
+            steam_app_id: None,
             engine: "unreal".to_string(),
             loader: "ue4ss".to_string(),
             created_at: now_string(),
@@ -8334,6 +12487,7 @@ mod tests {
             name: "Valheim".to_string(),
             game_path: "C:/Games/Valheim".to_string(),
             game_id: Some("valheim".to_string()),
+            steam_app_id: None,
             engine: "unity-mono".to_string(),
             loader: "bepinex".to_string(),
             created_at: now_string(),
@@ -8363,6 +12517,7 @@ mod tests {
             name: "Windrose".to_string(),
             game_path: "C:/Games/Windrose".to_string(),
             game_id: None,
+            steam_app_id: None,
             engine: "unreal".to_string(),
             loader: "ue4ss".to_string(),
             created_at: now_string(),
@@ -8381,6 +12536,7 @@ mod tests {
             installed_at: now_string(),
             files_written: Vec::new(),
             backups_written: Vec::new(),
+            written_file_hashes: HashMap::new(),
             dependencies: Vec::new(),
             config_files: Vec::new(),
             enabled: true,
@@ -8442,6 +12598,7 @@ mod tests {
             name: "Test Game".to_string(),
             game_path: root.to_string_lossy().to_string(),
             game_id: None,
+            steam_app_id: None,
             engine: "unreal".to_string(),
             loader: "ue4ss".to_string(),
             created_at: now_string(),
@@ -8485,22 +12642,157 @@ mod tests {
     #[test]
     fn detection_prepares_unreal_pak_and_ue4ss_routes() {
         let root = temp_game_dir("unreal-routes");
-        touch(&root, "Game/Binaries/Win64/Game-Win64-Shipping.exe");
-        touch(&root, "Game/Content/Paks/Game.pak");
+        touch(&root, "windrose.exe");
+        touch(&root, "R5/Binaries/Win64/Windrose-Win64-Shipping.exe");
+        touch(&root, "R5/Content/Paks/Game.pak");
 
         let result = detect_game_setup_impl(&root).unwrap();
 
         assert_eq!(result.engine, "unreal");
+        assert_eq!(result.game_id.as_deref(), Some("windrose"));
         assert!(result
             .created_mod_folders
-            .contains(&"Game/Content/Paks/~mods".to_string()));
+            .contains(&"R5/Content/Paks/~mods".to_string()));
         assert!(result
             .created_mod_folders
-            .contains(&"Game/Binaries/Win64/Mods".to_string()));
-        assert!(root.join("Game/Content/Paks/~mods").is_dir());
-        assert!(root.join("Game/Binaries/Win64/Mods").is_dir());
+            .contains(&"R5/Binaries/Win64/Mods".to_string()));
+        assert!(root.join("R5/Content/Paks/~mods").is_dir());
+        assert!(root.join("R5/Binaries/Win64/Mods").is_dir());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unknown_games_detect_nested_unreal_layout_without_guessing_a_loader() {
+        let root = temp_game_dir("nested-unknown-unreal");
+        touch(
+            &root,
+            "GameWrapper/Project/Binaries/Win64/Project-Win64-Shipping.exe",
+        );
+        touch(&root, "GameWrapper/Project/Content/Paks/Game.pak");
+
+        let result = detect_game_setup_impl(&root).unwrap();
+
+        assert_eq!(result.game_id, None);
+        assert_eq!(result.engine, "unreal");
+        assert_eq!(result.loader, "none");
+        assert_eq!(result.recommended_loader, "none");
+        assert!(!result.loader_installed);
+        assert!(!result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Engine could not be identified")));
+        assert!(result
+            .created_mod_folders
+            .contains(&"GameWrapper/Project/Content/Paks/~mods".to_string()));
+        assert!(!root
+            .join("GameWrapper/Project/Binaries/Win64/Mods")
+            .exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nested_unity_mono_and_bepinex_layout_is_detected() {
+        let root = temp_game_dir("nested-unity-mono");
+        touch(&root, "GameWrapper/Project/UnityPlayer.dll");
+        touch(
+            &root,
+            "GameWrapper/Project/Project_Data/Managed/Assembly-CSharp.dll",
+        );
+        touch(&root, "GameWrapper/Project/BepInEx/core/BepInEx.dll");
+
+        let result = detect_game_setup_impl(&root).unwrap();
+
+        assert_eq!(result.engine, "unity-mono");
+        assert_eq!(result.loader, "bepinex");
+        assert!(result.loader_installed);
+        assert!(result
+            .expected_mod_folders
+            .contains(&"GameWrapper/Project/BepInEx/plugins".to_string()));
+        assert!(!root.join("BepInEx/plugins").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nested_unity_il2cpp_and_bepinex_layout_is_detected() {
+        let root = temp_game_dir("nested-unity-il2cpp");
+        touch(&root, "GameWrapper/Project/UnityPlayer.dll");
+        touch(&root, "GameWrapper/Project/GameAssembly.dll");
+        touch(
+            &root,
+            "GameWrapper/Project/Project_Data/il2cpp_data/Metadata/global-metadata.dat",
+        );
+        touch(&root, "GameWrapper/Project/BepInEx/core/BepInEx.dll");
+        touch(
+            &root,
+            "GameWrapper/Project/BepInEx/interop/Assembly-CSharp.dll",
+        );
+
+        let result = detect_game_setup_impl(&root).unwrap();
+
+        assert_eq!(result.engine, "unity-il2cpp");
+        assert_eq!(result.loader, "bepinex-il2cpp");
+        assert!(result.loader_installed);
+        assert!(result
+            .expected_mod_folders
+            .contains(&"GameWrapper/Project/BepInEx/plugins".to_string()));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nested_re_engine_and_reframework_layout_is_detected() {
+        let root = temp_game_dir("nested-re-engine");
+        touch(&root, "GameWrapper/Project/re_chunk_000.pak");
+        touch(&root, "GameWrapper/Project/dinput8.dll");
+        touch(&root, "GameWrapper/Project/reframework/config.ini");
+
+        let result = detect_game_setup_impl(&root).unwrap();
+
+        assert_eq!(result.engine, "re-engine");
+        assert_eq!(result.loader, "reframework");
+        assert!(result.loader_installed);
+        assert!(result
+            .expected_mod_folders
+            .contains(&"GameWrapper/Project/reframework/plugins".to_string()));
+        assert!(!root.join("reframework/plugins").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nested_unreal_ue4ss_and_native_script_layouts_are_detected() {
+        let ue4ss_root = temp_game_dir("nested-unreal-ue4ss");
+        touch(&ue4ss_root, "GameWrapper/Project/Binaries/Win64/UE4SS.dll");
+        touch(&ue4ss_root, "GameWrapper/Project/Content/Paks/Game.pak");
+
+        let ue4ss = detect_game_setup_impl(&ue4ss_root).unwrap();
+        assert_eq!(ue4ss.engine, "unreal");
+        assert_eq!(ue4ss.loader, "ue4ss");
+        assert!(ue4ss.loader_installed);
+        assert!(ue4ss
+            .expected_mod_folders
+            .contains(&"GameWrapper/Project/Binaries/Win64/Mods".to_string()));
+
+        let script_root = temp_game_dir("nested-unreal-native-scripts");
+        touch(&script_root, "GameWrapper/Project/Content/Paks/Game.pak");
+        touch(
+            &script_root,
+            "GameWrapper/Project/Hercules/Script/Mods/InventorySort.as",
+        );
+
+        let scripts = detect_game_setup_impl(&script_root).unwrap();
+        assert_eq!(scripts.engine, "unreal");
+        assert_eq!(scripts.loader, "loose-files");
+        assert!(scripts.loader_installed);
+        assert!(scripts
+            .expected_mod_folders
+            .contains(&"GameWrapper/Project/Hercules/Script/Mods".to_string()));
+
+        let _ = fs::remove_dir_all(ue4ss_root);
+        let _ = fs::remove_dir_all(script_root);
     }
 
     #[test]
@@ -8517,6 +12809,7 @@ mod tests {
             name: "Resident Evil 4".to_string(),
             game_path: root.to_string_lossy().to_string(),
             game_id: result.game_id,
+            steam_app_id: None,
             engine: result.engine,
             loader: result.loader,
             created_at: now_string(),
@@ -8543,9 +12836,10 @@ mod tests {
 
         let profile = GameProfile {
             id: "profile-1".to_string(),
-            name: "Managed Game".to_string(),
+            name: "Valheim".to_string(),
             game_path: game_root.to_string_lossy().to_string(),
-            game_id: None,
+            game_id: Some("valheim".to_string()),
+            steam_app_id: None,
             engine: "unity-mono".to_string(),
             loader: "bepinex".to_string(),
             created_at: now_string(),
@@ -8572,6 +12866,7 @@ mod tests {
             &profile,
             &import_root.to_string_lossy(),
             Some("CoolModFolder"),
+            None,
             &plan,
         )
         .unwrap();
@@ -8672,6 +12967,7 @@ mod tests {
             name: "Valheim".to_string(),
             game_path: root.to_string_lossy().to_string(),
             game_id: Some("valheim".to_string()),
+            steam_app_id: None,
             engine: "unity-mono".to_string(),
             loader: "bepinex".to_string(),
             created_at: now_string(),
@@ -8693,6 +12989,7 @@ mod tests {
                 .to_string_lossy()
                 .to_string()],
             backups_written: Vec::new(),
+            written_file_hashes: HashMap::new(),
             dependencies: Vec::new(),
             config_files: Vec::new(),
             enabled: true,
@@ -8751,6 +13048,47 @@ mod tests {
     }
 
     #[test]
+    fn toml_config_editor_preserves_comments_and_value_types() {
+        let content = "# Keep this note\n[graphics]\nenabled = true\nquality = 3\n";
+        let entries = parse_toml_config_entries(content);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].section.as_deref(), Some("graphics"));
+
+        let updated =
+            update_toml_config_content(content, Some("graphics"), "enabled", "false").unwrap();
+        assert!(updated.contains("# Keep this note"));
+        assert!(updated.contains("enabled = false"));
+        assert!(update_toml_config_content(content, Some("graphics"), "quality", "high").is_err());
+    }
+
+    #[test]
+    fn yaml_config_editor_updates_only_the_selected_nested_value() {
+        let content = "gameplay:\n  stamina: 100\n  enabled: true\nserver:\n  enabled: false\n";
+        let entries = parse_yaml_config_entries(content);
+        assert_eq!(entries.len(), 3);
+
+        let updated =
+            update_yaml_config_content(content, Some("gameplay"), "enabled", "false").unwrap();
+        let parsed = serde_yaml::from_str::<serde_yaml::Value>(&updated).unwrap();
+        let gameplay = parsed
+            .get("gameplay")
+            .and_then(serde_yaml::Value::as_mapping)
+            .unwrap();
+        let server = parsed
+            .get("server")
+            .and_then(serde_yaml::Value::as_mapping)
+            .unwrap();
+        assert_eq!(
+            gameplay.get("enabled").and_then(serde_yaml::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            server.get("enabled").and_then(serde_yaml::Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
     fn detection_prepares_native_script_routes_without_ue4ss_warning() {
         let root = temp_game_dir("witchspire-native-scripts");
         touch(&root, "Witchspire.exe");
@@ -8782,9 +13120,10 @@ mod tests {
         touch(&import_root, "Mods/ItemEditor.as");
         let profile = GameProfile {
             id: "profile-1".to_string(),
-            name: "Script Game".to_string(),
+            name: "Witchspire".to_string(),
             game_path: game_root.to_string_lossy().to_string(),
-            game_id: None,
+            game_id: Some("witchspire".to_string()),
+            steam_app_id: None,
             engine: "unreal".to_string(),
             loader: "none".to_string(),
             created_at: now_string(),
@@ -8816,6 +13155,7 @@ mod tests {
             name: "Witchspire".to_string(),
             game_path: game_root.to_string_lossy().to_string(),
             game_id: Some("witchspire".to_string()),
+            steam_app_id: None,
             engine: "unreal".to_string(),
             loader: "none".to_string(),
             created_at: now_string(),
@@ -8844,6 +13184,248 @@ mod tests {
 
         let _ = fs::remove_dir_all(store_root);
         let _ = fs::remove_dir_all(game_root);
+    }
+
+    #[test]
+    fn witchspire_blocks_windrose_pak_packages_even_though_both_are_unreal() {
+        let profile = test_profile("witchspire", "Witchspire", "unreal", "none");
+        let analysis = analyze_scanned_archive(scanned_package("WindroseMod.pak", None), &profile);
+
+        assert!(analysis.recommended_plan.is_none());
+        assert_eq!(analysis.compatibility.status, "blocked");
+        assert!(analysis.compatibility.reason.contains("Witchspire"));
+        assert!(analysis.compatibility.reason.contains("native script mods"));
+        assert_eq!(analysis.package_identity.mod_types, vec!["unreal-pak"]);
+    }
+
+    #[test]
+    fn witchspire_accepts_native_script_packages() {
+        let profile = test_profile("witchspire", "Witchspire", "unreal", "none");
+        let analysis = analyze_scanned_archive(scanned_package("InventorySort.as", None), &profile);
+
+        assert_eq!(analysis.compatibility.status, "compatible");
+        assert_eq!(
+            analysis
+                .recommended_plan
+                .as_ref()
+                .map(|plan| plan.adapter_id.as_str()),
+            Some("script-files")
+        );
+    }
+
+    #[test]
+    fn windrose_accepts_unreal_pak_packages() {
+        let profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
+        let analysis = analyze_scanned_archive(scanned_package("FastTravel.pak", None), &profile);
+
+        assert_eq!(analysis.compatibility.status, "compatible");
+        assert_eq!(
+            analysis
+                .recommended_plan
+                .as_ref()
+                .map(|plan| plan.adapter_id.as_str()),
+            Some("unreal-pak")
+        );
+    }
+
+    #[test]
+    fn provider_game_mismatch_blocks_otherwise_compatible_packages() {
+        let profile = test_profile("valheim", "Valheim", "unity-mono", "bepinex");
+        let identity = provider_source_identity(
+            "nexus",
+            "nexus:witchspire/44".to_string(),
+            Some("1.0".to_string()),
+            Some("witchspire".to_string()),
+            "Nexus test fixture",
+        );
+        let analysis = analyze_scanned_archive_with_identity(
+            scanned_package("BepInEx/plugins/Test.dll", None),
+            &profile,
+            Some(identity),
+        );
+
+        assert!(analysis.recommended_plan.is_none());
+        assert!(analysis
+            .compatibility
+            .reason
+            .contains("provider game 'witchspire'"));
+        assert!(analysis.compatibility.reason.contains("Valheim"));
+    }
+
+    #[test]
+    fn curseforge_manifests_are_identified_without_being_parsed_as_thunderstore() {
+        let manifest = r#"{
+          "manifestType": "minecraftModpack",
+          "manifestVersion": 1,
+          "name": "Example Pack",
+          "version": "1.2.3",
+          "minecraft": { "version": "1.20.1" },
+          "files": [{ "projectID": 123, "fileID": 456 }]
+        }"#;
+        let (thunderstore, identity) = parse_embedded_package_manifest(manifest).unwrap();
+        let identity = identity.unwrap();
+
+        assert!(thunderstore.is_none());
+        assert_eq!(identity.provider, "curseforge");
+        assert_eq!(identity.provider_game_id.as_deref(), Some("minecraft"));
+        assert_eq!(identity.dependencies, vec!["curseforge:123#456"]);
+    }
+
+    #[test]
+    fn unknown_games_require_folder_proof_before_accepting_an_install_route() {
+        let root = temp_game_dir("unknown-route-proof");
+        let mut profile = test_profile("windrose", "Unknown Game", "unreal", "none");
+        profile.game_id = None;
+        profile.game_path = root.to_string_lossy().to_string();
+        let analysis = analyze_scanned_archive(scanned_package("UnknownMod.pak", None), &profile);
+
+        assert!(analysis.recommended_plan.is_none());
+        assert!(analysis
+            .compatibility
+            .reason
+            .contains("safe mod installation route"));
+
+        fs::create_dir_all(root.join("Project/Content/Paks")).unwrap();
+        let verified = analyze_scanned_archive(scanned_package("UnknownMod.pak", None), &profile);
+        assert_eq!(verified.compatibility.status, "compatible");
+        assert_eq!(
+            verified
+                .recommended_plan
+                .as_ref()
+                .map(|plan| plan.adapter_id.as_str()),
+            Some("unreal-pak")
+        );
+
+        let script_package =
+            analyze_scanned_archive(scanned_package("InventorySort.as", None), &profile);
+        assert!(script_package.recommended_plan.is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn all_registered_loader_runtimes_satisfy_equivalent_thunderstore_dependencies() {
+        let bepinex_root = temp_game_dir("bepinex-runtime-equivalence");
+        touch(&bepinex_root, "BepInEx/core/BepInEx.dll");
+        let mut bepinex_profile = test_profile("repo", "R.E.P.O.", "unity-mono", "bepinex");
+        bepinex_profile.game_path = bepinex_root.to_string_lossy().to_string();
+
+        for name in ["BepInExPack", "BepInExPack_REPO", "BepInEx"] {
+            let dependency = ThunderstorePackageRef {
+                namespace: "BepInEx".to_string(),
+                name: name.to_string(),
+                version: Some("5.4.2304".to_string()),
+            };
+            assert!(thunderstore_runtime_available(
+                &bepinex_profile,
+                &dependency
+            ));
+        }
+
+        let ordinary_plugin = ThunderstorePackageRef {
+            namespace: "Azumatt".to_string(),
+            name: "BepInExConfigurationManager".to_string(),
+            version: Some("1.0.0".to_string()),
+        };
+        assert!(!thunderstore_runtime_available(
+            &bepinex_profile,
+            &ordinary_plugin
+        ));
+
+        let il2cpp_root = temp_game_dir("bepinex-il2cpp-runtime-equivalence");
+        touch(&il2cpp_root, "BepInEx/core/BepInEx.dll");
+        let mut il2cpp_profile = test_profile(
+            "future-il2cpp-game",
+            "Future IL2CPP Game",
+            "unity-il2cpp",
+            "bepinex-il2cpp",
+        );
+        il2cpp_profile.game_path = il2cpp_root.to_string_lossy().to_string();
+        assert!(thunderstore_runtime_available(
+            &il2cpp_profile,
+            &ThunderstorePackageRef {
+                namespace: "BepInEx".to_string(),
+                name: "BepInExPack".to_string(),
+                version: None,
+            }
+        ));
+
+        let ue4ss_root = temp_game_dir("ue4ss-runtime-equivalence");
+        touch(&ue4ss_root, "Game/Binaries/Win64/UE4SS.dll");
+        let mut ue4ss_profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
+        ue4ss_profile.game_path = ue4ss_root.to_string_lossy().to_string();
+        assert!(thunderstore_runtime_available(
+            &ue4ss_profile,
+            &ThunderstorePackageRef {
+                namespace: "UE4SS".to_string(),
+                name: "RE-UE4SS".to_string(),
+                version: None,
+            }
+        ));
+
+        let reframework_root = temp_game_dir("reframework-runtime-equivalence");
+        touch(&reframework_root, "dinput8.dll");
+        touch(&reframework_root, "reframework/autorun/init.lua");
+        let mut reframework_profile =
+            test_profile("re4", "Resident Evil 4", "re-engine", "reframework");
+        reframework_profile.game_path = reframework_root.to_string_lossy().to_string();
+        assert!(thunderstore_runtime_available(
+            &reframework_profile,
+            &ThunderstorePackageRef {
+                namespace: "praydog".to_string(),
+                name: "REFramework".to_string(),
+                version: None,
+            }
+        ));
+
+        let future_runtime = DependencySpec {
+            id: "runtime:future-loader".to_string(),
+            name: "Future Loader".to_string(),
+            version: None,
+            provider: "manual".to_string(),
+            required: true,
+            status: "missing".to_string(),
+            source: None,
+            notes: None,
+        };
+        assert_eq!(
+            runtime_from_dependency(&future_runtime),
+            Some("future-loader")
+        );
+
+        let _ = fs::remove_dir_all(bepinex_root);
+        let _ = fs::remove_dir_all(il2cpp_root);
+        let _ = fs::remove_dir_all(ue4ss_root);
+        let _ = fs::remove_dir_all(reframework_root);
+    }
+
+    fn test_profile(game_id: &str, name: &str, engine: &str, loader: &str) -> GameProfile {
+        GameProfile {
+            id: format!("profile-{game_id}"),
+            name: name.to_string(),
+            game_path: format!("C:/Games/{name}"),
+            game_id: Some(game_id.to_string()),
+            steam_app_id: None,
+            engine: engine.to_string(),
+            loader: loader.to_string(),
+            created_at: now_string(),
+            updated_at: now_string(),
+        }
+    }
+
+    fn scanned_package(relative_path: &str, identity: Option<PackageIdentity>) -> ScannedArchive {
+        ScannedArchive {
+            archive_path: format!("C:/Downloads/{}", basename(relative_path)),
+            archive_name: basename(relative_path),
+            entries: vec![ArchiveEntry {
+                path: relative_path.to_string(),
+                logical_path: relative_path.to_string(),
+                size: 1,
+                is_directory: false,
+            }],
+            manifest: None,
+            package_identity: identity,
+        }
     }
 
     fn temp_game_dir(name: &str) -> PathBuf {

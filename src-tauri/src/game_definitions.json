@@ -5,6 +5,7 @@
     "engine": "unity-mono",
     "executableNames": ["valheim.exe"],
     "pathMarkers": ["valheim_data"],
+    "supportedAdapters": ["bepinex"],
     "bootstrapRuntimes": ["bepinex"],
     "configRoots": ["BepInEx/config"],
     "thunderstoreCommunity": "valheim",
@@ -25,6 +26,8 @@
     "engine": "unreal",
     "executableNames": ["windrose.exe"],
     "pathMarkers": ["r5/content/paks"],
+    "supportedAdapters": ["unreal-pak", "ue4ss"],
+    "bootstrapRuntimes": ["ue4ss"],
     "configRoots": ["Binaries/Win64/Mods", "R5/Binaries/Win64/Mods"]
   },
   {
@@ -33,6 +36,7 @@
     "engine": "unreal",
     "executableNames": ["witchspire.exe"],
     "pathMarkers": ["hercules/script", "hercules/content/paks"],
+    "supportedAdapters": ["script-files"],
     "configRoots": ["Hercules/Script/Mods"],
     "nativeScriptRoots": ["Hercules/Script/Mods"],
     "nexusGameDomain": "witchspire"
@@ -42,6 +46,7 @@
     "displayName": "Resident Evil 2",
     "engine": "re-engine",
     "executableNames": ["re2.exe"],
+    "supportedAdapters": ["reframework"],
     "bootstrapRuntimes": ["reframework"],
     "configRoots": ["reframework", "REFramework.ini", "dinput8.ini"],
     "runtimeDependencies": {
@@ -59,6 +64,7 @@
     "displayName": "Resident Evil 3",
     "engine": "re-engine",
     "executableNames": ["re3.exe"],
+    "supportedAdapters": ["reframework"],
     "bootstrapRuntimes": ["reframework"],
     "configRoots": ["reframework", "REFramework.ini", "dinput8.ini"],
     "runtimeDependencies": {
@@ -76,6 +82,7 @@
     "displayName": "Resident Evil 4",
     "engine": "re-engine",
     "executableNames": ["re4.exe"],
+    "supportedAdapters": ["reframework"],
     "bootstrapRuntimes": ["reframework"],
     "configRoots": ["reframework", "REFramework.ini", "dinput8.ini"],
     "runtimeDependencies": {
@@ -93,6 +100,7 @@
     "displayName": "Resident Evil 7",
     "engine": "re-engine",
     "executableNames": ["re7.exe"],
+    "supportedAdapters": ["reframework"],
     "bootstrapRuntimes": ["reframework"],
     "configRoots": ["reframework", "REFramework.ini", "dinput8.ini"],
     "runtimeDependencies": {
@@ -110,6 +118,7 @@
     "displayName": "Resident Evil Village",
     "engine": "re-engine",
     "executableNames": ["re8.exe"],
+    "supportedAdapters": ["reframework"],
     "bootstrapRuntimes": ["reframework"],
     "configRoots": ["reframework", "REFramework.ini", "dinput8.ini"],
     "runtimeDependencies": {
@@ -127,6 +136,7 @@
     "displayName": "Dragon's Dogma 2",
     "engine": "re-engine",
     "executableNames": ["dd2.exe"],
+    "supportedAdapters": ["reframework"],
     "bootstrapRuntimes": ["reframework"],
     "configRoots": ["reframework", "REFramework.ini", "dinput8.ini"],
     "runtimeDependencies": {
@@ -144,6 +154,7 @@
     "displayName": "Devil May Cry 5",
     "engine": "re-engine",
     "executableNames": ["dmc5.exe", "devilmaycry5.exe"],
+    "supportedAdapters": ["reframework"],
     "bootstrapRuntimes": ["reframework"],
     "configRoots": ["reframework", "REFramework.ini", "dinput8.ini"],
     "runtimeDependencies": {
@@ -161,6 +172,7 @@
     "displayName": "Monster Hunter Rise",
     "engine": "re-engine",
     "executableNames": ["mhrise.exe", "monsterhunterrise.exe"],
+    "supportedAdapters": ["reframework"],
     "bootstrapRuntimes": ["reframework"],
     "configRoots": ["reframework", "REFramework.ini", "dinput8.ini"],
     "runtimeDependencies": {
@@ -178,6 +190,7 @@
     "displayName": "Monster Hunter Wilds",
     "engine": "re-engine",
     "executableNames": ["mhwilds.exe", "monsterhunterwilds.exe"],
+    "supportedAdapters": ["reframework"],
     "bootstrapRuntimes": ["reframework"],
     "configRoots": ["reframework", "REFramework.ini", "dinput8.ini"],
     "runtimeDependencies": {
@@ -195,6 +208,7 @@
     "displayName": "Street Fighter 6",
     "engine": "re-engine",
     "executableNames": ["sf6.exe", "streetfighter6.exe"],
+    "supportedAdapters": ["reframework"],
     "bootstrapRuntimes": ["reframework"],
     "configRoots": ["reframework", "REFramework.ini", "dinput8.ini"],
     "runtimeDependencies": {

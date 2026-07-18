@@ -49,6 +49,7 @@ export interface GameProfile {
   name: string;
   gamePath: string;
   gameId?: string;
+  steamAppId?: string;
   engine: GameEngine;
   loader: LoaderKind;
   createdAt: string;
@@ -59,8 +60,16 @@ export interface CreateProfileInput {
   name: string;
   gamePath: string;
   gameId?: string;
+  steamAppId?: string;
   engine: GameEngine;
   loader: LoaderKind;
+}
+
+export interface SteamGameRecord {
+  appId: string;
+  name: string;
+  installDir: string;
+  libraryPath: string;
 }
 
 export interface DetectionSignal {
@@ -128,11 +137,36 @@ export interface InstallPlan {
   requiresConfirmation: boolean;
 }
 
+export type PackageProvider = "thunderstore" | "nexus" | "curseforge" | "unknown";
+
+export interface PackageIdentity {
+  provider: PackageProvider;
+  packageId?: string;
+  version?: string;
+  providerGameId?: string;
+  modTypes: AdapterId[];
+  dependencies: string[];
+  evidence: string[];
+  confidence: number;
+}
+
+export interface CompatibilityResult {
+  status: "compatible" | "blocked";
+  reason: string;
+  confidence: number;
+  gameId?: string;
+  providerGameId?: string;
+  detectedModTypes: AdapterId[];
+  supportedModTypes: AdapterId[];
+}
+
 export interface ArchiveAnalysis {
   archivePath: string;
   archiveName: string;
   entries: ArchiveEntry[];
   manifest?: ThunderstoreManifest;
+  packageIdentity: PackageIdentity;
+  compatibility: CompatibilityResult;
   plans: InstallPlan[];
   recommendedPlan?: InstallPlan;
 }
@@ -141,6 +175,7 @@ export interface InstallRequest {
   profileId: string;
   archivePath: string;
   archiveName?: string;
+  packageIdentity?: PackageIdentity;
   plan: InstallPlan;
 }
 
@@ -152,6 +187,11 @@ export interface InstallResult {
   filesWritten: string[];
   backupsWritten: string[];
   warnings: string[];
+}
+
+export interface NexusNxmInstallResult {
+  modId: string;
+  installResult: InstallResult;
 }
 
 export interface InstalledModRecord {
@@ -201,7 +241,8 @@ export interface UpdateModConfigValueInput {
 
 export interface AppSettings {
   minimizeToTrayOnClose: boolean;
-  nexusApiKey: string;
+  nexusApiKey?: string;
+  nexusApiKeyConfigured: boolean;
 }
 
 export type AppUpdateStatus = "up-to-date" | "available" | "unavailable" | "error";
@@ -219,11 +260,28 @@ export interface AppUpdateInfo {
 
 export type OnlineModProvider = "thunderstore" | "nexus";
 
+export type OnlineModFileAction = "direct" | "browser" | "auth" | "unsupported";
+
+export interface OnlineModFileOption {
+  id: string;
+  name: string;
+  version?: string;
+  category?: string;
+  description?: string;
+  fileName?: string;
+  fileSize?: number;
+  uploadedAt?: string;
+  primary: boolean;
+  action: OnlineModFileAction;
+  downloadPageUrl?: string;
+}
+
 export interface OnlineModRecord {
   id: string;
   provider: OnlineModProvider;
   providerLabel: string;
   gameId?: string;
+  providerGameId?: string;
   name: string;
   owner: string;
   version: string;
@@ -243,12 +301,29 @@ export interface OnlineModRecord {
   installNote?: string;
 }
 
+export interface DiscoveryPage {
+  items: OnlineModRecord[];
+  total: number;
+  page: number;
+  pageSize: number;
+  hasMore: boolean;
+}
+
 export interface ModActionResult {
   profileId: string;
   installedModId: string;
   status: InstalledModRecord["lastStatus"];
   filesChanged: string[];
   warnings: string[];
+}
+
+export interface ProfileModToggleResult {
+  profileId: string;
+  enabled: boolean;
+  changedMods: number;
+  filesChanged: string[];
+  warnings: string[];
+  installedMods: InstalledModRecord[];
 }
 
 export interface ProfileActionResult {
@@ -314,13 +389,18 @@ export interface AppState {
 export interface DesktopApi {
   getAppSettings(): Promise<AppSettings>;
   updateAppSettings(input: AppSettings): Promise<AppSettings>;
+  saveNexusApiKey(apiKey: string): Promise<AppSettings>;
   checkAppUpdate(): Promise<AppUpdateInfo>;
   minimizeWindow(): Promise<void>;
   toggleMaximizeWindow(): Promise<void>;
   closeWindow(): Promise<void>;
-  startWindowDrag(): Promise<void>;
   downloadUpdateInstaller(url: string, fileName?: string): Promise<string>;
+  scanSteamGames(): Promise<SteamGameRecord[]>;
+  createSteamProfile(game: SteamGameRecord): Promise<GameProfile>;
+  launchProfileGame(profileId: string): Promise<void>;
+  setAllProfileModsEnabled(profileId: string, enabled: boolean): Promise<ProfileModToggleResult>;
   listProfiles(): Promise<GameProfile[]>;
+  profileFolderExists(profileId: string): Promise<boolean>;
   createProfile(input: CreateProfileInput): Promise<GameProfile>;
   renameProfile(profileId: string, name: string): Promise<GameProfile>;
   removeProfile(profileId: string): Promise<ProfileActionResult>;
@@ -335,8 +415,28 @@ export interface DesktopApi {
   selectAndAnalyzeModFolder(profileId: string): Promise<ArchiveAnalysis | null>;
   analyzeArchivePath(profileId: string, archivePath: string): Promise<ArchiveAnalysis>;
   installArchive(request: InstallRequest): Promise<InstallResult>;
-  discoverOnlineMods(profileId: string): Promise<OnlineModRecord[]>;
-  installDiscoveredMod(profileId: string, mod: OnlineModRecord): Promise<InstallResult>;
+  discoverOnlineMods(
+    profileId: string,
+    page: number,
+    pageSize: number,
+    sort: "downloads" | "newest" | "oldest",
+    query: string
+  ): Promise<DiscoveryPage>;
+  listDiscoveredModFiles(
+    profileId: string,
+    mod: OnlineModRecord
+  ): Promise<OnlineModFileOption[]>;
+  installDiscoveredMod(
+    profileId: string,
+    mod: OnlineModRecord,
+    file?: OnlineModFileOption
+  ): Promise<InstallResult>;
+  beginNexusBrowserDownload(
+    profileId: string,
+    mod: OnlineModRecord,
+    file: OnlineModFileOption
+  ): Promise<string>;
+  installNexusNxmLink(nxmUrl: string): Promise<NexusNxmInstallResult>;
   listInstalledMods(profileId: string): Promise<InstalledModRecord[]>;
   getModConfigDetails(profileId: string, installedModId: string): Promise<ModConfigFile[]>;
   updateModConfigValue(input: UpdateModConfigValueInput): Promise<ModConfigFile>;

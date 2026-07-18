@@ -1,0 +1,113 @@
+[
+  {
+    "id": "bepinex",
+    "dependency": {
+      "id": "runtime:bepinex",
+      "name": "BepInEx Mono x64",
+      "provider": "github-release",
+      "source": "github-release:BepInEx/BepInEx#BepInEx_win_x64_*.zip",
+      "notes": "Official stable BepInEx 5 Windows x64 build for Mono Unity games."
+    },
+    "profileEngines": ["unity-mono"],
+    "profileLoaders": ["bepinex"],
+    "providerPackages": [
+      {
+        "provider": "thunderstore",
+        "namespacePatterns": ["*"],
+        "packagePatterns": ["BepInEx", "BepInExPack", "BepInExPack_*", "*_BepInExPack"]
+      }
+    ],
+    "detectionRules": [
+      {
+        "all": ["file:BepInEx/core/BepInEx.dll"]
+      },
+      {
+        "all": ["dir:BepInEx", "file-name:doorstop_config.ini", "file-name:winhttp.dll"]
+      }
+    ]
+  },
+  {
+    "id": "bepinex-il2cpp",
+    "dependency": {
+      "id": "runtime:bepinex-il2cpp",
+      "name": "BepInEx Unity IL2CPP x64",
+      "provider": "bepinbuilds",
+      "source": "bepinbuilds:bepinex_be#BepInEx-Unity.IL2CPP-win-x64-*.zip",
+      "notes": "Official BepInEx bleeding-edge IL2CPP build for Windows x64 Unity games."
+    },
+    "profileEngines": ["unity-il2cpp"],
+    "profileLoaders": ["bepinex-il2cpp"],
+    "providerPackages": [
+      {
+        "provider": "thunderstore",
+        "namespacePatterns": ["*"],
+        "packagePatterns": ["BepInEx", "BepInExPack", "BepInExPack_*", "*_BepInExPack"]
+      }
+    ],
+    "detectionRules": [
+      {
+        "all": ["file:BepInEx/core/BepInEx.dll", "dir-prefix:BepInEx/interop"]
+      },
+      {
+        "all": ["file:BepInEx/core/BepInEx.dll", "dir:dotnet"]
+      },
+      {
+        "all": ["file:BepInEx/core/BepInEx.dll", "profile-engine:unity-il2cpp"]
+      },
+      {
+        "all": ["file:BepInEx/core/BepInEx.dll", "profile-loader:bepinex-il2cpp"]
+      }
+    ]
+  },
+  {
+    "id": "ue4ss",
+    "dependency": {
+      "id": "runtime:ue4ss",
+      "name": "UE4SS",
+      "provider": "github-release",
+      "source": "github-release:UE4SS-RE/RE-UE4SS#UE4SS_v*.zip",
+      "notes": "Official latest UE4SS release for Unreal Engine script and hook mods."
+    },
+    "profileEngines": ["unreal"],
+    "profileLoaders": ["ue4ss"],
+    "providerPackages": [
+      {
+        "provider": "thunderstore",
+        "namespacePatterns": ["*"],
+        "packagePatterns": ["UE4SS", "RE-UE4SS", "RE_UE4SS", "UE4SSLoader", "UE4SSRuntime"]
+      }
+    ],
+    "detectionRules": [
+      {
+        "any": ["file-name:UE4SS.dll", "file-name:UE4SS-settings.ini"]
+      }
+    ]
+  },
+  {
+    "id": "reframework",
+    "dependency": {
+      "id": "runtime:reframework",
+      "name": "REFramework",
+      "provider": "github-release",
+      "source": "github-release:praydog/REFramework-nightly#REFramework.zip",
+      "notes": "Official REFramework release. Game-specific assets can be supplied by game definitions."
+    },
+    "profileEngines": ["re-engine"],
+    "profileLoaders": ["reframework"],
+    "providerPackages": [
+      {
+        "provider": "thunderstore",
+        "namespacePatterns": ["*"],
+        "packagePatterns": ["REFramework", "REFrameworkRuntime"]
+      }
+    ],
+    "detectionRules": [
+      {
+        "all": ["file-name:dinput8.dll", "dir-prefix:reframework"]
+      },
+      {
+        "all": ["file-name:dinput8.dll", "file-name:reframework_revision.txt"]
+      }
+    ]
+  }
+]

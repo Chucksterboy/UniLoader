@@ -1,6 +1,6 @@
 {
   "name": "uniloader",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
   "description": "UniLoader cross-game mod manager prototype with per-game adapters and dependency planning.",
   "scripts": {
@@ -8,26 +8,24 @@
     "build": "tauri build",
     "build:web": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "test": "vitest run && cargo test --manifest-path src-tauri/Cargo.toml",
+    "test": "pnpm run typecheck && cargo test --manifest-path src-tauri/Cargo.toml",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/plugin-deep-link": "^2.4.5",
     "@tauri-apps/plugin-dialog": "^2.7.1",
     "@vitejs/plugin-react": "^4.3.4",
-    "jszip": "^3.10.1",
     "lucide-react": "^0.468.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "vite": "^6.0.7",
-    "zod": "^3.24.1"
+    "vite": "^6.0.7"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.4",
     "@types/node": "^22.10.5",
     "@types/react": "^18.3.18",
     "@types/react-dom": "^18.3.5",
-    "typescript": "^5.7.2",
-    "vitest": "^2.1.8"
+    "typescript": "^5.7.2"
   }
 }

@@ -2,13 +2,21 @@ import {
   Activity,
   AlertTriangle,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   Compass,
   Database,
   Download,
+  ExternalLink,
+  FolderCog,
   FolderOpen,
+  Gamepad2,
+  Heart,
   Home,
   Minus,
   PackagePlus,
+  Pencil,
+  Play,
   Power,
   PowerOff,
   RefreshCw,
@@ -22,10 +30,10 @@ import {
   X
 } from "lucide-react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getVersion } from "@tauri-apps/api/app";
+import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import {
   FormEvent,
-  memo,
-  MouseEvent as ReactMouseEvent,
   useEffect,
   useMemo,
   useRef,
@@ -35,6 +43,7 @@ import {
   AppSettings,
   AppUpdateInfo,
   ArchiveAnalysis,
+  DiscoveryPage,
   CreateProfileInput,
   GameDetectionResult,
   GameProfile,
@@ -42,9 +51,11 @@ import {
   InstallPlan,
   ModConfigEntry,
   ModConfigFile,
+  OnlineModFileOption,
   OnlineModRecord,
   ProfileDependencyBootstrapResult,
-  ProfileRefreshResult
+  ProfileRefreshResult,
+  SteamGameRecord
 } from "../shared/contracts";
 import { desktopApi } from "./tauriApi";
 
@@ -52,21 +63,24 @@ const emptyProfileInput: CreateProfileInput = {
   name: "",
   gamePath: "",
   gameId: undefined,
+  steamAppId: undefined,
   engine: "unknown",
   loader: "none"
 };
 
 const defaultAppSettings: AppSettings = {
   minimizeToTrayOnClose: false,
-  nexusApiKey: ""
+  nexusApiKeyConfigured: false
 };
 
-const appDisplayVersion = "v0.5";
+const defaultThemeId = "neon-circuit";
+const supportPageUrl = "https://www.patreon.com/Chucksterboy";
 
 type ViewMode = "manager" | "discover" | "transfer" | "settings";
 type ModSortMode = "newest" | "oldest";
 type OnlineSortMode = "downloads" | "newest" | "oldest";
 type TransferMode = "import" | "export" | null;
+type ProfileCreationMode = "steam" | "manual";
 type NoticeKind = "success" | "warning" | "error";
 type StartupSplashPhase = "intro" | "exiting" | "hidden";
 
@@ -105,20 +119,29 @@ const discoverPageSize = 20;
 const nexusApiKeysUrl = "https://www.nexusmods.com/settings/api-keys";
 const startupSplashPulseMs = 2700;
 const startupSplashFadeMs = 420;
+const startupSplashMaximumMs = 8000;
 
 export function App() {
   const [activeView, setActiveView] = useState<ViewMode>("manager");
   const [startupSplashPhase, setStartupSplashPhase] = useState<StartupSplashPhase>("intro");
+  const [startupMinimumElapsed, setStartupMinimumElapsed] = useState(false);
+  const [bootstrapReady, setBootstrapReady] = useState(false);
+  const [appVersion, setAppVersion] = useState("");
   const [appSettings, setAppSettings] = useState<AppSettings>(defaultAppSettings);
   const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo | null>(null);
   const [profiles, setProfiles] = useState<GameProfile[]>([]);
   const [selectedProfileId, setSelectedProfileId] = useState<string>("");
+  const [expandedProfileId, setExpandedProfileId] = useState<string>("");
+  const [selectedProfileFolderConnected, setSelectedProfileFolderConnected] = useState<
+    boolean | null
+  >(null);
   const [profileInput, setProfileInput] = useState<CreateProfileInput>(emptyProfileInput);
   const [analysis, setAnalysis] = useState<ArchiveAnalysis | null>(null);
   const [installedMods, setInstalledMods] = useState<InstalledModRecord[]>([]);
   const [discoverProfileId, setDiscoverProfileId] = useState<string>("");
   const [discoverLoadedProfileId, setDiscoverLoadedProfileId] = useState<string>("");
   const [onlineMods, setOnlineMods] = useState<OnlineModRecord[]>([]);
+  const [onlineModTotal, setOnlineModTotal] = useState(0);
   const [modSortMode, setModSortMode] = useState<ModSortMode>("newest");
   const [transferMode, setTransferMode] = useState<TransferMode>(null);
   const [detection, setDetection] = useState<GameDetectionResult | null>(null);
@@ -131,6 +154,16 @@ export function App() {
   const [isCheckingForUpdate, setIsCheckingForUpdate] = useState(false);
   const [isDownloadingUpdate, setIsDownloadingUpdate] = useState(false);
   const [isTransferringProfile, setIsTransferringProfile] = useState(false);
+  const [isScanningSteamGames, setIsScanningSteamGames] = useState(false);
+  const [isCreatingProfile, setIsCreatingProfile] = useState(false);
+  const [isCreatingSteamProfile, setIsCreatingSteamProfile] = useState(false);
+  const [isLaunchingGame, setIsLaunchingGame] = useState(false);
+  const [isTogglingAllMods, setIsTogglingAllMods] = useState(false);
+  const [steamGames, setSteamGames] = useState<SteamGameRecord[]>([]);
+  const [selectedSteamGameAppId, setSelectedSteamGameAppId] = useState("");
+  const [profileCreatorOpen, setProfileCreatorOpen] = useState(false);
+  const [profileCreationMode, setProfileCreationMode] = useState<ProfileCreationMode>("steam");
+  const [steamGameSearch, setSteamGameSearch] = useState("");
   const [status, setStatus] = useState<string>("Ready");
   const [notice, setNoticeState] = useState<Notice | null>(null);
   const [nexusSettingsAttentionId, setNexusSettingsAttentionId] = useState(0);
@@ -142,10 +175,19 @@ export function App() {
   const noticeSequence = useRef(0);
   const errorSequence = useRef(0);
   const updateAnnouncementShown = useRef(false);
+  const installedModsRequestSequence = useRef(0);
+  const discoveryRequestSequence = useRef(0);
+  const processedNxmLinks = useRef(new Set<string>());
 
   function setNotice(nextNotice: NoticeInput | null) {
     setNoticeState(nextNotice ? { ...nextNotice, motionId: ++noticeSequence.current } : null);
   }
+
+  useEffect(() => {
+    if (selectedProfileId) {
+      setExpandedProfileId(selectedProfileId);
+    }
+  }, [selectedProfileId]);
 
   function setError(nextError: string) {
     if (nextError) {
@@ -160,6 +202,8 @@ export function App() {
   const configModalPresence = useFadePresence(configModal);
   const profileRenamePresence = useFadePresence(profilePendingRename);
   const profileRemovalPresence = useFadePresence(profilePendingRemoval);
+  const profileCreatorPresence = useFadePresence(profileCreatorOpen ? true : null);
+  const profileCreationModeMotion = useFadeSwitch(profileCreationMode, 140);
   const noticePresence = useFadePresence(notice, 140);
   const errorPresence = useFadePresence(error ? error : null, 140);
   const selectedProfile = useMemo(
@@ -175,6 +219,23 @@ export function App() {
       }),
     [installedMods, modSortMode]
   );
+  const selectedSteamGame = useMemo(
+    () => steamGames.find((game) => game.appId === selectedSteamGameAppId),
+    [selectedSteamGameAppId, steamGames]
+  );
+  const filteredSteamGames = useMemo(() => {
+    const query = steamGameSearch.trim().toLowerCase();
+    if (!query) {
+      return steamGames;
+    }
+    return steamGames.filter((game) =>
+      `${game.name} ${game.installDir}`.toLowerCase().includes(query)
+    );
+  }, [steamGameSearch, steamGames]);
+  const enabledProfileModCount = installedMods.filter((mod) => mod.enabled).length;
+  const allProfileModsEnabled =
+    installedMods.length > 0 && enabledProfileModCount === installedMods.length;
+  const profileModToggleLabel = allProfileModsEnabled ? "ON" : "OFF";
   const displayedOnlineMods =
     discoverLoadedProfileId === discoverProfileId ? onlineMods : [];
   const selectedPlan = analysis?.recommendedPlan;
@@ -193,6 +254,48 @@ export function App() {
 
   useEffect(() => {
     void bootstrap();
+    void getVersion().then(setAppVersion).catch(() => setAppVersion("unknown"));
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    const receiveUrls = (urls: string[]) => {
+      if (!disposed) {
+        void handleNxmUrls(urls);
+      }
+    };
+
+    void onOpenUrl(receiveUrls)
+      .then((handler) => {
+        if (disposed) {
+          handler();
+        } else {
+          unlisten = handler;
+        }
+      })
+      .catch((caughtError) => {
+        if (!disposed) {
+          setNotice({
+            kind: "warning",
+            title: "Nexus handoff unavailable",
+            detail: String(caughtError)
+          });
+        }
+      });
+
+    void getCurrent()
+      .then((urls) => {
+        if (urls) {
+          receiveUrls(urls);
+        }
+      })
+      .catch(() => undefined);
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   }, []);
 
   useEffect(() => {
@@ -200,26 +303,58 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    const exitTimeoutId = window.setTimeout(
-      () => setStartupSplashPhase("exiting"),
-      startupSplashPulseMs
-    );
+    const timeoutId = window.setTimeout(() => setStartupMinimumElapsed(true), startupSplashPulseMs);
+    return () => window.clearTimeout(timeoutId);
+  }, []);
+
+  useEffect(() => {
+    const timeoutId = window.setTimeout(() => setBootstrapReady(true), startupSplashMaximumMs);
+    return () => window.clearTimeout(timeoutId);
+  }, []);
+
+  useEffect(() => {
+    if (!startupMinimumElapsed || !bootstrapReady) {
+      return;
+    }
+    setStartupSplashPhase("exiting");
     const hideTimeoutId = window.setTimeout(
       () => setStartupSplashPhase("hidden"),
-      startupSplashPulseMs + startupSplashFadeMs
+      startupSplashFadeMs
     );
-
-    return () => {
-      window.clearTimeout(exitTimeoutId);
-      window.clearTimeout(hideTimeoutId);
-    };
-  }, []);
+    return () => window.clearTimeout(hideTimeoutId);
+  }, [bootstrapReady, startupMinimumElapsed]);
 
   useEffect(() => {
     if (selectedProfileId) {
       void refreshInstalledMods(selectedProfileId);
     }
   }, [selectedProfileId]);
+
+  useEffect(() => {
+    if (!selectedProfile) {
+      setSelectedProfileFolderConnected(null);
+      return;
+    }
+
+    let cancelled = false;
+    setSelectedProfileFolderConnected(null);
+    void api
+      .profileFolderExists(selectedProfile.id)
+      .then((connected) => {
+        if (!cancelled) {
+          setSelectedProfileFolderConnected(connected);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setSelectedProfileFolderConnected(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedProfile?.gamePath, selectedProfile?.id]);
 
   useEffect(() => {
     if (activeView !== "discover") {
@@ -294,11 +429,71 @@ export function App() {
       setAppSettings(loadedSettings);
     } catch (caughtError) {
       setError(String(caughtError));
+    } finally {
+      setBootstrapReady(true);
     }
   }
 
   async function refreshInstalledMods(profileId: string) {
-    setInstalledMods(await api.listInstalledMods(profileId));
+    const requestId = ++installedModsRequestSequence.current;
+    const mods = await api.listInstalledMods(profileId);
+    if (requestId === installedModsRequestSequence.current) {
+      setInstalledMods(mods);
+    }
+  }
+
+  async function handleNxmUrls(urls: string[]) {
+    for (const nxmUrl of urls) {
+      if (!nxmUrl.toLowerCase().startsWith("nxm://")) {
+        continue;
+      }
+      const replayKey = nexusNxmReplayKey(nxmUrl);
+      if (!replayKey || processedNxmLinks.current.has(replayKey)) {
+        continue;
+      }
+      processedNxmLinks.current.add(replayKey);
+      setError("");
+      setInstallingOnlineModId("nexus-handoff");
+      setStatus("Installing Nexus download");
+      setNotice({
+        kind: "warning",
+        title: "Nexus download authorized",
+        detail: "UniLoader received the selected file and is checking it before installation."
+      });
+
+      try {
+        const result = await api.installNexusNxmLink(nxmUrl);
+        setSelectedProfileId(result.installResult.profileId);
+        setExpandedProfileId(result.installResult.profileId);
+        setOnlineMods((current) =>
+          current.map((item) =>
+            item.id === result.modId ? { ...item, installed: true } : item
+          )
+        );
+        await refreshInstalledMods(result.installResult.profileId);
+        setStatus("Mod installed");
+        setNotice({
+          kind: result.installResult.warnings.length > 0 ? "warning" : "success",
+          title: "Nexus mod installed",
+          detail: installSuccessDetail(
+            "Selected Nexus file",
+            result.installResult.filesWritten.length,
+            result.installResult.warnings
+          )
+        });
+      } catch (caughtError) {
+        processedNxmLinks.current.delete(replayKey);
+        setError(String(caughtError));
+        setStatus("Nexus install failed");
+        setNotice({
+          kind: "error",
+          title: "Nexus install failed",
+          detail: String(caughtError)
+        });
+      } finally {
+        setInstallingOnlineModId("");
+      }
+    }
   }
 
   async function updateAppSetting(nextSettings: AppSettings) {
@@ -314,6 +509,42 @@ export function App() {
         title: "Settings failed",
         detail: String(caughtError)
       });
+    }
+  }
+
+  async function saveNexusApiKey(apiKey: string) {
+    try {
+      const savedSettings = await api.saveNexusApiKey(apiKey);
+      setAppSettings(savedSettings);
+      setOnlineMods((current) =>
+        current.map((mod) =>
+          mod.provider === "nexus"
+            ? {
+                ...mod,
+                installSupported: savedSettings.nexusApiKeyConfigured,
+                installNote: savedSettings.nexusApiKeyConfigured
+                  ? "Uses your saved Nexus API key to request the mod file download."
+                  : "Add a Nexus API key in Settings to enable direct install for Nexus mods."
+              }
+            : mod
+        )
+      );
+      setStatus(apiKey.trim() ? "Nexus API key saved securely" : "Nexus API key removed");
+      setNotice({
+        kind: "success",
+        title: apiKey.trim() ? "Nexus connected" : "Nexus disconnected",
+        detail: apiKey.trim()
+          ? "The API key is stored in Windows Credential Manager."
+          : "The saved Nexus API key was removed."
+      });
+    } catch (caughtError) {
+      setError(String(caughtError));
+      setNotice({
+        kind: "error",
+        title: "Nexus settings failed",
+        detail: String(caughtError)
+      });
+      throw caughtError;
     }
   }
 
@@ -346,7 +577,7 @@ export function App() {
     } catch (caughtError) {
       const message = String(caughtError);
       setUpdateInfo({
-        currentVersion: "0.5.0",
+        currentVersion: appVersion || "unknown",
         updateAvailable: false,
         status: "error",
         message
@@ -496,9 +727,11 @@ export function App() {
       gamePath: folder,
       name: current.name || getFolderName(folder),
       gameId: undefined,
+      steamAppId: undefined,
       engine: "unknown",
       loader: "none"
     }));
+    setSelectedSteamGameAppId("");
     setDetection(null);
     setIsDetecting(true);
     setStatus("Detecting game setup");
@@ -537,9 +770,44 @@ export function App() {
     }
   }
 
+  function openProfileCreator() {
+    setProfileCreationMode("steam");
+    setProfileInput(emptyProfileInput);
+    setDetection(null);
+    setSelectedSteamGameAppId("");
+    setSteamGameSearch("");
+    setProfileCreatorOpen(true);
+    if (steamGames.length === 0 && !isScanningSteamGames) {
+      void scanSteamGames();
+    }
+  }
+
+  function closeProfileCreator() {
+    if (isCreatingProfile || isCreatingSteamProfile) {
+      return;
+    }
+    setProfileCreatorOpen(false);
+    setProfileCreationMode("steam");
+  }
+
+  function changeProfileCreationMode(mode: ProfileCreationMode) {
+    if (mode === profileCreationMode) {
+      return;
+    }
+    setProfileCreationMode(mode);
+    setProfileInput(emptyProfileInput);
+    setDetection(null);
+    setSelectedSteamGameAppId("");
+    setSteamGameSearch("");
+    if (mode === "steam" && steamGames.length === 0 && !isScanningSteamGames) {
+      void scanSteamGames();
+    }
+  }
+
   async function createProfile(event: FormEvent) {
     event.preventDefault();
     setError("");
+    setIsCreatingProfile(true);
     setStatus("Creating profile");
 
     try {
@@ -578,9 +846,13 @@ export function App() {
               }`
       });
       setStatus("Profile created");
+      setProfileCreatorOpen(false);
+      setProfileCreationMode("steam");
     } catch (caughtError) {
       setError(String(caughtError));
       setStatus("Profile failed");
+    } finally {
+      setIsCreatingProfile(false);
     }
   }
 
@@ -710,6 +982,254 @@ export function App() {
     }
   }
 
+  async function scanSteamGames() {
+    setError("");
+    setIsScanningSteamGames(true);
+    setStatus("Scanning Steam games");
+    try {
+      const games = await api.scanSteamGames();
+      setSteamGames(games);
+      setSelectedSteamGameAppId("");
+      setStatus(games.length > 0 ? "Steam games found" : "No Steam games found");
+      setNotice({
+        kind: games.length > 0 ? "success" : "warning",
+        title: games.length > 0 ? "Steam games found" : "No Steam games found",
+        detail:
+          games.length > 0
+            ? `Found ${games.length} installed Steam game${games.length === 1 ? "" : "s"}. Pick one below to create a profile.`
+            : "UniLoader could not find Steam library manifests on this PC."
+      });
+    } catch (caughtError) {
+      setError(String(caughtError));
+      setStatus("Steam scan failed");
+      setNotice({
+        kind: "error",
+        title: "Steam scan failed",
+        detail: String(caughtError)
+      });
+    } finally {
+      setIsScanningSteamGames(false);
+    }
+  }
+
+  async function selectSteamGameForProfile(appId: string) {
+    setSelectedSteamGameAppId(appId);
+    const game = steamGames.find((item) => item.appId === appId);
+    if (!game) {
+      return;
+    }
+
+    setProfileInput((current) => ({
+      ...current,
+      name: game.name,
+      gamePath: game.installDir,
+      steamAppId: game.appId
+    }));
+    setDetection(null);
+    setIsDetecting(true);
+    setStatus("Detecting Steam game");
+    setError("");
+
+    try {
+      const detectedSetup = await api.detectGameSetup(game.installDir);
+      setDetection(detectedSetup);
+      setProfileInput((current) => ({
+        ...current,
+        gameId: detectedSetup.gameId,
+        engine: detectedSetup.engine,
+        loader: detectedSetup.loader
+      }));
+      const issue = getDetectionIssue(detectedSetup);
+      setStatus(issue ? "Detection needs review" : "Steam game ready");
+      setNotice(
+        issue
+          ? {
+              kind: "warning",
+              title: "Steam game needs review",
+              detail: issue
+            }
+          : {
+              kind: "success",
+              title: "Steam game ready",
+              detail: `${game.name} folder was selected automatically.`
+            }
+      );
+    } catch (caughtError) {
+      setProfileInput((current) => ({ ...current, engine: "unknown", loader: "none" }));
+      setError(String(caughtError));
+      setStatus("Detection failed");
+    } finally {
+      setIsDetecting(false);
+    }
+  }
+
+  async function createSelectedSteamProfile() {
+    if (!selectedSteamGame) {
+      setNotice({
+        kind: "warning",
+        title: "Choose a Steam game",
+        detail: "Scan Steam games, then choose one from the dropdown."
+      });
+      return;
+    }
+
+    await createProfileFromSteam(selectedSteamGame);
+  }
+
+  async function createProfileFromSteam(game: SteamGameRecord) {
+    const existingProfile = profiles.find(
+      (profile) =>
+        profile.steamAppId === game.appId ||
+        profile.gamePath.toLowerCase() === game.installDir.toLowerCase()
+    );
+
+    if (existingProfile) {
+      setSelectedProfileId(existingProfile.id);
+      setProfileCreatorOpen(false);
+      setProfileCreationMode("steam");
+      setNotice({
+        kind: "warning",
+        title: "Profile already exists",
+        detail: `${existingProfile.name} is already in UniLoader.`
+      });
+      return;
+    }
+
+    setError("");
+    setIsCreatingSteamProfile(true);
+    setStatus("Creating Steam profile");
+    try {
+      const profile = await api.createSteamProfile(game);
+      setProfiles((current) => [...current, profile]);
+      setSelectedProfileId(profile.id);
+      setAnalysis(null);
+      setDetection(null);
+      setSelectedSteamGameAppId("");
+      setProfileInput(emptyProfileInput);
+      let dependencyDetail = "";
+      let dependencyWarnings: string[] = [];
+      try {
+        const dependencyResult = await api.bootstrapProfileDependencies(profile.id);
+        await refreshInstalledMods(profile.id);
+        if (dependencyResult.installedDependencies.length > 0) {
+          dependencyDetail = ` Installed ${dependencyResult.installedDependencies.length} profile dependenc${dependencyResult.installedDependencies.length === 1 ? "y" : "ies"} automatically.`;
+        } else if (dependencyResult.skippedDependencies.length > 0) {
+          dependencyDetail = " Profile dependencies were already installed.";
+        }
+        dependencyWarnings = actionableDependencyWarnings(dependencyResult.warnings);
+      } catch (caughtError) {
+        dependencyWarnings = [String(caughtError)];
+      }
+
+      setStatus("Steam profile created");
+      setNotice({
+        kind:
+          profile.engine === "unknown" || profile.loader === "none" || dependencyWarnings.length > 0
+            ? "warning"
+            : "success",
+        title: "Steam profile created",
+        detail:
+          profile.engine === "unknown" || profile.loader === "none"
+            ? `${profile.name} was added from Steam, but detection may need review before installing mods.`
+            : `${profile.name} was added with Steam launch support.${dependencyDetail}${
+                dependencyWarnings.length > 0 ? ` ${dependencyWarnings[0]}` : ""
+              }`
+      });
+      setProfileCreatorOpen(false);
+      setProfileCreationMode("steam");
+    } catch (caughtError) {
+      setError(String(caughtError));
+      setStatus("Steam profile failed");
+      setNotice({
+        kind: "error",
+        title: "Steam profile failed",
+        detail: String(caughtError)
+      });
+    } finally {
+      setIsCreatingSteamProfile(false);
+    }
+  }
+
+  async function launchSelectedProfileGame() {
+    if (!selectedProfile) {
+      setNotice({
+        kind: "warning",
+        title: "Select a profile",
+        detail: "Choose a profile before launching the game."
+      });
+      return;
+    }
+
+    setError("");
+    setIsLaunchingGame(true);
+    setStatus("Launching game");
+    try {
+      await api.launchProfileGame(selectedProfile.id);
+      setStatus("Game launched");
+      setNotice({
+        kind: "success",
+        title: "Launch requested",
+        detail: `Steam is launching ${selectedProfile.name}.`
+      });
+    } catch (caughtError) {
+      setError(String(caughtError));
+      setStatus("Launch failed");
+      setNotice({
+        kind: "error",
+        title: "Launch failed",
+        detail: String(caughtError)
+      });
+    } finally {
+      setIsLaunchingGame(false);
+    }
+  }
+
+  async function setAllModsEnabled(enabled: boolean) {
+    if (!selectedProfile) {
+      setNotice({
+        kind: "warning",
+        title: "Select a profile",
+        detail: "Choose a profile before changing installed mods."
+      });
+      return;
+    }
+
+    if (installedMods.length === 0) {
+      setNotice({
+        kind: "warning",
+        title: "No mods installed",
+        detail: "Install at least one mod before using the all-mods switch."
+      });
+      return;
+    }
+
+    setError("");
+    setIsTogglingAllMods(true);
+    setStatus(enabled ? "Enabling all mods" : "Disabling all mods");
+    try {
+      const result = await api.setAllProfileModsEnabled(selectedProfile.id, enabled);
+      setInstalledMods(result.installedMods);
+      setStatus(enabled ? "All mods enabled" : "All mods disabled");
+      setNotice({
+        kind: result.warnings.length > 0 ? "warning" : "success",
+        title: enabled ? "All mods enabled" : "All mods disabled",
+        detail:
+          result.warnings[0] ??
+          `${result.changedMods} mod${result.changedMods === 1 ? "" : "s"} ${enabled ? "enabled" : "disabled"}.`
+      });
+    } catch (caughtError) {
+      setError(String(caughtError));
+      setStatus("Mod toggle failed");
+      setNotice({
+        kind: "error",
+        title: "Mod toggle failed",
+        detail: String(caughtError)
+      });
+    } finally {
+      setIsTogglingAllMods(false);
+    }
+  }
+
   async function exportProfileBundle(profileId: string) {
     const profile = profiles.find((item) => item.id === profileId);
     if (!profile) {
@@ -787,23 +1307,43 @@ export function App() {
     }
   }
 
-  async function loadOnlineMods(profileId: string) {
+  async function loadOnlineMods(
+    profileId: string,
+    page = 1,
+    sort: OnlineSortMode = "downloads",
+    query = ""
+  ) {
+    const requestId = ++discoveryRequestSequence.current;
     setError("");
     setIsDiscoveringMods(true);
     setStatus("Discovering online mods");
     try {
-      const mods = await api.discoverOnlineMods(profileId);
-      setOnlineMods(mods);
+      const result: DiscoveryPage = await api.discoverOnlineMods(
+        profileId,
+        page,
+        discoverPageSize,
+        sort,
+        query
+      );
+      if (requestId !== discoveryRequestSequence.current) {
+        return;
+      }
+      setOnlineMods(result.items);
+      setOnlineModTotal(result.total);
       setDiscoverLoadedProfileId(profileId);
       setStatus("Discovery ready");
       const profile = profiles.find((item) => item.id === profileId);
       setNotice({
         kind: "success",
         title: "Discovery updated",
-        detail: `${profile?.name ?? "Selected profile"}: found ${mods.length} online mod(s).`
+        detail: `${profile?.name ?? "Selected profile"}: found ${result.total} online mod(s).`
       });
     } catch (caughtError) {
+      if (requestId !== discoveryRequestSequence.current) {
+        return;
+      }
       setOnlineMods([]);
+      setOnlineModTotal(0);
       setError(String(caughtError));
       setStatus("Discovery failed");
       setNotice({
@@ -812,11 +1352,20 @@ export function App() {
         detail: String(caughtError)
       });
     } finally {
-      setIsDiscoveringMods(false);
+      if (requestId === discoveryRequestSequence.current) {
+        setIsDiscoveringMods(false);
+      }
     }
   }
 
-  async function installOnlineMod(mod: OnlineModRecord) {
+  async function loadOnlineModFiles(mod: OnlineModRecord) {
+    if (!discoverProfileId) {
+      throw new Error("Select a profile before loading mod files.");
+    }
+    return api.listDiscoveredModFiles(discoverProfileId, mod);
+  }
+
+  async function installOnlineMod(mod: OnlineModRecord, file?: OnlineModFileOption) {
     if (!discoverProfileId) {
       setNotice({
         kind: "warning",
@@ -826,7 +1375,38 @@ export function App() {
       return;
     }
 
-    if (!mod.installSupported) {
+    if (file?.action === "browser") {
+      try {
+        const downloadPageUrl = await api.beginNexusBrowserDownload(
+          discoverProfileId,
+          mod,
+          file
+        );
+        await openExternalUrl(downloadPageUrl);
+        setStatus("Waiting for Nexus confirmation");
+        setNotice({
+          kind: "warning",
+          title: "Continue in Nexus",
+          detail: "Click Slow download, then Open via UniLoader for automated installs."
+        });
+      } catch (caughtError) {
+        setError(String(caughtError));
+        setStatus("Nexus handoff failed");
+        setNotice({
+          kind: "error",
+          title: "Could not start Nexus download",
+          detail: String(caughtError)
+        });
+      }
+      return;
+    }
+
+    if (file?.action === "auth") {
+      openNexusAuthSettings();
+      return;
+    }
+
+    if (!mod.installSupported || file?.action === "unsupported") {
       setNotice({
         kind: "warning",
         title: "Install needs provider support",
@@ -839,7 +1419,7 @@ export function App() {
     setInstallingOnlineModId(mod.id);
     setStatus("Installing online mod");
     try {
-      const result = await api.installDiscoveredMod(discoverProfileId, mod);
+      const result = await api.installDiscoveredMod(discoverProfileId, mod, file);
       setOnlineMods((current) =>
         current.map((item) => (item.id === mod.id ? { ...item, installed: true } : item))
       );
@@ -884,6 +1464,18 @@ export function App() {
         detail: String(caughtError)
       });
     }
+  }
+
+  async function openSupportPage() {
+    if (!supportPageUrl) {
+      setNotice({
+        kind: "warning",
+        title: "Support Me",
+        detail: "The Patreon page is coming soon."
+      });
+      return;
+    }
+    await openExternalUrl(supportPageUrl);
   }
 
   async function chooseArchive() {
@@ -976,8 +1568,8 @@ export function App() {
       setStatus("No install route");
       setNotice({
         kind: "error",
-        title: "No install route found",
-        detail: "UniLoader could not find a safe adapter for this archive."
+        title: nextAnalysis.compatibility.status === "blocked" ? "Incompatible mod" : "No install route found",
+        detail: nextAnalysis.compatibility.reason
       });
       return;
     }
@@ -989,6 +1581,7 @@ export function App() {
         profileId: selectedProfile.id,
         archivePath: nextAnalysis.archivePath,
         archiveName: nextAnalysis.archiveName,
+        packageIdentity: nextAnalysis.packageIdentity,
         plan
       });
       await refreshInstalledMods(selectedProfile.id);
@@ -1099,43 +1692,31 @@ export function App() {
     );
   }
 
-  function startWindowDrag(event: ReactMouseEvent<HTMLElement>) {
-    if (event.button !== 0) {
-      return;
-    }
-
-    const target = event.target;
-    if (
-      target instanceof Element &&
-      target.closest("button, input, textarea, select, label, a")
-    ) {
-      return;
-    }
-
-    event.preventDefault();
-    void api.startWindowDrag();
-  }
-
   const profileToRename = profileRenamePresence.value;
   const profileToRemove = profileRemovalPresence.value;
 
   return (
     <>
     {startupSplashPhase !== "hidden" ? <StartupSplash phase={startupSplashPhase} /> : null}
-    <main className={renderedView === "manager" ? "app-shell" : "app-shell settings-shell"}>
-      <div
-        className="window-drag-region"
-        onMouseDown={startWindowDrag}
-      />
+    <main
+      className={renderedView === "manager" ? "app-shell" : "app-shell settings-shell"}
+      data-theme={defaultThemeId}
+    >
+      <header className="window-title-strip" data-tauri-drag-region>
+        <span className="window-title-identity">
+          <span className="window-title-mark">
+            <UniLoaderMark />
+          </span>
+          <strong>UniLoader</strong>
+        </span>
+        <span className="window-title-trace" />
+      </header>
       <WindowControls
         onClose={() => void api.closeWindow()}
         onMaximize={() => void api.toggleMaximizeWindow()}
         onMinimize={() => void api.minimizeWindow()}
       />
       <aside className="nav-rail">
-        <div className="rail-brand" title="UniLoader">
-          <UniLoaderMark />
-        </div>
         <nav className="rail-nav" aria-label="Primary">
           <button
             className={activeView === "manager" ? "rail-button active" : "rail-button"}
@@ -1177,125 +1758,134 @@ export function App() {
             updateInfo={updateInfo}
             onClick={() => void showUpdateDetails()}
           />
-          <div className="rail-status" title={status} />
-          <span className="app-version" title={`UniLoader ${appDisplayVersion}`}>
-            {appDisplayVersion}
-          </span>
+          <button
+            aria-label="Support Me"
+            className="rail-support-button"
+            data-tooltip="Support Me"
+            onClick={() => void openSupportPage()}
+            type="button"
+          >
+            <Heart size={17} />
+          </button>
+          <div className="rail-version-row">
+            <div className="rail-status" title={status} />
+            <span className="app-version" title={`UniLoader ${appVersion || "loading"}`}>
+              {appVersion ? `v${appVersion}` : ""}
+            </span>
+          </div>
         </div>
       </aside>
       {renderedView === "manager" ? (
       <aside className={`sidebar view-motion ${viewMotion.className}`}>
-        <div className="brand-row">
-          <div className="brand-mark">
-            <UniLoaderMark />
-          </div>
-          <div className="brand-copy">
-            <h1>UniLoader</h1>
-            <p>Cross-game mod manager</p>
-          </div>
-        </div>
-
         <section className="panel">
           <div className="panel-heading">
             <Database size={17} />
             <h2>Profiles</h2>
           </div>
           <div className="profile-list">
-            {profiles.map((profile) => (
-              <div
-                className={profile.id === selectedProfileId ? "profile active" : "profile"}
-                key={profile.id}
-              >
-                <button
-                  className="profile-select"
-                  onClick={() => {
-                    setSelectedProfileId(profile.id);
-                    setAnalysis(null);
-                    setNotice(null);
-                  }}
-                  type="button"
+            {profiles.map((profile) => {
+              const isSelected = profile.id === selectedProfileId;
+              const isExpanded = profile.id === expandedProfileId;
+              const needsReview = profile.engine === "unknown" || profile.loader === "none";
+              return (
+                <div
+                  className={`profile${isSelected ? " active" : ""}${isExpanded ? " expanded" : ""}`}
+                  key={profile.id}
                 >
-                  <span>{profile.name}</span>
-                  <small>{profile.engine === "unknown" || profile.loader === "none" ? "Needs review" : "Ready"}</small>
-                </button>
-                <div className="profile-actions">
                   <button
-                    aria-label={`Rename ${profile.name}`}
-                    onClick={() => setProfilePendingRename(profile)}
-                    title="Rename profile"
+                    aria-expanded={isExpanded}
+                    className="profile-select"
+                    onClick={() => {
+                      if (isSelected) {
+                        setExpandedProfileId((current) => (current === profile.id ? "" : profile.id));
+                      } else {
+                        setSelectedProfileId(profile.id);
+                        setExpandedProfileId(profile.id);
+                      }
+                      setAnalysis(null);
+                      setNotice(null);
+                    }}
                     type="button"
                   >
-                    E
+                    <ProfileArtwork profile={profile} />
+                    <span className="profile-copy">
+                      <strong>{profile.name}</strong>
+                      <small>{needsReview ? "Needs review" : "Ready"}</small>
+                    </span>
+                    <span className="profile-chevron" aria-hidden="true">
+                      {isExpanded ? <ChevronUp size={18} /> : <ChevronDown size={18} />}
+                    </span>
                   </button>
-                  <button
-                    aria-label={`Open ${profile.name} game folder`}
-                    className="folder"
-                    onClick={() => void openProfileGameFolder(profile)}
-                    title="Open game folder"
-                    type="button"
-                  >
-                    F
-                  </button>
-                  <button
-                    aria-label={`Select ${profile.name} game folder`}
-                    className="select-folder"
-                    onClick={() => void reselectProfileGameFolder(profile)}
-                    title="Select game folder"
-                    type="button"
-                  >
-                    S
-                  </button>
-                  <button
-                    aria-label={`Remove ${profile.name}`}
-                    className="remove"
-                    onClick={() => setProfilePendingRemoval(profile)}
-                    title="Remove profile"
-                    type="button"
-                  >
-                    X
-                  </button>
+                  {isExpanded ? (
+                    <div className="profile-expanded-content">
+                      <div className="profile-actions">
+                        <button
+                          onClick={() => setProfilePendingRename(profile)}
+                          type="button"
+                        >
+                          <Pencil size={15} />
+                          <span>Rename</span>
+                        </button>
+                        <button
+                          className="folder"
+                          onClick={() => void openProfileGameFolder(profile)}
+                          type="button"
+                        >
+                          <FolderOpen size={15} />
+                          <span>Open Folder</span>
+                        </button>
+                        <button
+                          className="select-folder"
+                          onClick={() => void reselectProfileGameFolder(profile)}
+                          type="button"
+                        >
+                          <FolderCog size={15} />
+                          <span>Change Folder</span>
+                        </button>
+                        <button
+                          className="remove"
+                          onClick={() => setProfilePendingRemoval(profile)}
+                          type="button"
+                        >
+                          <Trash2 size={15} />
+                          <span>Remove</span>
+                        </button>
+                      </div>
+                      <div
+                        className={`profile-folder-state ${
+                          selectedProfileFolderConnected === true
+                            ? "connected"
+                            : selectedProfileFolderConnected === false
+                              ? "disconnected"
+                              : "checking"
+                        }`}
+                      >
+                        {selectedProfileFolderConnected === true ? (
+                          <CheckCircle2 size={16} />
+                        ) : selectedProfileFolderConnected === false ? (
+                          <AlertTriangle size={16} />
+                        ) : (
+                          <RefreshCw size={16} className="spin-icon" />
+                        )}
+                        <span>
+                          {selectedProfileFolderConnected === true
+                            ? "Game folder connected"
+                            : selectedProfileFolderConnected === false
+                              ? "Game folder unavailable"
+                              : "Checking game folder"}
+                        </span>
+                      </div>
+                    </div>
+                  ) : null}
                 </div>
-              </div>
-            ))}
+              );
+            })}
             {profiles.length === 0 ? <p className="muted">No profiles yet.</p> : null}
           </div>
-        </section>
-
-        <section className="panel">
-          <div className="panel-heading">
-            <FolderOpen size={17} />
-            <h2>New Profile</h2>
-          </div>
-          <form className="profile-form" onSubmit={createProfile}>
-            <label>
-              Game name
-              <input
-                value={profileInput.name}
-                onChange={(event) =>
-                  setProfileInput((current) => ({ ...current, name: event.target.value }))
-                }
-                placeholder="Windrose"
-              />
-            </label>
-            <label>
-              Main game folder
-              <div className="folder-input">
-                <input readOnly value={profileInput.gamePath} placeholder="Select folder" />
-                <button type="button" className="icon-button" onClick={selectGameFolder}>
-                  <FolderOpen size={17} />
-                </button>
-              </div>
-            </label>
-            <DetectionWarning
-              detection={detection}
-              detectionIssue={detectionIssue}
-              isDetecting={isDetecting}
-            />
-            <button className="primary-button" type="submit">
-              <PackagePlus size={17} />
-              Create Profile
-            </button>
-          </form>
+          <button className="new-profile-trigger" onClick={openProfileCreator} type="button">
+            <PackagePlus size={17} />
+            <span>New Profile</span>
+          </button>
         </section>
       </aside>
       ) : null}
@@ -1313,7 +1903,7 @@ export function App() {
       >
         {renderedView === "manager" ? (
           <>
-        <header className="topbar" onMouseDown={startWindowDrag}>
+        <header className="topbar">
           <div className="topbar-copy">
             <p className="eyebrow">Active profile</p>
             <h2>{selectedProfile?.name ?? "No profile selected"}</h2>
@@ -1353,6 +1943,51 @@ export function App() {
             motionClassName={noticePresence.className}
           />
         ) : null}
+
+        <section className="profile-command-panel">
+          <div className="profile-command-copy">
+            <p className="eyebrow">Profile controls</p>
+            <h3>Launch & mod state</h3>
+            <small>
+              {selectedProfile?.steamAppId
+                ? `Steam App ${selectedProfile.steamAppId}`
+                : "Steam launch is available for profiles added from Steam scan."}
+            </small>
+          </div>
+          <div className="profile-command-actions">
+            <button
+              className="primary-button"
+              disabled={!selectedProfile || !selectedProfile.steamAppId || isLaunchingGame}
+              onClick={() => void launchSelectedProfileGame()}
+              title={
+                selectedProfile?.steamAppId
+                  ? "Launch selected game through Steam"
+                  : "Add this profile from Steam scan to enable Steam launch"
+              }
+              type="button"
+            >
+              <Play size={17} />
+              {isLaunchingGame ? "Launching" : "Launch Game"}
+            </button>
+            <label
+              className={isTogglingAllMods ? "master-mod-toggle busy" : "master-mod-toggle"}
+              title="Enable or disable every installed mod in this profile"
+            >
+              <input
+                checked={allProfileModsEnabled}
+                disabled={!selectedProfile || installedMods.length === 0 || isTogglingAllMods}
+                onChange={(event) => void setAllModsEnabled(event.currentTarget.checked)}
+                type="checkbox"
+              />
+              <span className="master-mod-track">
+                <span />
+              </span>
+              <span className="master-mod-copy">
+                <strong>{profileModToggleLabel}</strong>
+              </span>
+            </label>
+          </div>
+        </section>
 
           <div className="main-grid">
             <section className="work-panel analysis-panel">
@@ -1456,11 +2091,14 @@ export function App() {
             installingModId={installingOnlineModId}
             isLoading={isDiscoveringMods}
             mods={displayedOnlineMods}
+            total={discoverLoadedProfileId === discoverProfileId ? onlineModTotal : 0}
             profiles={profiles}
             selectedProfileId={discoverProfileId}
-            onInstall={(mod) => void installOnlineMod(mod)}
+            onInstall={(mod, file) => void installOnlineMod(mod, file)}
+            onLoadFiles={loadOnlineModFiles}
             onNeedsAuth={openNexusAuthSettings}
-            onRefresh={() => void loadOnlineMods(discoverProfileId)}
+            onOpenPage={(url) => void openExternalUrl(url)}
+            onLoad={(page, sort, query) => void loadOnlineMods(discoverProfileId, page, sort, query)}
             onSelectProfile={setDiscoverProfileId}
           />
         ) : (
@@ -1468,6 +2106,7 @@ export function App() {
             appSettings={appSettings}
             nexusAttentionId={nexusSettingsAttentionId}
             onOpenExternalUrl={(url) => void openExternalUrl(url)}
+            onSaveNexusApiKey={saveNexusApiKey}
             onUpdateSettings={updateAppSetting}
           />
         )}
@@ -1483,6 +2122,35 @@ export function App() {
       />
       ) : null}
     </main>
+    {profileCreatorPresence.value ? (
+      <ProfileCreatorDialog
+        detection={detection}
+        detectionIssue={detectionIssue}
+        filteredSteamGames={filteredSteamGames}
+        isCreatingProfile={isCreatingProfile}
+        isCreatingSteamProfile={isCreatingSteamProfile}
+        isDetecting={isDetecting}
+        isScanningSteamGames={isScanningSteamGames}
+        mode={profileCreationModeMotion.value}
+        modeMotionClassName={profileCreationModeMotion.className}
+        motionClassName={profileCreatorPresence.className}
+        profileInput={profileInput}
+        selectedSteamGameAppId={selectedSteamGameAppId}
+        steamGameSearch={steamGameSearch}
+        steamGamesCount={steamGames.length}
+        onCancel={closeProfileCreator}
+        onChangeMode={changeProfileCreationMode}
+        onChangeName={(name) =>
+          setProfileInput((current) => ({ ...current, name }))
+        }
+        onChangeSteamSearch={setSteamGameSearch}
+        onChooseFolder={() => void selectGameFolder()}
+        onCreateManual={createProfile}
+        onCreateSteam={() => void createSelectedSteamProfile()}
+        onScanSteam={() => void scanSteamGames()}
+        onSelectSteamGame={(appId) => void selectSteamGameForProfile(appId)}
+      />
+    ) : null}
     {configModalPresence.value ? (
       <ConfigModal
         motionClassName={configModalPresence.className}
@@ -1578,6 +2246,249 @@ function useFadeSwitch<T>(value: T, durationMs = motionDurationMs): MotionState<
 function getFolderName(folderPath: string): string {
   const parts = folderPath.replace(/\\/g, "/").split("/").filter(Boolean);
   return parts[parts.length - 1] ?? "";
+}
+
+interface ProfileCreatorDialogProps {
+  detection: GameDetectionResult | null;
+  detectionIssue: string;
+  filteredSteamGames: SteamGameRecord[];
+  isCreatingProfile: boolean;
+  isCreatingSteamProfile: boolean;
+  isDetecting: boolean;
+  isScanningSteamGames: boolean;
+  mode: ProfileCreationMode;
+  modeMotionClassName: string;
+  motionClassName: string;
+  profileInput: CreateProfileInput;
+  selectedSteamGameAppId: string;
+  steamGameSearch: string;
+  steamGamesCount: number;
+  onCancel(): void;
+  onChangeMode(mode: ProfileCreationMode): void;
+  onChangeName(name: string): void;
+  onChangeSteamSearch(value: string): void;
+  onChooseFolder(): void;
+  onCreateManual(event: FormEvent): void;
+  onCreateSteam(): void;
+  onScanSteam(): void;
+  onSelectSteamGame(appId: string): void;
+}
+
+function ProfileCreatorDialog({
+  detection,
+  detectionIssue,
+  filteredSteamGames,
+  isCreatingProfile,
+  isCreatingSteamProfile,
+  isDetecting,
+  isScanningSteamGames,
+  mode,
+  modeMotionClassName,
+  motionClassName,
+  profileInput,
+  selectedSteamGameAppId,
+  steamGameSearch,
+  steamGamesCount,
+  onCancel,
+  onChangeMode,
+  onChangeName,
+  onChangeSteamSearch,
+  onChooseFolder,
+  onCreateManual,
+  onCreateSteam,
+  onScanSteam,
+  onSelectSteamGame
+}: ProfileCreatorDialogProps) {
+  const isBusy = isCreatingProfile || isCreatingSteamProfile;
+  const canCreateManual =
+    profileInput.name.trim().length > 0 && profileInput.gamePath.length > 0 && !isDetecting;
+  const canCreateSteam = selectedSteamGameAppId.length > 0 && !isDetecting;
+
+  return (
+    <div className={`modal-backdrop ${motionClassName}`} onMouseDown={onCancel}>
+      <form
+        aria-label="Create game profile"
+        aria-modal="true"
+        className="profile-creator-modal"
+        onMouseDown={(event) => event.stopPropagation()}
+        onSubmit={(event) => {
+          if (mode === "manual") {
+            onCreateManual(event);
+            return;
+          }
+          event.preventDefault();
+          if (canCreateSteam) {
+            onCreateSteam();
+          }
+        }}
+        role="dialog"
+      >
+        <header className="profile-creator-header">
+          <div className="profile-creator-title">
+            <span className="profile-creator-icon">
+              <PackagePlus size={22} />
+            </span>
+            <div>
+              <p className="eyebrow">Profiles</p>
+              <h3>New Profile</h3>
+            </div>
+          </div>
+          <button
+            aria-label="Close new profile window"
+            className="icon-button"
+            disabled={isBusy}
+            onClick={onCancel}
+            title="Close"
+            type="button"
+          >
+            <X size={18} />
+          </button>
+        </header>
+
+        <div className="profile-source-tabs" role="tablist" aria-label="Profile source">
+          <button
+            aria-selected={mode === "steam"}
+            className={mode === "steam" ? "active" : ""}
+            onClick={() => onChangeMode("steam")}
+            role="tab"
+            type="button"
+          >
+            <Gamepad2 size={17} />
+            Steam Game
+          </button>
+          <button
+            aria-selected={mode === "manual"}
+            className={mode === "manual" ? "active" : ""}
+            onClick={() => onChangeMode("manual")}
+            role="tab"
+            type="button"
+          >
+            <FolderOpen size={17} />
+            Choose Folder
+          </button>
+        </div>
+
+        <div className={`profile-creator-content view-motion ${modeMotionClassName}`}>
+          {mode === "steam" ? (
+            <div className="steam-creator-flow">
+              <div className="steam-creator-toolbar">
+                <label className="search-field">
+                  <Search size={16} />
+                  <input
+                    autoFocus
+                    onChange={(event) => onChangeSteamSearch(event.target.value)}
+                    placeholder="Search installed Steam games"
+                    value={steamGameSearch}
+                  />
+                </label>
+                <button
+                  aria-label="Scan Steam games"
+                  className="icon-button steam-scan-button"
+                  disabled={isScanningSteamGames}
+                  onClick={onScanSteam}
+                  title="Scan Steam games"
+                  type="button"
+                >
+                  <RefreshCw className={isScanningSteamGames ? "spin-icon" : ""} size={17} />
+                </button>
+              </div>
+
+              <div className="steam-creator-list" aria-label="Installed Steam games">
+                {isScanningSteamGames && steamGamesCount === 0 ? (
+                  <div className="profile-creator-empty">Scanning Steam libraries...</div>
+                ) : null}
+                {!isScanningSteamGames && steamGamesCount === 0 ? (
+                  <div className="profile-creator-empty">
+                    No installed Steam games were found. Rescan or use Choose Folder.
+                  </div>
+                ) : null}
+                {steamGamesCount > 0 && filteredSteamGames.length === 0 ? (
+                  <div className="profile-creator-empty">No installed games match this search.</div>
+                ) : null}
+                {filteredSteamGames.map((game) => (
+                  <button
+                    aria-pressed={selectedSteamGameAppId === game.appId}
+                    className={
+                      selectedSteamGameAppId === game.appId
+                        ? "steam-creator-game selected"
+                        : "steam-creator-game"
+                    }
+                    key={game.appId}
+                    onClick={() => onSelectSteamGame(game.appId)}
+                    type="button"
+                  >
+                    <span>
+                      <strong>{game.name}</strong>
+                      <small title={game.installDir}>{game.installDir}</small>
+                    </span>
+                    <CheckCircle2 size={17} />
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div className="manual-creator-flow">
+              <label>
+                Game name
+                <input
+                  autoFocus
+                  onChange={(event) => onChangeName(event.target.value)}
+                  placeholder="Game name"
+                  value={profileInput.name}
+                />
+              </label>
+              <label>
+                Main game folder
+                <div className="folder-input">
+                  <input readOnly value={profileInput.gamePath} placeholder="Select game folder" />
+                  <button
+                    aria-label="Select main game folder"
+                    className="icon-button"
+                    onClick={onChooseFolder}
+                    title="Select folder"
+                    type="button"
+                  >
+                    <FolderOpen size={17} />
+                  </button>
+                </div>
+              </label>
+            </div>
+          )}
+        </div>
+
+        <section className="profile-detection-preview" aria-label="Profile detection preview">
+          <div className="profile-detection-copy">
+            <span>Selected game</span>
+            <strong>{profileInput.name || "Waiting for selection"}</strong>
+            <small title={profileInput.gamePath}>
+              {profileInput.gamePath || "Choose an installed game or main game folder."}
+            </small>
+          </div>
+          <DetectionWarning
+            detection={detection}
+            detectionIssue={detectionIssue}
+            isDetecting={isDetecting}
+          />
+        </section>
+
+        <footer className="profile-creator-actions">
+          <button className="secondary-button compact-button" onClick={onCancel} type="button">
+            Cancel
+          </button>
+          <button
+            className="primary-button compact-button"
+            disabled={
+              isBusy || (mode === "steam" ? !canCreateSteam : !canCreateManual)
+            }
+            type="submit"
+          >
+            <PackagePlus size={16} />
+            {isBusy ? "Creating..." : "Create Profile"}
+          </button>
+        </footer>
+      </form>
+    </div>
+  );
 }
 
 interface ProfileRenameDialogProps {
@@ -1695,6 +2606,51 @@ interface WindowControlsProps {
   onClose(): void;
 }
 
+function ProfileArtwork({ profile }: { profile: GameProfile }) {
+  const [imageSourceIndex, setImageSourceIndex] = useState(0);
+  const steamAppId = profile.steamAppId?.trim();
+  const imageUrls =
+    steamAppId && /^\d+$/.test(steamAppId)
+      ? [
+          `https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_600x900_2x.jpg`,
+          `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_600x900_2x.jpg`,
+          `https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_600x900.jpg`,
+          `https://cdn.cloudflare.steamstatic.com/steam/apps/${steamAppId}/capsule_231x87.jpg`
+        ]
+      : [];
+  const imageUrl = imageUrls[imageSourceIndex];
+  const initials =
+    profile.name
+      .split(/\s+/)
+      .filter(Boolean)
+      .slice(0, 2)
+      .map((word) => word[0]?.toUpperCase())
+      .join("") || "G";
+
+  useEffect(() => {
+    setImageSourceIndex(0);
+  }, [steamAppId]);
+
+  return (
+    <span className="profile-artwork" aria-hidden="true">
+      {imageUrl ? (
+        <img
+          alt=""
+          draggable={false}
+          loading="lazy"
+          onError={() => setImageSourceIndex((current) => current + 1)}
+          src={imageUrl}
+        />
+      ) : (
+        <span className="profile-artwork-fallback">
+          <Gamepad2 size={19} />
+          <b>{initials}</b>
+        </span>
+      )}
+    </span>
+  );
+}
+
 function WindowControls({ onClose, onMaximize, onMinimize }: WindowControlsProps) {
   return (
     <div className="window-controls" aria-label="Window controls">
@@ -1780,7 +2736,7 @@ function HealthPanel({
         <span>Health</span>
         <strong>{healthMessage}</strong>
       </div>
-      <span className="health-status">{status}</span>
+      <span className="health-status" title={status}>{status}</span>
       <button
         className="health-refresh"
         disabled={isRefreshing}
@@ -1837,11 +2793,14 @@ interface DiscoverViewProps {
   installingModId: string;
   isLoading: boolean;
   mods: OnlineModRecord[];
+  total: number;
   profiles: GameProfile[];
   selectedProfileId: string;
-  onInstall(mod: OnlineModRecord): void;
+  onInstall(mod: OnlineModRecord, file?: OnlineModFileOption): void;
+  onLoadFiles(mod: OnlineModRecord): Promise<OnlineModFileOption[]>;
   onNeedsAuth(): void;
-  onRefresh(): void;
+  onOpenPage(url: string): void;
+  onLoad(page: number, sort: OnlineSortMode, query: string): void;
   onSelectProfile(profileId: string): void;
 }
 
@@ -1850,77 +2809,62 @@ function DiscoverView({
   installingModId,
   isLoading,
   mods,
+  total,
   profiles,
   selectedProfileId,
   onInstall,
+  onLoadFiles,
   onNeedsAuth,
-  onRefresh,
+  onOpenPage,
+  onLoad,
   onSelectProfile
 }: DiscoverViewProps) {
   const [query, setQuery] = useState("");
   const [page, setPage] = useState(1);
   const [sortMode, setSortMode] = useState<OnlineSortMode>("downloads");
+  const [expandedModId, setExpandedModId] = useState("");
   const selectedProfile = profiles.find((profile) => profile.id === selectedProfileId);
-  const normalizedQuery = query.toLowerCase().trim();
-  const filteredMods = useMemo(
-    () =>
-      normalizedQuery
-        ? mods.filter((mod) =>
-            [
-              mod.name,
-              mod.owner,
-              mod.description,
-              mod.providerLabel,
-              mod.categories.join(" ")
-            ]
-              .join(" ")
-              .toLowerCase()
-              .includes(normalizedQuery)
-          )
-        : mods,
-    [mods, normalizedQuery]
-  );
-  const sortedOnlineMods = useMemo(
-    () =>
-      [...filteredMods].sort((first, second) => {
-        const firstTime = onlineModTimestamp(first);
-        const secondTime = onlineModTimestamp(second);
-
-        if (sortMode === "newest") {
-          return (
-            secondTime - firstTime ||
-            second.downloads - first.downloads ||
-            second.ratingScore - first.ratingScore
-          );
-        }
-
-        if (sortMode === "oldest") {
-          return (
-            firstTime - secondTime ||
-            second.downloads - first.downloads ||
-            second.ratingScore - first.ratingScore
-          );
-        }
-
-        return (
-          second.downloads - first.downloads ||
-          second.ratingScore - first.ratingScore ||
-          first.name.localeCompare(second.name)
-        );
-      }),
-    [filteredMods, sortMode]
-  );
-  const pageCount = Math.max(1, Math.ceil(sortedOnlineMods.length / discoverPageSize));
+  const pageCount = Math.max(1, Math.ceil(total / discoverPageSize));
   const currentPage = Math.min(page, pageCount);
-  const pageStart = (currentPage - 1) * discoverPageSize;
-  const visibleMods = useMemo(
-    () => sortedOnlineMods.slice(pageStart, pageStart + discoverPageSize),
-    [sortedOnlineMods, pageStart]
-  );
+  const visibleMods = mods;
 
   useEffect(() => {
     setPage(1);
-  }, [normalizedQuery, selectedProfileId, mods, sortMode]);
+    setQuery("");
+    setSortMode("downloads");
+    setExpandedModId("");
+  }, [selectedProfileId]);
+
+  useEffect(() => {
+    if (expandedModId && !mods.some((mod) => mod.id === expandedModId)) {
+      setExpandedModId("");
+    }
+  }, [expandedModId, mods]);
+
+  useEffect(() => {
+    if (!hasLoaded || !selectedProfileId) {
+      return;
+    }
+    const timeout = window.setTimeout(() => {
+      setPage(1);
+      onLoad(1, sortMode, query.trim());
+    }, 300);
+    return () => window.clearTimeout(timeout);
+  }, [query]);
+
+  function changeSort(nextSort: OnlineSortMode) {
+    setSortMode(nextSort);
+    setPage(1);
+    setExpandedModId("");
+    onLoad(1, nextSort, query.trim());
+  }
+
+  function changePage(nextPage: number) {
+    const safePage = Math.max(1, Math.min(pageCount, nextPage));
+    setPage(safePage);
+    setExpandedModId("");
+    onLoad(safePage, sortMode, query.trim());
+  }
 
   return (
     <div className="discover-layout">
@@ -1937,7 +2881,10 @@ function DiscoverView({
         <button
           className="secondary-button"
           disabled={!selectedProfileId || isLoading}
-          onClick={onRefresh}
+          onClick={() => {
+            setExpandedModId("");
+            onLoad(currentPage, sortMode, query.trim());
+          }}
           type="button"
         >
           <RefreshCw size={16} />
@@ -1950,7 +2897,10 @@ function DiscoverView({
           Profile
           <select
             value={selectedProfileId}
-            onChange={(event) => onSelectProfile(event.target.value)}
+            onChange={(event) => {
+              setExpandedModId("");
+              onSelectProfile(event.target.value);
+            }}
           >
             {profiles.map((profile) => (
               <option key={profile.id} value={profile.id}>
@@ -1963,38 +2913,48 @@ function DiscoverView({
           <Search size={17} />
           <input
             value={query}
-            onChange={(event) => setQuery(event.target.value)}
+            onChange={(event) => {
+              setExpandedModId("");
+              setQuery(event.target.value);
+            }}
             placeholder="Search online mods"
           />
           {query ? (
-            <button onClick={() => setQuery("")} title="Clear search" type="button">
+            <button
+              onClick={() => {
+                setExpandedModId("");
+                setQuery("");
+              }}
+              title="Clear search"
+              type="button"
+            >
               X
             </button>
           ) : null}
         </label>
-        <div className="discover-provider-pill" title={`${sortedOnlineMods.length} total online mods`}>
+        <div className="discover-provider-pill" title={`${total} total online mods`}>
           <Compass size={17} />
           <span>Total Mods</span>
-          <strong>{formatCompactNumber(sortedOnlineMods.length)}</strong>
+          <strong>{formatCompactNumber(total)}</strong>
         </div>
         <div className="sort-toggle discover-sort" aria-label="Sort online mods">
           <button
             className={sortMode === "downloads" ? "active" : ""}
-            onClick={() => setSortMode("downloads")}
+            onClick={() => changeSort("downloads")}
             type="button"
           >
             Total Downloads
           </button>
           <button
             className={sortMode === "newest" ? "active" : ""}
-            onClick={() => setSortMode("newest")}
+            onClick={() => changeSort("newest")}
             type="button"
           >
             Newest
           </button>
           <button
             className={sortMode === "oldest" ? "active" : ""}
-            onClick={() => setSortMode("oldest")}
+            onClick={() => changeSort("oldest")}
             type="button"
           >
             Oldest
@@ -2005,11 +2965,15 @@ function DiscoverView({
       <section className="discover-results" aria-label="Online mod results">
         {visibleMods.map((mod) => (
           <OnlineModCard
+            expanded={expandedModId === mod.id}
             installing={installingModId === mod.id}
             key={`${mod.provider}:${mod.id}:${mod.version}`}
             mod={mod}
             onInstall={onInstall}
+            onLoadFiles={onLoadFiles}
             onNeedsAuth={onNeedsAuth}
+            onOpenPage={onOpenPage}
+            onToggle={() => setExpandedModId((current) => (current === mod.id ? "" : mod.id))}
           />
         ))}
         {!isLoading && !hasLoaded ? (
@@ -2030,12 +2994,12 @@ function DiscoverView({
             <p>No online mods match that search.</p>
           </div>
         ) : null}
-        {!isLoading && filteredMods.length > discoverPageSize ? (
+        {!isLoading && total > discoverPageSize ? (
           <div className="discover-pagination">
             <button
               className="secondary-button compact-button"
               disabled={currentPage <= 1}
-              onClick={() => setPage((value) => Math.max(1, value - 1))}
+              onClick={() => changePage(currentPage - 1)}
               type="button"
             >
               Previous
@@ -2046,7 +3010,7 @@ function DiscoverView({
             <button
               className="secondary-button compact-button"
               disabled={currentPage >= pageCount}
-              onClick={() => setPage((value) => Math.min(pageCount, value + 1))}
+              onClick={() => changePage(currentPage + 1)}
               type="button"
             >
               Next
@@ -2065,84 +3029,330 @@ function DiscoverView({
 }
 
 interface OnlineModCardProps {
+  expanded: boolean;
   installing: boolean;
   mod: OnlineModRecord;
-  onInstall(mod: OnlineModRecord): void;
+  onInstall(mod: OnlineModRecord, file?: OnlineModFileOption): void;
+  onLoadFiles(mod: OnlineModRecord): Promise<OnlineModFileOption[]>;
   onNeedsAuth(): void;
+  onOpenPage(url: string): void;
+  onToggle(): void;
 }
 
-const OnlineModCard = memo(function OnlineModCard({
+function OnlineModCard({
+  expanded,
   installing,
   mod,
   onInstall,
-  onNeedsAuth
+  onLoadFiles,
+  onNeedsAuth,
+  onOpenPage,
+  onToggle
 }: OnlineModCardProps) {
+  const [files, setFiles] = useState<OnlineModFileOption[]>([]);
+  const [fileLoadState, setFileLoadState] = useState<"idle" | "loading" | "ready" | "error">(
+    "idle"
+  );
+  const [fileLoadError, setFileLoadError] = useState("");
+  const [selectedFileId, setSelectedFileId] = useState("");
+  const fileRequestSequence = useRef(0);
   const needsAuth = !mod.installSupported && mod.provider === "nexus";
   const installDisabled = mod.installed || installing || (!mod.installSupported && !needsAuth);
+  const pageUrl = mod.packageUrl ?? mod.websiteUrl;
+  const selectedFile = files.find((file) => file.id === selectedFileId);
   const installTitle = !mod.installSupported
     ? (mod.installNote ?? `${mod.providerLabel} direct install is not available yet.`)
     : undefined;
+  const statusLabel = mod.installed
+    ? "Installed"
+    : installing
+      ? "Installing"
+      : needsAuth
+        ? "Needs auth"
+        : mod.installSupported
+          ? "Available"
+          : "Unavailable";
+  const installLabel = mod.installed
+    ? "Installed"
+    : installing
+      ? "Installing"
+      : mod.installSupported
+        ? "Install"
+        : "Needs Auth";
+  const selectedActionLabel = mod.installed
+    ? "Installed"
+    : installing
+      ? "Installing"
+      : selectedFile?.action === "browser"
+        ? "Confirm & Install"
+        : selectedFile
+          ? "Install Selected"
+          : fileLoadState === "loading"
+            ? "Loading Files"
+            : "Select a File";
+  const selectedActionDisabled =
+    mod.installed ||
+    installing ||
+    !selectedFile ||
+    selectedFile.action === "unsupported" ||
+    selectedFile.action === "auth";
+
+  useEffect(() => {
+    fileRequestSequence.current += 1;
+    setFiles([]);
+    setSelectedFileId("");
+    setFileLoadError("");
+    setFileLoadState("idle");
+  }, [mod.id]);
+
+  useEffect(() => {
+    if (!expanded || needsAuth || fileLoadState !== "idle") {
+      return;
+    }
+
+    const requestId = ++fileRequestSequence.current;
+    setFileLoadState("loading");
+    void onLoadFiles(mod)
+      .then((options) => {
+        if (requestId !== fileRequestSequence.current) {
+          return;
+        }
+        setFiles(options);
+        setSelectedFileId(options.find((option) => option.primary)?.id ?? options[0]?.id ?? "");
+        setFileLoadState("ready");
+      })
+      .catch((caughtError) => {
+        if (requestId !== fileRequestSequence.current) {
+          return;
+        }
+        setFileLoadError(String(caughtError));
+        setFileLoadState("error");
+      });
+  }, [expanded, fileLoadState, mod, needsAuth, onLoadFiles]);
+
+  function runSummaryAction() {
+    if (needsAuth) {
+      onNeedsAuth();
+      return;
+    }
+    if (mod.provider === "nexus") {
+      if (!expanded) {
+        onToggle();
+      }
+      return;
+    }
+    onInstall(mod);
+  }
 
   return (
-    <article className={mod.installed ? "online-mod-card installed" : "online-mod-card"}>
-      <div className="online-mod-icon">
-        {mod.iconUrl ? (
-          <img alt="" decoding="async" loading="lazy" src={mod.iconUrl} />
-        ) : (
-          <PackagePlus size={24} />
-        )}
-      </div>
-      <div className="online-mod-copy">
-        <div className="online-mod-heading">
-          <div>
-            <p className="eyebrow">{mod.providerLabel}</p>
-            <h3>{mod.name}</h3>
-          </div>
-          <span className={mod.installed ? "online-mod-state installed" : "online-mod-state"}>
-            {mod.installed ? "Installed" : `v${mod.version}`}
-          </span>
+    <article
+      className={`online-mod-card${mod.installed ? " installed" : ""}${expanded ? " expanded" : ""}`}
+    >
+      <div className="online-mod-summary">
+        <div className="online-mod-icon">
+          {mod.iconUrl ? (
+            <img alt="" decoding="async" loading="lazy" src={mod.iconUrl} />
+          ) : (
+            <PackagePlus size={24} />
+          )}
         </div>
-        <p>{mod.description || "No description provided."}</p>
-        <div className="online-mod-meta">
-          <span>{mod.owner}</span>
-          <span>{formatCompactNumber(mod.downloads)} downloads</span>
-          <span>{mod.dependencyCount} dependenc{mod.dependencyCount === 1 ? "y" : "ies"}</span>
-          {mod.fileSize ? <span>{formatFileSize(mod.fileSize)}</span> : null}
+        <div className="online-mod-identity">
+          <p className="eyebrow">{mod.providerLabel}</p>
+          <h3>{mod.name}</h3>
+          <span>{mod.owner || "Unknown author"}</span>
         </div>
-        {mod.categories.length > 0 ? (
-          <div className="dependency-chips">
-            {mod.categories.slice(0, 4).map((category) => (
-              <span key={category}>{category}</span>
-            ))}
-          </div>
-        ) : null}
-      </div>
-      <div className="online-mod-actions">
-        {mod.packageUrl ? (
-          <a className="secondary-button compact-button" href={mod.packageUrl} target="_blank" rel="noreferrer">
-            Page
-          </a>
-        ) : null}
+        <div className="online-mod-row-stat" title={`${mod.downloads.toLocaleString()} downloads`}>
+          <Download size={16} />
+          <strong>{formatCompactNumber(mod.downloads)}</strong>
+        </div>
+        <span className="online-mod-row-version">v{mod.version || "Unknown"}</span>
+        <span className={mod.installed ? "online-mod-row-state installed" : "online-mod-row-state"}>
+          {mod.installed ? <CheckCircle2 size={17} /> : null}
+          {statusLabel}
+        </span>
         <button
-          className={needsAuth ? "secondary-button compact-button auth-button" : "primary-button compact-button"}
+          aria-label={`${installLabel} ${mod.name}`}
+          className={needsAuth ? "online-mod-icon-button auth" : "online-mod-icon-button"}
           disabled={installDisabled}
-          onClick={() => (needsAuth ? onNeedsAuth() : onInstall(mod))}
-          title={installTitle}
+          onClick={runSummaryAction}
+          title={
+            mod.provider === "nexus" && mod.installSupported
+              ? `Choose a file for ${mod.name}`
+              : (installTitle ?? `${installLabel} ${mod.name}`)
+          }
           type="button"
         >
-          {needsAuth ? <Settings2 size={15} /> : <Download size={15} />}
-          {mod.installed
-            ? "Installed"
-            : installing
-              ? "Installing"
-              : mod.installSupported
-                ? "Install"
-                : "Needs Auth"}
+          {needsAuth ? <Settings2 size={18} /> : mod.installed ? <CheckCircle2 size={18} /> : <Download size={18} />}
+        </button>
+        <button
+          aria-expanded={expanded}
+          aria-label={`${expanded ? "Hide" : "Show"} details for ${mod.name}`}
+          className="online-mod-expand-button"
+          onClick={(event) => {
+            event.stopPropagation();
+            onToggle();
+          }}
+          title={expanded ? "Hide details" : "Show details"}
+          type="button"
+        >
+          {expanded ? <ChevronUp size={20} /> : <ChevronDown size={20} />}
         </button>
       </div>
+
+      {expanded ? (
+        <div className="online-mod-details">
+          <div className="online-mod-description">
+            <p>{mod.description || "The provider did not include a description for this mod."}</p>
+            {mod.installNote ? <small>{mod.installNote}</small> : null}
+          </div>
+          <dl className="online-mod-detail-grid">
+            <div>
+              <dt>Author</dt>
+              <dd>{mod.owner || "Unknown"}</dd>
+            </div>
+            <div>
+              <dt>Provider</dt>
+              <dd>{mod.providerLabel}</dd>
+            </div>
+            <div>
+              <dt>Version</dt>
+              <dd>{mod.version || "Not provided"}</dd>
+            </div>
+            <div>
+              <dt>Downloads</dt>
+              <dd>{mod.downloads.toLocaleString()}</dd>
+            </div>
+            <div>
+              <dt>Dependencies</dt>
+              <dd>{mod.dependencyCount}</dd>
+            </div>
+            <div>
+              <dt>File size</dt>
+              <dd>{mod.fileSize ? formatFileSize(mod.fileSize) : "Not provided"}</dd>
+            </div>
+            <div>
+              <dt>Published</dt>
+              <dd>{formatOnlineDate(mod.createdAt)}</dd>
+            </div>
+            <div>
+              <dt>Updated</dt>
+              <dd>{formatOnlineDate(mod.updatedAt)}</dd>
+            </div>
+          </dl>
+          <section className="online-mod-file-section" aria-label={`Files for ${mod.name}`}>
+            <div className="online-mod-file-heading">
+              <div>
+                <span>Install file</span>
+                <strong>Choose the release or variant you want</strong>
+              </div>
+              {files.length > 0 ? <small>{files.length} available</small> : null}
+            </div>
+            {needsAuth ? (
+              <div className="online-mod-file-message warning">
+                Add your Nexus API key in Settings to load this mod's available files.
+              </div>
+            ) : fileLoadState === "loading" ? (
+              <div className="online-mod-file-message">
+                <RefreshCw size={15} />
+                Loading available files...
+              </div>
+            ) : fileLoadState === "error" ? (
+              <div className="online-mod-file-message error">
+                <AlertTriangle size={15} />
+                {fileLoadError}
+              </div>
+            ) : fileLoadState === "ready" && files.length === 0 ? (
+              <div className="online-mod-file-message warning">
+                This provider did not return any installable archive files.
+              </div>
+            ) : files.length > 0 ? (
+              <div className="online-mod-file-picker" role="radiogroup" aria-label="Mod file">
+                {files.map((file) => {
+                  const selected = file.id === selectedFileId;
+                  const fileMeta = [
+                    file.version ? `v${file.version}` : "",
+                    file.category ?? "",
+                    file.fileSize ? formatFileSize(file.fileSize) : "",
+                    file.uploadedAt ? formatOnlineDate(file.uploadedAt) : ""
+                  ].filter(Boolean);
+                  return (
+                    <label
+                      className={selected ? "online-mod-file-option selected" : "online-mod-file-option"}
+                      key={file.id}
+                    >
+                      <input
+                        checked={selected}
+                        name={`online-file-${mod.id}`}
+                        onChange={() => setSelectedFileId(file.id)}
+                        type="radio"
+                        value={file.id}
+                      />
+                      <span>
+                        <strong>{file.name}</strong>
+                        <small>{fileMeta.join(" / ") || file.fileName || "Provider file"}</small>
+                      </span>
+                      {file.primary ? <b>Recommended</b> : null}
+                    </label>
+                  );
+                })}
+              </div>
+            ) : null}
+            {selectedFile?.description ? (
+              <p className="online-mod-file-description">{selectedFile.description}</p>
+            ) : null}
+            {selectedFile?.action === "browser" ? (
+              <div className="online-mod-file-message warning">
+                Click Slow download, then Open via UniLoader for automated installs.
+              </div>
+            ) : null}
+          </section>
+          <div className="online-mod-detail-footer">
+            <div className="online-mod-categories">
+              <span>Categories</span>
+              <p>{mod.categories.length > 0 ? mod.categories.join(", ") : "No categories provided"}</p>
+            </div>
+            <div className="online-mod-detail-actions">
+              {pageUrl ? (
+                <button
+                  className="secondary-button compact-button"
+                  onClick={() => onOpenPage(pageUrl)}
+                  type="button"
+                >
+                  <ExternalLink size={15} />
+                  Page
+                </button>
+              ) : null}
+              <button
+                className={
+                  needsAuth || selectedFile?.action === "browser"
+                    ? "secondary-button compact-button auth-button"
+                    : "primary-button compact-button"
+                }
+                disabled={needsAuth ? false : selectedActionDisabled}
+                onClick={() =>
+                  needsAuth ? onNeedsAuth() : selectedFile ? onInstall(mod, selectedFile) : undefined
+                }
+                title={installTitle}
+                type="button"
+              >
+                {needsAuth ? (
+                  <Settings2 size={15} />
+                ) : selectedFile?.action === "browser" ? (
+                  <ExternalLink size={15} />
+                ) : mod.installed ? (
+                  <CheckCircle2 size={15} />
+                ) : (
+                  <Download size={15} />
+                )}
+                {needsAuth ? "Add API Key" : selectedActionLabel}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </article>
   );
-});
+}
 
 interface TransferViewProps {
   isBusy: boolean;
@@ -2269,6 +3479,7 @@ interface SettingsViewProps {
   appSettings: AppSettings;
   nexusAttentionId: number;
   onOpenExternalUrl(url: string): void;
+  onSaveNexusApiKey(apiKey: string): Promise<void>;
   onUpdateSettings(settings: AppSettings): Promise<void>;
 }
 
@@ -2276,8 +3487,22 @@ function SettingsView({
   appSettings,
   nexusAttentionId,
   onOpenExternalUrl,
+  onSaveNexusApiKey,
   onUpdateSettings
 }: SettingsViewProps) {
+  const [nexusApiKeyDraft, setNexusApiKeyDraft] = useState("");
+  const [isSavingNexusKey, setIsSavingNexusKey] = useState(false);
+
+  async function submitNexusApiKey() {
+    setIsSavingNexusKey(true);
+    try {
+      await onSaveNexusApiKey(nexusApiKeyDraft);
+      setNexusApiKeyDraft("");
+    } finally {
+      setIsSavingNexusKey(false);
+    }
+  }
+
   return (
     <div className="settings-grid">
       <section className="work-panel settings-panel">
@@ -2324,19 +3549,24 @@ function SettingsView({
           <span>Personal API key</span>
           <input
             autoComplete="off"
-            placeholder="Paste Nexus API key"
+            placeholder={appSettings.nexusApiKeyConfigured ? "API key saved securely" : "Paste Nexus API key"}
             type="password"
-            value={appSettings.nexusApiKey}
-            onChange={(event) =>
-              void onUpdateSettings({
-                ...appSettings,
-                nexusApiKey: event.target.value.trim()
-              })
-            }
+            value={nexusApiKeyDraft}
+            onChange={(event) => setNexusApiKeyDraft(event.target.value)}
           />
         </label>
-        <p className={appSettings.nexusApiKey.trim() ? "settings-status connected" : "settings-status"}>
-          {appSettings.nexusApiKey.trim()
+        <div className="settings-key-actions">
+          <button
+            className="secondary-button"
+            disabled={isSavingNexusKey || (!nexusApiKeyDraft.trim() && !appSettings.nexusApiKeyConfigured)}
+            onClick={() => void submitNexusApiKey()}
+            type="button"
+          >
+            {isSavingNexusKey ? "Saving" : nexusApiKeyDraft.trim() ? "Save Key" : "Remove Key"}
+          </button>
+        </div>
+        <p className={appSettings.nexusApiKeyConfigured ? "settings-status connected" : "settings-status"}>
+          {appSettings.nexusApiKeyConfigured
             ? "Nexus install support is enabled for discovered mods."
             : "Nexus results are browse-only until an API key is saved."}
         </p>
@@ -2386,8 +3616,16 @@ function installSuccessDetail(archiveName: string, fileCount: number, warnings: 
   return `${base} ${dependencyNotes.length} dependency package(s) installed automatically.`;
 }
 
-function onlineModTimestamp(mod: OnlineModRecord): number {
-  return Date.parse(mod.updatedAt ?? mod.createdAt ?? "") || 0;
+function nexusNxmReplayKey(rawUrl: string): string | null {
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol.toLowerCase() !== "nxm:") {
+      return null;
+    }
+    return `${parsed.hostname.toLowerCase()}${parsed.pathname}?expires=${parsed.searchParams.get("expires") ?? ""}&user_id=${parsed.searchParams.get("user_id") ?? ""}`;
+  } catch {
+    return null;
+  }
 }
 
 function formatCompactNumber(value: number): string {
@@ -2403,6 +3641,23 @@ function formatFileSize(bytes: number): string {
   }
 
   return `${(bytes / 1024 / 1024).toFixed(bytes >= 100 * 1024 * 1024 ? 0 : 1)} MB`;
+}
+
+function formatOnlineDate(value?: string): string {
+  if (!value) {
+    return "Not provided";
+  }
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return "Not provided";
+  }
+
+  return Intl.DateTimeFormat(undefined, {
+    day: "numeric",
+    month: "short",
+    year: "numeric"
+  }).format(parsed);
 }
 
 function refreshSummary(result: ProfileRefreshResult): string {
@@ -2574,7 +3829,7 @@ function getDetectionIssue(detection: GameDetectionResult | null): string {
     return "UniLoader could not identify the game engine from this folder.";
   }
 
-  if (detection.loader === "none") {
+  if (detection.loader === "none" && detection.expectedModFolders.length === 0) {
     return "UniLoader could not identify a loader route for this folder.";
   }
 

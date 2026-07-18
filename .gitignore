@@ -4,6 +4,7 @@ release/
 src-tauri/target/
 src-tauri/gen/
 screenshots/
+artifacts/
 *.log
 .env
 .DS_Store
