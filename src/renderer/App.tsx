@@ -74,7 +74,7 @@ const defaultAppSettings: AppSettings = {
 };
 
 const defaultThemeId = "neon-circuit";
-const supportPageUrl = "https://www.patreon.com/Chucksterboy";
+const supportPageUrl = "https://ko-fi.com/chucksterboy";
 
 type ViewMode = "manager" | "discover" | "transfer" | "settings";
 type ModSortMode = "newest" | "oldest";

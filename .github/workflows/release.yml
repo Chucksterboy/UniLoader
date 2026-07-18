@@ -50,9 +50,9 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "UniLoader ${{ github.ref_name }}"
           releaseBody: |
-            UniLoader v0.6 adds broader game and loader detection, Steam profile scanning,
-            redesigned profiles and mod discovery, improved Nexus and Thunderstore flows,
-            universal archive handling, and reliability fixes across installation and startup.
+            UniLoader Windows release with broader game and loader detection, Steam profile
+            scanning, redesigned profiles and mod discovery, improved Nexus and Thunderstore
+            flows, universal archive handling, and reliability fixes.
           releaseDraft: false
           prerelease: false
 
