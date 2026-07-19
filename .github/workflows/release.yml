@@ -51,19 +51,15 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "UniLoader ${{ github.ref_name }}"
           releaseBody: |
-            UniLoader v0.9.7 improves future-game and runtime compatibility across the shared
-            provider pipeline. Nexus game identities now use verified provider metadata and aliases,
-            encoded installation instructions are decoded correctly, and nested UE4SS layouts such
-            as RuneScape: Dragonwilds are detected and routed safely.
+            UniLoader v0.9.8 fixes profile bundles that disappeared from the Import dialog after
+            being sent to another PC. The picker now shows transferred files even when a browser,
+            messenger, or duplicate download changes the filename or extension; UniLoader validates
+            the bundle contents before importing it.
 
-            Installed BepInEx, BepInEx IL2CPP, UE4SS, and REFramework runtimes now satisfy
-            game-qualified Nexus requirements without unnecessary reinstall prompts. Stale Nexus
-            browser handoffs belonging to deleted profiles are cleaned up and the newest valid
-            profile request is always used.
-
-            Profile Import / Export is restored for Steam-only mode. Bundles preserve managed mods,
-            enabled states, installation plans, and configuration files, then automatically locate
-            and verify the matching installed Steam game before restoring the profile.
+            Windows icon assets are regenerated from the current gold shield. UniLoader now refreshes
+            the Windows shell icon cache once per app version, and NSIS updates recreate existing
+            desktop and Start menu shortcuts so the desktop, taskbar, and system tray stop retaining
+            older UniLoader artwork after an in-place update.
           releaseDraft: false
           prerelease: false
 

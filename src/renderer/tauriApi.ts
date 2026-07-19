@@ -86,8 +86,7 @@ export const desktopApi: DesktopApi = {
     const bundleSelection = await open({
       directory: false,
       multiple: false,
-      title: "Import UniLoader profile",
-      filters: [{ name: "UniLoader profile bundle", extensions: ["uniloader-profile"] }]
+      title: "Import UniLoader profile"
     });
     const bundlePath = normalizeDialogSelection(bundleSelection);
 

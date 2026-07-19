@@ -4168,6 +4168,7 @@ pub fn run() {
                 return;
             }
 
+            let _ = window.set_icon(APP_ICON.clone());
             let _ = window.show();
             let _ = window.unminimize();
         })
@@ -4181,6 +4182,7 @@ pub fn run() {
                 window.set_icon(APP_ICON.clone())?;
             }
             setup_tray(app, APP_ICON.clone())?;
+            refresh_windows_shell_icons_once(app.handle());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -4249,6 +4251,39 @@ fn reveal_main_window(app: &AppHandle) {
         let _ = window.set_focus();
     }
 }
+
+#[cfg(windows)]
+fn refresh_windows_shell_icons_once(app: &AppHandle) {
+    use windows_sys::Win32::UI::Shell::{SHChangeNotify, SHCNE_ASSOCCHANGED, SHCNF_IDLIST};
+
+    let Ok(app_data_dir) = app.path().app_data_dir() else {
+        return;
+    };
+    let marker_path = app_data_dir.join("shell-icon-version.txt");
+    let current_version = env!("CARGO_PKG_VERSION");
+    if fs::read_to_string(&marker_path)
+        .map(|value| value.trim() == current_version)
+        .unwrap_or(false)
+    {
+        return;
+    }
+
+    unsafe {
+        SHChangeNotify(
+            SHCNE_ASSOCCHANGED as i32,
+            SHCNF_IDLIST,
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+    }
+
+    if fs::create_dir_all(&app_data_dir).is_ok() {
+        let _ = fs::write(marker_path, format!("{current_version}\n"));
+    }
+}
+
+#[cfg(not(windows))]
+fn refresh_windows_shell_icons_once(_app: &AppHandle) {}
 
 fn setup_tray(app: &mut tauri::App, icon: tauri::image::Image<'static>) -> tauri::Result<()> {
     let show_item = MenuItem::with_id(app, "tray-show", "Show UniLoader", true, None::<&str>)?;
@@ -18739,6 +18774,8 @@ mod tests {
         assert_eq!(exported.exported_mods, 1);
         assert_eq!(exported.exported_config_files, 1);
         assert!(exported.warnings.is_empty());
+        let transferred_bundle_path = root.join("Shared Profile Download.zip");
+        fs::copy(&bundle_path, &transferred_bundle_path).unwrap();
 
         let installed_game = SteamGameRecord {
             app_id: "3041230".to_string(),
@@ -18746,13 +18783,16 @@ mod tests {
             install_dir: target_game.to_string_lossy().to_string(),
             library_path: steam_library.to_string_lossy().to_string(),
         };
-        let resolved =
-            resolve_profile_bundle_steam_game(&bundle_path, std::slice::from_ref(&installed_game))
-                .unwrap();
+        let resolved = resolve_profile_bundle_steam_game(
+            &transferred_bundle_path,
+            std::slice::from_ref(&installed_game),
+        )
+        .unwrap();
         assert_eq!(resolved.app_id, installed_game.app_id);
         assert!(resolve_profile_bundle_steam_game(&bundle_path, &[]).is_err());
 
-        let imported = import_profile_bundle_impl(&root, &bundle_path, &target_game).unwrap();
+        let imported =
+            import_profile_bundle_impl(&root, &transferred_bundle_path, &target_game).unwrap();
         assert_eq!(imported.profile.steam_app_id.as_deref(), Some("3041230"));
         assert_eq!(imported.installed_mods.len(), 1);
         assert_eq!(imported.config_files_written.len(), 1);
