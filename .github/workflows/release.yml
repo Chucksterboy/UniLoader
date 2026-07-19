@@ -51,15 +51,13 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "UniLoader ${{ github.ref_name }}"
           releaseBody: |
-            UniLoader v0.9.5 adds live Steam game process detection to the Library launch control.
-            The button now shows Launching while Steam starts the selected game, changes to a
-            subdued Launched state once the game process is confirmed, and automatically restores
-            the launch action after the game closes.
+            UniLoader v0.9.6 fixes false missing-file warnings after launching a game with Mods OFF.
+            Files deliberately parked for a clean launch are now tracked as safely suspended, while
+            genuinely missing files continue to trigger a health warning.
 
-            This release also gives the installed-mod Library a stable seven-row maximum viewport
-            with a visible themed scrollbar, adds the compact installed-mod rail to Discovery,
-            improves profile-card behavior, expands safe route and dependency learning, and keeps
-            localization resources out of the configuration editor.
+            This release also improves the profile expand controls and explicitly applies the new
+            Vault shield artwork to the application window and system tray. The Windows shortcut,
+            taskbar, tray, executable, and installer now use the same current icon.
           releaseDraft: false
           prerelease: false
 

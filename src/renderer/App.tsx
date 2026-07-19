@@ -2027,7 +2027,7 @@ export function App() {
                       title={isExpanded ? "Hide profile controls" : "Show profile controls"}
                       type="button"
                     >
-                      {isExpanded ? <ChevronUp size={18} /> : <ChevronDown size={18} />}
+                      <ChevronDown aria-hidden="true" size={18} />
                     </button>
                   </div>
                   {isExpanded ? (
@@ -4197,6 +4197,10 @@ function refreshSummary(result: ProfileRefreshResult): string {
     (total, health) => total + health.missingFiles.length,
     0
   );
+  const suspendedFileCount = result.modFileHealth.reduce(
+    (total, health) => total + (health.suspendedFiles?.length ?? 0),
+    0
+  );
   const parts = [
     `Checked ${result.installedMods.length} mod(s) and ${configFileCount} config file(s).`
   ];
@@ -4215,6 +4219,12 @@ function refreshSummary(result: ProfileRefreshResult): string {
 
   if (missingFileCount > 0) {
     parts.push(`${missingFileCount} expected installed file(s) are missing.`);
+  }
+
+  if (suspendedFileCount > 0) {
+    parts.push(
+      `${suspendedFileCount} mod file(s) are safely suspended for a clean launch.`
+    );
   }
 
   if (result.missingDependencies.length > 0) {

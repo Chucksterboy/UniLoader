@@ -354,6 +354,7 @@ export interface ModFileHealth {
   modName: string;
   checkedFiles: number;
   missingFiles: string[];
+  suspendedFiles: string[];
 }
 
 export interface ProfileRefreshResult {

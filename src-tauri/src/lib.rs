@@ -67,6 +67,7 @@ const GITHUB_API_BASE: &str = "https://api.github.com/repos";
 const APP_UPDATE_REPOSITORY: &str = "Chucksterboy/UniLoader";
 const BEPINBUILDS_BASE: &str = "https://builds.bepinex.dev";
 const BEPINBUILDS_BEPINEX_BE: &str = "https://builds.bepinex.dev/projects/bepinex_be";
+const APP_ICON: tauri::image::Image<'static> = tauri::include_image!("./icons/icon.png");
 const GAME_DEFINITIONS_JSON: &str = include_str!("game_definitions.json");
 const RUNTIME_DEFINITIONS_JSON: &str = include_str!("runtime_definitions.json");
 const NEXUS_KEYRING_SERVICE: &str = "UniLoader";
@@ -906,6 +907,8 @@ pub struct ModFileHealth {
     mod_name: String,
     checked_files: usize,
     missing_files: Vec<String>,
+    #[serde(default)]
+    suspended_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2056,6 +2059,7 @@ fn refresh_profile_sync(
     let adopted_native_script_mods =
         adopt_existing_native_script_mods(&root, &profile, &mut installed_store)?;
     ensure_visible_runtime_records(&root, &profile, &mut installed_store)?;
+    let launch_suspension = read_profile_launch_suspension(&root, &profile.id)?;
     let mut mod_file_health = Vec::new();
     let mut missing_dependencies = Vec::new();
     let mut dependency_keys = HashSet::new();
@@ -2090,7 +2094,7 @@ fn refresh_profile_sync(
             );
         }
 
-        mod_file_health.push(mod_file_health_for_record(record));
+        mod_file_health.push(mod_file_health_for_record(record, &launch_suspension));
     }
 
     write_store(&installed_mods_file, &installed_store).map_err(error_to_string)?;
@@ -4082,7 +4086,10 @@ pub fn run() {
                 use tauri_plugin_deep_link::DeepLinkExt;
                 app.deep_link().register_all()?;
             }
-            setup_tray(app)?;
+            if let Some(window) = app.get_webview_window("main") {
+                window.set_icon(APP_ICON.clone())?;
+            }
+            setup_tray(app, APP_ICON.clone())?;
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -4152,14 +4159,15 @@ fn reveal_main_window(app: &AppHandle) {
     }
 }
 
-fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
+fn setup_tray(app: &mut tauri::App, icon: tauri::image::Image<'static>) -> tauri::Result<()> {
     let show_item = MenuItem::with_id(app, "tray-show", "Show UniLoader", true, None::<&str>)?;
     let hide_item = MenuItem::with_id(app, "tray-hide", "Hide to tray", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "tray-quit", "Quit UniLoader", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
     let menu = Menu::with_items(app, &[&show_item, &hide_item, &separator, &quit_item])?;
 
-    let mut tray = TrayIconBuilder::with_id("main")
+    let tray = TrayIconBuilder::with_id("main")
+        .icon(icon)
         .tooltip("UniLoader")
         .menu(&menu)
         .show_menu_on_left_click(false)
@@ -4187,10 +4195,6 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
                 reveal_main_window(tray.app_handle());
             }
         });
-
-    if let Some(icon) = app.default_window_icon().cloned() {
-        tray = tray.icon(icon);
-    }
 
     let tray_icon = tray.build(app)?;
     app.manage(tray_icon);
@@ -11005,22 +11009,35 @@ fn dependency_key(dependency: &DependencySpec) -> String {
     )
 }
 
-fn mod_file_health_for_record(record: &InstalledModRecord) -> ModFileHealth {
+fn mod_file_health_for_record(
+    record: &InstalledModRecord,
+    launch_suspension: &ProfileLaunchSuspension,
+) -> ModFileHealth {
     let checked_files = if record.enabled {
         record.files_written.len()
     } else {
         0
     };
-    let missing_files = if record.enabled {
-        record
-            .files_written
+    let intentionally_suspended = record.enabled
+        && launch_suspension
+            .mods
             .iter()
-            .filter(|path| !Path::new(path).exists())
-            .cloned()
-            .collect()
-    } else {
-        Vec::new()
-    };
+            .any(|suspended| suspended.mod_id == record.id);
+    let mut missing_files = Vec::new();
+    let mut suspended_files = Vec::new();
+
+    if record.enabled {
+        for path in &record.files_written {
+            if Path::new(path).exists() {
+                continue;
+            }
+            if intentionally_suspended {
+                suspended_files.push(path.clone());
+            } else {
+                missing_files.push(path.clone());
+            }
+        }
+    }
 
     ModFileHealth {
         installed_mod_id: record.id.clone(),
@@ -11031,6 +11048,7 @@ fn mod_file_health_for_record(record: &InstalledModRecord) -> ModFileHealth {
             .unwrap_or_else(|| humanize_mod_display_name(&record.archive_name)),
         checked_files,
         missing_files,
+        suspended_files,
     }
 }
 
@@ -16375,6 +16393,25 @@ mod tests {
         assert!(suspended_store.items[0].enabled);
         assert!(!suspended_store.items[1].enabled);
         assert!(suspended_store.items[2].enabled);
+
+        let suspension = read_profile_launch_suspension(&store_root, &profile.id).unwrap();
+        let suspended_health = mod_file_health_for_record(&suspended_store.items[0], &suspension);
+        assert!(suspended_health.missing_files.is_empty());
+        assert_eq!(
+            suspended_health.suspended_files,
+            vec![enabled_file.to_string_lossy().to_string()]
+        );
+
+        let genuinely_missing_file = game_root.join("Mods/genuinely-missing.dll");
+        let genuinely_missing_record =
+            record("genuinely-missing", &genuinely_missing_file, true, None);
+        let genuinely_missing_health =
+            mod_file_health_for_record(&genuinely_missing_record, &suspension);
+        assert_eq!(
+            genuinely_missing_health.missing_files,
+            vec![genuinely_missing_file.to_string_lossy().to_string()]
+        );
+        assert!(genuinely_missing_health.suspended_files.is_empty());
 
         assert_eq!(
             prepare_profile_mod_launch(&store_root, &profile, true).unwrap(),
