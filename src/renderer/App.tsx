@@ -3953,8 +3953,8 @@ function TransferView({
             <>
               <div className="transfer-steps">
                 <span>1. Choose a `.uniloader-profile` bundle.</span>
-                <span>2. Select the matching game install folder.</span>
-                <span>3. UniLoader recreates the profile and deploys enabled mods.</span>
+                <span>2. UniLoader finds and verifies the matching installed Steam game.</span>
+                <span>3. The profile, enabled mods, and configuration files are restored.</span>
               </div>
               <button
                 className="primary-button transfer-action"

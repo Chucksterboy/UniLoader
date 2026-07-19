@@ -79,6 +79,7 @@ static THUNDERSTORE_CACHE: OnceLock<Mutex<HashMap<String, ThunderstoreCacheEntry
     OnceLock::new();
 static PROVIDER_MAPPING_CACHE: OnceLock<Mutex<HashMap<String, ProviderMappingCacheEntry>>> =
     OnceLock::new();
+static NEXUS_GAME_ID_CACHE: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
 static PROFILE_RUNTIME_INFERENCE_CACHE: OnceLock<
     Mutex<HashMap<String, RuntimeInferenceCacheEntry>>,
 > = OnceLock::new();
@@ -398,6 +399,13 @@ struct NexusGameNode {
     #[serde(default)]
     id: Option<u64>,
     name: String,
+    domain_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct NexusGameDetails {
+    id: u64,
+    #[serde(default)]
     domain_name: String,
 }
 
@@ -1982,6 +1990,11 @@ fn remove_profile(app: AppHandle, profile_id: String) -> Result<ProfileActionRes
     }
 
     let mut warnings = Vec::new();
+    if let Err(error) = remove_pending_nexus_downloads_for_profile(&root, &profile.id) {
+        warnings.push(format!(
+            "Profile was removed, but UniLoader could not clear its pending Nexus downloads: {error}"
+        ));
+    }
     let profile_data_dir = profile_dir(&root, &profile.id);
     if profile_data_dir.exists() {
         if let Err(error) = fs::remove_dir_all(&profile_data_dir) {
@@ -2216,6 +2229,7 @@ async fn export_profile_bundle(
     output_path: String,
 ) -> Result<ProfileExportResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _operation = lock_mutations()?;
         let root = store_root(&app)?;
         export_profile_bundle_impl(&root, &profile_id, Path::new(&output_path))
     })
@@ -2225,11 +2239,32 @@ async fn export_profile_bundle(
 
 #[tauri::command]
 async fn import_profile_bundle(
-    _app: AppHandle,
-    _bundle_path: String,
-    _game_path: String,
+    app: AppHandle,
+    bundle_path: String,
 ) -> Result<ProfileImportResult, String> {
-    Err("Profile imports are not available in Steam-only mode.".to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation = lock_mutations()?;
+        let root = store_root(&app)?;
+        let game = resolve_profile_bundle_steam_game(
+            Path::new(&bundle_path),
+            &scan_steam_games_impl(),
+        )?;
+        let profiles = read_store::<GameProfile>(&profiles_path(&root)).map_err(error_to_string)?;
+        if profiles.items.iter().any(|profile| {
+            profile.steam_app_id.as_deref() == Some(game.app_id.as_str())
+                || normalize_filesystem_identity(&profile.game_path)
+                    == normalize_filesystem_identity(&game.install_dir)
+        }) {
+            return Err(format!(
+                "{} already has a UniLoader profile. Remove the existing profile before importing a replacement bundle.",
+                game.name
+            ));
+        }
+
+        import_profile_bundle_impl(&root, Path::new(&bundle_path), Path::new(&game.install_dir))
+    })
+    .await
+    .map_err(error_to_string)?
 }
 
 fn profile_dependency_candidates(
@@ -2535,6 +2570,49 @@ fn export_profile_bundle_impl(
         exported_config_files: manifest.config_files.len(),
         warnings,
     })
+}
+
+fn resolve_profile_bundle_steam_game(
+    bundle_path: &Path,
+    installed_games: &[SteamGameRecord],
+) -> Result<SteamGameRecord, String> {
+    if !bundle_path.is_file() {
+        return Err(format!(
+            "Profile bundle does not exist: {}",
+            bundle_path.to_string_lossy()
+        ));
+    }
+
+    let bundle_file = File::open(bundle_path).map_err(error_to_string)?;
+    let mut zip = ZipArchive::new(bundle_file).map_err(error_to_string)?;
+    validate_zip_archive_safety(&mut zip)?;
+    let manifest = read_bundle_manifest(&mut zip)?;
+    if manifest.schema_version != 1 {
+        return Err(format!(
+            "Unsupported profile bundle version: {}",
+            manifest.schema_version
+        ));
+    }
+    let steam_app_id = manifest
+        .profile
+        .steam_app_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "This profile bundle predates Steam-only profiles and cannot be verified safely."
+                .to_string()
+        })?;
+
+    installed_games
+        .iter()
+        .find(|game| game.app_id == steam_app_id && Path::new(&game.install_dir).is_dir())
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "The matching Steam game is not installed. Install Steam App {steam_app_id}, then import this profile again."
+            )
+        })
 }
 
 #[allow(dead_code)]
@@ -3287,8 +3365,15 @@ async fn preflight_discovered_mod_install(
 
         let (domain, nexus_mod_id) = parse_nexus_online_mod_id(&mod_id)?;
         verified_discovery_provider_game(&profile, "nexus", Some(&domain), Some(&domain))?;
+        let settings = read_app_settings(&root)?;
         let client = provider_client()?;
-        let requirements = fetch_nexus_mod_requirements(&client, &domain, nexus_mod_id)?;
+        let requirements = fetch_nexus_mod_requirements(
+            &client,
+            &profile,
+            &domain,
+            nexus_mod_id,
+            settings.nexus_api_key(),
+        )?;
         let dependencies = nexus_requirement_dependencies(&profile, &domain, &requirements)
             .into_iter()
             .map(|dependency| refresh_dependency_status(&root, &profile, &dependency))
@@ -3348,7 +3433,13 @@ async fn begin_nexus_requirement_download(
             Some(&domain),
         )?;
         let client = provider_client()?;
-        let nested_requirements = fetch_nexus_mod_requirements(&client, &domain, nexus_mod_id)?;
+        let nested_requirements = fetch_nexus_mod_requirements(
+            &client,
+            &profile,
+            &domain,
+            nexus_mod_id,
+            Some(api_key),
+        )?;
         let missing_confirmation_dependency =
             nexus_requirement_dependencies(&profile, &domain, &nested_requirements)
         .into_iter()
@@ -4837,7 +4928,11 @@ fn score_loaders(
             );
         }
 
-        if lower_path.contains("/binaries/win64/mods") || lower_path.starts_with("mods/") {
+        if lower_path.contains("/binaries/win64/mods")
+            || lower_path.contains("/binaries/win64/ue4ss/mods")
+            || lower_path.starts_with("mods/")
+            || lower_path.starts_with("ue4ss/mods/")
+        {
             add_score(
                 scores,
                 signals,
@@ -4918,8 +5013,9 @@ fn prepare_mod_routes(
     }
 
     if supports("ue4ss") {
-        for win64_root in find_unreal_win64_dirs(entries) {
-            push_unique_route(&mut routes, &format!("{}/Mods", win64_root));
+        let win64_roots = find_unreal_win64_dirs(entries);
+        for route in ue4ss_mod_routes_for_entries(entries, &win64_roots) {
+            push_unique_route(&mut routes, &route);
         }
     }
 
@@ -5003,8 +5099,47 @@ fn find_unreal_win64_dirs(entries: &[ProbeEntry]) -> Vec<String> {
         .collect::<Vec<_>>();
 
     roots.sort();
-    roots.dedup();
+    roots.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
     roots
+}
+
+fn ue4ss_mod_routes_for_entries(entries: &[ProbeEntry], win64_roots: &[String]) -> Vec<String> {
+    let mut routes = Vec::new();
+
+    for win64_root in win64_roots {
+        let nested_root = format!("{win64_root}/ue4ss");
+        let nested_mods = format!("{nested_root}/Mods");
+        let legacy_mods = format!("{win64_root}/Mods");
+        let has_nested_layout = probe_directory_exists(entries, &nested_root)
+            || probe_directory_exists(entries, &nested_mods);
+
+        if has_nested_layout {
+            push_unique_route(&mut routes, &nested_mods);
+            if probe_route_has_descendants(entries, &legacy_mods) {
+                push_unique_route(&mut routes, &legacy_mods);
+            }
+        } else {
+            push_unique_route(&mut routes, &legacy_mods);
+        }
+    }
+
+    routes
+}
+
+fn probe_directory_exists(entries: &[ProbeEntry], route: &str) -> bool {
+    entries.iter().any(|entry| {
+        entry.is_directory
+            && normalize_archive_path(&entry.relative_path).eq_ignore_ascii_case(route)
+    })
+}
+
+fn probe_route_has_descendants(entries: &[ProbeEntry], route: &str) -> bool {
+    let prefix = format!("{}/", normalize_archive_path(route).to_lowercase());
+    entries.iter().any(|entry| {
+        normalize_archive_path(&entry.relative_path)
+            .to_lowercase()
+            .starts_with(&prefix)
+    })
 }
 
 fn native_script_routes_for_detection(
@@ -5814,38 +5949,53 @@ fn ue4ss_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<Install
     let files = installable_files(&scanned.entries);
     let mut mappings = Vec::new();
     let mut warnings = Vec::new();
+    let mut summary_targets = Vec::new();
     let mod_folder_name = archive_stem(&scanned.archive_name);
-    let target_roots = ue4ss_target_roots(profile);
+    let (target_roots, mod_target_dirs) = ue4ss_install_targets(profile);
 
     for file in &files {
         let lower_path = file.logical_path.to_lowercase();
-        let (target_suffix, reason) = if is_ue4ss_root_runtime_file(&file.logical_path) {
-            (
-                Some(basename(&file.logical_path)),
-                "UE4SS runtime bootstrap file.",
-            )
-        } else if lower_path.starts_with("mods/") {
-            (Some(file.logical_path.clone()), "UE4SS Mods folder.")
-        } else if lower_path.starts_with("ue4ss/") {
-            (
-                Some(file.logical_path.clone()),
-                "UE4SS runtime or configuration files.",
-            )
-        } else if lower_path.contains("/scripts/") || lower_path.ends_with(".lua") {
-            (
-                Some(format!("Mods/{}/{}", mod_folder_name, file.logical_path)),
-                "UE4SS script file.",
-            )
-        } else {
-            (None, "")
-        };
-        if let Some(target_suffix) = target_suffix {
+        if is_ue4ss_root_runtime_file(&file.logical_path) {
             for target_root in &target_roots {
+                push_unique_route(&mut summary_targets, target_root);
                 mappings.push(mapping(
                     &file.path,
                     "game",
-                    &format!("{target_root}/{target_suffix}"),
-                    reason,
+                    &format!("{target_root}/{}", basename(&file.logical_path)),
+                    "UE4SS runtime bootstrap file.",
+                ));
+            }
+        } else if let Some(target_suffix) =
+            strip_prefix_ignore_ascii_case(&file.logical_path, "ue4ss/mods/")
+                .or_else(|| strip_prefix_ignore_ascii_case(&file.logical_path, "mods/"))
+        {
+            for target_dir in &mod_target_dirs {
+                push_unique_route(&mut summary_targets, target_dir);
+                mappings.push(mapping(
+                    &file.path,
+                    "game",
+                    &format!("{target_dir}/{target_suffix}"),
+                    "UE4SS Mods folder.",
+                ));
+            }
+        } else if lower_path.starts_with("ue4ss/") {
+            for target_root in &target_roots {
+                push_unique_route(&mut summary_targets, target_root);
+                mappings.push(mapping(
+                    &file.path,
+                    "game",
+                    &format!("{target_root}/{}", file.logical_path),
+                    "UE4SS runtime or configuration files.",
+                ));
+            }
+        } else if lower_path.contains("/scripts/") || lower_path.ends_with(".lua") {
+            for target_dir in &mod_target_dirs {
+                push_unique_route(&mut summary_targets, target_dir);
+                mappings.push(mapping(
+                    &file.path,
+                    "game",
+                    &format!("{target_dir}/{mod_folder_name}/{}", file.logical_path),
+                    "UE4SS script file.",
                 ));
             }
         }
@@ -5888,7 +6038,7 @@ fn ue4ss_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<Install
         summary: format!(
             "Install {} file(s) into {}.",
             mappings.len(),
-            join_human_list(&target_roots)
+            join_human_list(&summary_targets)
         ),
         mappings,
         dependencies: vec![known_runtime_dependency(profile, "ue4ss")],
@@ -8207,14 +8357,7 @@ fn extract_install_route_candidates(
 }
 
 fn provider_text_for_route_scan(text: &str) -> String {
-    let decoded = text
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&#92;", "\\")
-        .replace("&nbsp;", " ")
-        .replace("&amp;", "&");
+    let decoded = decode_provider_html_entities(text);
     let characters = decoded.chars().collect::<Vec<_>>();
     let mut output = String::with_capacity(decoded.len());
     let mut index = 0usize;
@@ -8266,6 +8409,53 @@ fn provider_text_for_route_scan(text: &str) -> String {
         index = end + 1;
     }
     output
+}
+
+fn decode_provider_html_entities(value: &str) -> String {
+    let mut decoded = String::with_capacity(value.len());
+    let mut cursor = 0usize;
+
+    while let Some(relative_start) = value[cursor..].find('&') {
+        let start = cursor + relative_start;
+        decoded.push_str(&value[cursor..start]);
+        let Some(relative_end) = value[start + 1..].find(';') else {
+            decoded.push_str(&value[start..]);
+            return decoded;
+        };
+        let end = start + 1 + relative_end;
+        let entity = &value[start + 1..end];
+        if entity.len() <= 16 {
+            if let Some(character) = decode_provider_html_entity(entity) {
+                decoded.push(character);
+                cursor = end + 1;
+                continue;
+            }
+        }
+
+        decoded.push('&');
+        cursor = start + 1;
+    }
+
+    decoded.push_str(&value[cursor..]);
+    decoded
+}
+
+fn decode_provider_html_entity(entity: &str) -> Option<char> {
+    match entity.to_ascii_lowercase().as_str() {
+        "amp" => Some('&'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "nbsp" => Some(' '),
+        numeric if numeric.starts_with("#x") => u32::from_str_radix(&numeric[2..], 16)
+            .ok()
+            .and_then(char::from_u32),
+        numeric if numeric.starts_with('#') => {
+            numeric[1..].parse::<u32>().ok().and_then(char::from_u32)
+        }
+        _ => None,
+    }
 }
 
 fn is_provider_html_tag(tag_name: &str) -> bool {
@@ -8341,6 +8531,7 @@ fn normalize_install_route_candidate(
         })
         .trim_start_matches("./")
         .trim_start_matches('/')
+        .trim_end_matches('.')
         .to_string();
 
     if normalized.starts_with('<') {
@@ -8462,6 +8653,11 @@ fn canonical_install_route(parts: &[String]) -> Option<(String, String)> {
     {
         return Some((parts[..=index + 1].join("/"), "script-files".to_string()));
     }
+    if let Some(index) = lower.windows(4).position(|parts| {
+        parts[0] == "binaries" && parts[1] == "win64" && parts[2] == "ue4ss" && parts[3] == "mods"
+    }) {
+        return Some((parts[..=index + 3].join("/"), "ue4ss".to_string()));
+    }
     if let Some(index) = lower
         .windows(3)
         .position(|parts| parts[0] == "binaries" && parts[1] == "win64" && parts[2] == "mods")
@@ -8503,10 +8699,16 @@ fn validate_learned_route_shape(adapter_id: &str, relative_path: &str) -> bool {
                 && parts[parts.len() - 1] == "mods"
         }
         "ue4ss" => {
-            parts.len() >= 3
+            let legacy = parts.len() >= 3
                 && parts[parts.len() - 3] == "binaries"
                 && parts[parts.len() - 2] == "win64"
-                && parts[parts.len() - 1] == "mods"
+                && parts[parts.len() - 1] == "mods";
+            let nested = parts.len() >= 4
+                && parts[parts.len() - 4] == "binaries"
+                && parts[parts.len() - 3] == "win64"
+                && parts[parts.len() - 2] == "ue4ss"
+                && parts[parts.len() - 1] == "mods";
+            legacy || nested
         }
         "bepinex" => {
             parts.len() >= 2
@@ -9368,6 +9570,20 @@ fn fetch_nexus_mod_page_with_sort(
 }
 
 fn fetch_nexus_game_domain_by_name(client: &Client, name: &str) -> Option<String> {
+    let nodes = fetch_nexus_games_by_name(client, name)?;
+    let normalized_name = compact_provider_slug(name);
+    nodes.into_iter().find_map(|node| {
+        let node_name = compact_provider_slug(&node.name);
+        let node_domain = compact_provider_slug(&node.domain_name);
+        if node_name == normalized_name || node_domain == normalized_name {
+            Some(node.domain_name)
+        } else {
+            None
+        }
+    })
+}
+
+fn fetch_nexus_games_by_name(client: &Client, name: &str) -> Option<Vec<NexusGameNode>> {
     const NEXUS_GAME_QUERY: &str = r#"
         query UniLoaderDiscoverGame(
           $filter: GamesSearchFilter,
@@ -9411,77 +9627,92 @@ fn fetch_nexus_game_domain_by_name(client: &Client, name: &str) -> Option<String
         return None;
     }
 
-    let normalized_name = compact_provider_slug(name);
-    response.data?.games.nodes.into_iter().find_map(|node| {
-        let node_name = compact_provider_slug(&node.name);
-        let node_domain = compact_provider_slug(&node.domain_name);
-        if node_name == normalized_name || node_domain == normalized_name {
-            Some(node.domain_name)
-        } else {
-            None
-        }
-    })
+    Some(response.data?.games.nodes)
 }
 
-fn fetch_nexus_game_id_for_domain(client: &Client, domain: &str) -> Result<u64, String> {
-    const NEXUS_GAME_ID_QUERY: &str = r#"
-        query UniLoaderResolveGameId(
-          $filter: GamesSearchFilter,
-          $sort: [GamesSearchSort!],
-          $offset: Int,
-          $count: Int
-        ) {
-          games(filter: $filter, sort: $sort, offset: $offset, count: $count) {
-            nodes {
-              id
-              name
-              domainName
-            }
-          }
-        }
-    "#;
-    let body = serde_json::json!({
-        "query": NEXUS_GAME_ID_QUERY,
-        "variables": {
-            "filter": {
-                "name": [{ "value": readable_provider_text(domain), "op": "MATCHES" }]
-            },
-            "sort": [{ "relevance": { "direction": "DESC" } }],
-            "offset": 0,
-            "count": 25
-        }
-    });
-    let response = client
-        .post(NEXUS_GRAPHQL_API_BASE)
-        .json(&body)
-        .send()
-        .map_err(error_to_string)?
-        .error_for_status()
-        .map_err(error_to_string)?
-        .json::<NexusGamesGraphqlResponse>()
-        .map_err(error_to_string)?;
-    if !response.errors.is_empty() {
-        return Err(response
-            .errors
-            .into_iter()
-            .map(|error| error.message)
-            .collect::<Vec<_>>()
-            .join("; "));
+fn nexus_game_lookup_names(profile: &GameProfile, domain: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut seen = HashSet::new();
+
+    for alias in provider_name_aliases(&compact_provider_slug(domain)) {
+        push_unique_string(&mut names, &mut seen, alias);
     }
+    for name in provider_name_candidates(profile) {
+        push_unique_string(&mut names, &mut seen, name);
+    }
+    push_unique_string(&mut names, &mut seen, profile.name.clone());
+    push_unique_string(&mut names, &mut seen, readable_provider_text(domain));
+    names
+}
+
+fn fetch_nexus_game_id_for_domain(
+    client: &Client,
+    profile: &GameProfile,
+    domain: &str,
+    api_key: Option<&str>,
+) -> Result<u64, String> {
     let normalized_domain = compact_provider_slug(domain);
-    response
-        .data
-        .into_iter()
-        .flat_map(|data| data.games.nodes)
-        .find(|node| compact_provider_slug(&node.domain_name) == normalized_domain)
-        .and_then(|node| node.id)
-        .ok_or_else(|| format!("Nexus Mods did not return a game id for '{domain}'."))
+    if let Ok(cache) = NEXUS_GAME_ID_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        if let Some(game_id) = cache.get(&normalized_domain) {
+            return Ok(*game_id);
+        }
+    }
+
+    if let Some(api_key) = api_key {
+        let direct_url = format!(
+            "https://api.nexusmods.com/v1/games/{}.json",
+            sanitize_url_path_segment(domain)
+        );
+        if let Ok(response) = nexus_api_get(client, &direct_url, api_key).send() {
+            if let Ok(response) = response.error_for_status() {
+                if let Ok(details) = response.json::<NexusGameDetails>() {
+                    let returned_domain = compact_provider_slug(&details.domain_name);
+                    if returned_domain.is_empty() || returned_domain == normalized_domain {
+                        cache_nexus_game_id(&normalized_domain, details.id);
+                        return Ok(details.id);
+                    }
+                }
+            }
+        }
+    }
+
+    for name in nexus_game_lookup_names(profile, domain) {
+        let Some(nodes) = fetch_nexus_games_by_name(client, &name) else {
+            continue;
+        };
+        if let Some(game_id) = nodes
+            .into_iter()
+            .find(|node| compact_provider_slug(&node.domain_name) == normalized_domain)
+            .and_then(|node| node.id)
+        {
+            cache_nexus_game_id(&normalized_domain, game_id);
+            return Ok(game_id);
+        }
+    }
+
+    Err(format!(
+        "Nexus Mods could not resolve the game catalogue id for '{domain}'. Refresh Discovery and try again."
+    ))
+}
+
+fn cache_nexus_game_id(domain: &str, game_id: u64) {
+    if let Ok(mut cache) = NEXUS_GAME_ID_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        cache.insert(domain.to_string(), game_id);
+    }
 }
 
 fn fetch_nexus_mod_requirements(
     client: &Client,
+    profile: &GameProfile,
     domain: &str,
     mod_id: u64,
+    api_key: Option<&str>,
 ) -> Result<Vec<NexusRequirement>, String> {
     const NEXUS_REQUIREMENTS_QUERY: &str = r#"
         query UniLoaderModRequirements($filter: ModsFilter, $count: Int) {
@@ -9505,7 +9736,7 @@ fn fetch_nexus_mod_requirements(
           }
         }
     "#;
-    let game_id = fetch_nexus_game_id_for_domain(client, domain)?;
+    let game_id = fetch_nexus_game_id_for_domain(client, profile, domain, api_key)?;
     let body = serde_json::json!({
         "query": NEXUS_REQUIREMENTS_QUERY,
         "variables": {
@@ -9561,8 +9792,7 @@ fn nexus_requirement_dependencies(
             dependency.notes = requirement.notes.clone().or(dependency.notes);
             dependency
         } else if !requirement.external_requirement {
-            let domain = non_empty_string(requirement.game_id.trim())
-                .unwrap_or_else(|| parent_domain.to_string());
+            let domain = nexus_requirement_domain(requirement, parent_domain);
             let Ok(mod_id) = requirement.mod_id.trim().parse::<u64>() else {
                 continue;
             };
@@ -9596,6 +9826,38 @@ fn nexus_requirement_dependencies(
     }
 
     dependencies
+}
+
+fn nexus_requirement_domain(requirement: &NexusRequirement, parent_domain: &str) -> String {
+    if let Ok(url) = url::Url::parse(requirement.url.trim()) {
+        let segments = url
+            .path_segments()
+            .map(|segments| {
+                segments
+                    .filter(|segment| !segment.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let domain_index = usize::from(segments.first().is_some_and(|segment| *segment == "games"));
+        if segments
+            .get(domain_index + 1)
+            .is_some_and(|segment| *segment == "mods")
+        {
+            if let Some(domain) = segments.get(domain_index) {
+                return sanitize_url_path_segment(domain);
+            }
+        }
+    }
+
+    let provider_game_id = requirement.game_id.trim();
+    if provider_game_id
+        .chars()
+        .any(|character| character.is_ascii_alphabetic())
+    {
+        return sanitize_url_path_segment(provider_game_id);
+    }
+
+    parent_domain.to_string()
 }
 
 fn nexus_requirement_is_optional(requirement: &NexusRequirement) -> bool {
@@ -9708,6 +9970,7 @@ fn clean_nexus_summary(summary: Option<String>) -> String {
         return String::new();
     };
 
+    let raw_summary = decode_provider_html_entities(&raw_summary);
     let mut cleaned = String::new();
     let mut skipping_html = false;
     let mut skipping_bbcode = false;
@@ -9723,15 +9986,7 @@ fn clean_nexus_summary(summary: Option<String>) -> String {
         }
     }
 
-    let decoded = cleaned
-        .replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&nbsp;", " ");
-
-    decoded.split_whitespace().collect::<Vec<_>>().join(" ")
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn non_empty_string(value: &str) -> Option<String> {
@@ -10033,7 +10288,8 @@ fn install_resolved_nexus_file(
         .join("\n"),
     };
     let provided_runtime = runtime_id_for_provider_package(profile, "nexus", None, &mod_name);
-    let requirements = fetch_nexus_mod_requirements(client, domain, nexus_mod_id)?;
+    let requirements =
+        fetch_nexus_mod_requirements(client, profile, domain, nexus_mod_id, Some(api_key))?;
     let mut dependencies = nexus_requirement_dependencies(profile, domain, &requirements);
     append_unique_dependencies(
         &mut dependencies,
@@ -10335,8 +10591,7 @@ fn store_pending_nexus_download(
     let mut store = read_store::<PendingNexusDownload>(&path).map_err(error_to_string)?;
     store.items.retain(|existing| {
         pending_nexus_download_is_fresh(existing, now)
-            && !(existing.profile_id == pending.profile_id
-                && existing.domain.eq_ignore_ascii_case(&pending.domain)
+            && !(existing.domain.eq_ignore_ascii_case(&pending.domain)
                 && existing.mod_id == pending.mod_id
                 && existing.file_id == pending.file_id)
     });
@@ -10350,11 +10605,19 @@ fn find_pending_nexus_download(
 ) -> Result<PendingNexusDownload, String> {
     let path = pending_nexus_downloads_path(store_root);
     let mut store = read_store::<PendingNexusDownload>(&path).map_err(error_to_string)?;
+    let profiles =
+        read_store::<GameProfile>(&profiles_path(store_root)).map_err(error_to_string)?;
+    let profile_ids = profiles
+        .items
+        .iter()
+        .map(|profile| profile.id.as_str())
+        .collect::<HashSet<_>>();
     let now = Utc::now().timestamp();
     let original_len = store.items.len();
-    store
-        .items
-        .retain(|pending| pending_nexus_download_is_fresh(pending, now));
+    store.items.retain(|pending| {
+        pending_nexus_download_is_fresh(pending, now)
+            && profile_ids.contains(pending.profile_id.as_str())
+    });
     if store.items.len() != original_len {
         write_store(&path, &store).map_err(error_to_string)?;
     }
@@ -10362,15 +10625,32 @@ fn find_pending_nexus_download(
     store
         .items
         .into_iter()
-        .find(|pending| {
+        .filter(|pending| {
             pending.domain.eq_ignore_ascii_case(&nxm.domain)
                 && pending.mod_id == nxm.mod_id
                 && pending.file_id == nxm.file_id
         })
+        .max_by_key(|pending| pending.created_at)
         .ok_or_else(|| {
             "UniLoader did not request this Nexus download, or the request expired. Start it again from Discovery."
                 .to_string()
         })
+}
+
+fn remove_pending_nexus_downloads_for_profile(
+    store_root: &Path,
+    profile_id: &str,
+) -> Result<(), String> {
+    let path = pending_nexus_downloads_path(store_root);
+    let mut store = read_store::<PendingNexusDownload>(&path).map_err(error_to_string)?;
+    let original_len = store.items.len();
+    store
+        .items
+        .retain(|pending| pending.profile_id != profile_id);
+    if store.items.len() != original_len {
+        write_store(&path, &store).map_err(error_to_string)?;
+    }
+    Ok(())
 }
 
 fn remove_pending_nexus_download(store_root: &Path, nxm: &NexusNxmLink) -> Result<(), String> {
@@ -11272,11 +11552,44 @@ fn runtime_provider_package_matches(
                         .iter()
                         .any(|pattern| wildcard_match(pattern, value))
                 }))
-            && package
-                .package_patterns
-                .iter()
-                .any(|pattern| wildcard_match(pattern, package_name))
+            && package.package_patterns.iter().any(|pattern| {
+                wildcard_match(pattern, package_name)
+                    || game_qualified_runtime_name_matches(pattern, package_name)
+            })
     })
+}
+
+fn game_qualified_runtime_name_matches(runtime_alias: &str, package_name: &str) -> bool {
+    if runtime_alias.contains('*') || runtime_alias.contains('?') {
+        return false;
+    }
+
+    let alias = normalized_runtime_package_name(runtime_alias);
+    let package = normalized_runtime_package_name(package_name);
+    if alias.is_empty() || package.len() <= alias.len() || !package.starts_with(&alias) {
+        return false;
+    }
+
+    let suffix = package[alias.len()..].trim_start();
+    suffix
+        .strip_prefix("for ")
+        .is_some_and(|game_name| !game_name.trim().is_empty())
+}
+
+fn normalized_runtime_package_name(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn thunderstore_package_installed(
@@ -14932,7 +15245,7 @@ fn join_install_route(parent: &str, child: &str) -> String {
     }
 }
 
-fn ue4ss_target_roots(profile: &GameProfile) -> Vec<String> {
+fn ue4ss_install_targets(profile: &GameProfile) -> (Vec<String>, Vec<String>) {
     let game_path = Path::new(&profile.game_path);
     let entries = if game_path.is_dir() {
         walk_game_folder(game_path)
@@ -14950,10 +15263,10 @@ fn ue4ss_target_roots(profile: &GameProfile) -> Vec<String> {
     });
     roots.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
     if roots.is_empty() {
-        vec!["Binaries/Win64".to_string()]
-    } else {
-        roots
+        roots.push("Binaries/Win64".to_string());
     }
+    let mod_routes = ue4ss_mod_routes_for_entries(&entries, &roots);
+    (roots, mod_routes)
 }
 
 fn native_script_payload_relative(path: &str) -> String {
@@ -15206,6 +15519,7 @@ fn should_descend_into(relative_path: &str, name: &str) -> bool {
                 | "scripts"
                 | "~mods"
                 | "mods"
+                | "ue4ss"
                 | "reframework"
                 | "autorun"
                 | "natives"
@@ -16537,6 +16851,44 @@ mod tests {
         assert!(
             provider_name_candidates(&dragonwilds).contains(&"RuneScape: Dragonwilds".to_string())
         );
+        let lookup_names = nexus_game_lookup_names(&dragonwilds, "runescapedragonwilds");
+        assert_eq!(lookup_names.first().unwrap(), "RuneScape: Dragonwilds");
+    }
+
+    #[test]
+    fn nexus_text_decodes_numeric_entities_for_display_and_route_scanning() {
+        let text = "Extract to RSDragonwilds&#92;Binaries&#x5c;Win64 &amp; restart";
+        assert_eq!(
+            clean_nexus_summary(Some(text.to_string())),
+            "Extract to RSDragonwilds\\Binaries\\Win64 & restart"
+        );
+        assert_eq!(
+            provider_text_for_route_scan(text),
+            "Extract to RSDragonwilds\\Binaries\\Win64 & restart"
+        );
+    }
+
+    #[test]
+    #[ignore = "live provider smoke test"]
+    fn live_nexus_game_id_lookup_resolves_compact_domains_using_provider_identity() {
+        let profile = GameProfile {
+            id: "profile-dragonwilds".to_string(),
+            name: "Coop Pack".to_string(),
+            game_path: "D:/Steam/steamapps/common/RSDragonwilds".to_string(),
+            game_id: None,
+            steam_app_id: Some("1374490".to_string()),
+            engine: "unreal".to_string(),
+            loader: "ue4ss".to_string(),
+            created_at: now_string(),
+            updated_at: now_string(),
+        };
+        let client = provider_client().unwrap();
+
+        assert_eq!(
+            fetch_nexus_game_id_for_domain(&client, &profile, "runescapedragonwilds", None,)
+                .unwrap(),
+            7597
+        );
     }
 
     #[test]
@@ -16702,6 +17054,66 @@ mod tests {
         assert!(!candidates
             .iter()
             .any(|candidate| candidate.excerpt.contains("Dedicated Server")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn route_text_accepts_nested_ue4ss_mod_directories_from_encoded_provider_text() {
+        let parent = temp_game_dir("nested-ue4ss-route-text");
+        let root = parent.join("RSDragonwilds");
+        fs::create_dir_all(root.join("RSDragonwilds/Binaries/Win64")).unwrap();
+        let mut profile = test_profile(
+            "future-unreal-game",
+            "RuneScape: Dragonwilds",
+            "unreal",
+            "ue4ss",
+        );
+        profile.game_path = root.to_string_lossy().to_string();
+        let text = "UE4SS is required. Extract to RSDragonwilds&#92;RSDragonwilds&#92;Binaries&#92;Win64&#92;ue4ss&#92;Mods.";
+
+        let candidates = extract_install_route_candidates(&profile, text);
+
+        assert!(candidates.iter().any(|candidate| {
+            candidate.relative_path == "RSDragonwilds/Binaries/Win64/ue4ss/Mods"
+                && candidate.adapter_id == "ue4ss"
+        }));
+
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn ue4ss_plan_prefers_detected_nested_mod_layout_over_empty_legacy_folder() {
+        let root = temp_game_dir("nested-ue4ss-plan");
+        fs::create_dir_all(root.join("RSDragonwilds/Binaries/Win64/ue4ss/Mods")).unwrap();
+        fs::create_dir_all(root.join("RSDragonwilds/Binaries/Win64/Mods")).unwrap();
+        let mut profile = test_profile(
+            "future-unreal-game",
+            "Future Unreal Game",
+            "unreal",
+            "ue4ss",
+        );
+        profile.game_path = root.to_string_lossy().to_string();
+        let scanned = ScannedArchive {
+            archive_path: "C:/Downloads/CooldownRemover.zip".to_string(),
+            archive_name: "CooldownRemover.zip".to_string(),
+            entries: vec![ArchiveEntry {
+                path: "Mods/CooldownRemover/Scripts/main.lua".to_string(),
+                logical_path: "Mods/CooldownRemover/Scripts/main.lua".to_string(),
+                size: 1,
+                is_directory: false,
+            }],
+            manifest: None,
+            package_identity: None,
+        };
+
+        let plan = ue4ss_plan(&scanned, &profile).unwrap();
+
+        assert_eq!(plan.mappings.len(), 1);
+        assert_eq!(
+            plan.mappings[0].target_relative_path,
+            "RSDragonwilds/Binaries/Win64/ue4ss/Mods/CooldownRemover/Scripts/main.lua"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -18075,11 +18487,11 @@ mod tests {
                 },
                 NexusRequirement {
                     external_requirement: false,
-                    game_id: "monsterhunterwilds".to_string(),
+                    game_id: "7597".to_string(),
                     mod_id: "2".to_string(),
                     mod_name: "Optional Texture Addon".to_string(),
                     notes: Some("Optional visual preset".to_string()),
-                    url: "https://www.nexusmods.com/monsterhunterwilds/mods/2".to_string(),
+                    url: String::new(),
                 },
             ],
         );
@@ -18089,6 +18501,270 @@ mod tests {
         assert!(dependencies[0].required);
         assert_eq!(dependencies[1].id, "nexus:monsterhunterwilds/2");
         assert!(!dependencies[1].required);
+    }
+
+    #[test]
+    fn game_qualified_requirement_names_match_every_registered_runtime_safely() {
+        let mono = test_profile("future-mono", "Future Mono", "unity-mono", "bepinex");
+        let il2cpp = test_profile(
+            "future-il2cpp",
+            "Future IL2CPP",
+            "unity-il2cpp",
+            "bepinex-il2cpp",
+        );
+        let unreal = test_profile("dragonwilds", "Dragonwilds", "unreal", "ue4ss");
+        let re_engine = test_profile(
+            "future-re-engine",
+            "Future RE Engine",
+            "re-engine",
+            "reframework",
+        );
+
+        assert_eq!(
+            runtime_id_for_provider_package(&mono, "nexus", None, "BepInEx for Future Mono")
+                .as_deref(),
+            Some("bepinex")
+        );
+        assert_eq!(
+            runtime_id_for_provider_package(&il2cpp, "nexus", None, "BepInEx for Future IL2CPP")
+                .as_deref(),
+            Some("bepinex-il2cpp")
+        );
+        assert_eq!(
+            runtime_id_for_provider_package(&unreal, "nexus", None, "UE4SS for RSDragonwilds")
+                .as_deref(),
+            Some("ue4ss")
+        );
+        assert_eq!(
+            runtime_id_for_provider_package(
+                &re_engine,
+                "nexus",
+                None,
+                "REFramework for Future RE Engine"
+            )
+            .as_deref(),
+            Some("reframework")
+        );
+        assert_eq!(
+            runtime_id_for_provider_package(&unreal, "nexus", None, "UE4SS Configuration Manager"),
+            None
+        );
+    }
+
+    #[test]
+    fn installed_runtime_satisfies_a_game_qualified_nexus_requirement() {
+        let game_root = temp_game_dir("qualified-installed-runtime");
+        let store_root = temp_game_dir("qualified-installed-runtime-store");
+        touch(&game_root, "RSDragonwilds/Binaries/Win64/UE4SS.dll");
+        fs::create_dir_all(&store_root).unwrap();
+        let mut profile = test_profile("dragonwilds", "Dragonwilds", "unreal", "ue4ss");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        let dependencies = nexus_requirement_dependencies(
+            &profile,
+            "runescapedragonwilds",
+            &[NexusRequirement {
+                external_requirement: false,
+                game_id: "7597".to_string(),
+                mod_id: "4".to_string(),
+                mod_name: "UE4SS for RSDragonwilds".to_string(),
+                notes: None,
+                url: "https://www.nexusmods.com/runescapedragonwilds/mods/4".to_string(),
+            }],
+        );
+
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].id, "runtime:ue4ss");
+        assert_eq!(
+            refresh_dependency_status(&store_root, &profile, &dependencies[0]).status,
+            "already-installed"
+        );
+
+        let _ = fs::remove_dir_all(game_root);
+        let _ = fs::remove_dir_all(store_root);
+    }
+
+    #[test]
+    fn pending_nexus_handoff_uses_the_newest_existing_profile() {
+        let root = temp_game_dir("pending-nexus-existing-profile");
+        fs::create_dir_all(&root).unwrap();
+        let current_profile = test_profile("dragonwilds", "Dragonwilds", "unreal", "ue4ss");
+        write_store(
+            &profiles_path(&root),
+            &StoreFile {
+                version: 1,
+                items: vec![current_profile.clone()],
+            },
+        )
+        .unwrap();
+        let now = Utc::now().timestamp();
+        write_store(
+            &pending_nexus_downloads_path(&root),
+            &StoreFile {
+                version: 1,
+                items: vec![
+                    PendingNexusDownload {
+                        profile_id: "deleted-profile".to_string(),
+                        domain: "runescapedragonwilds".to_string(),
+                        mod_id: 4,
+                        file_id: 620,
+                        version: None,
+                        provider_game_id: "7597".to_string(),
+                        created_at: now - 20,
+                    },
+                    PendingNexusDownload {
+                        profile_id: current_profile.id.clone(),
+                        domain: "runescapedragonwilds".to_string(),
+                        mod_id: 4,
+                        file_id: 620,
+                        version: None,
+                        provider_game_id: "7597".to_string(),
+                        created_at: now - 10,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        let nxm = NexusNxmLink {
+            domain: "runescapedragonwilds".to_string(),
+            mod_id: 4,
+            file_id: 620,
+            key: "test-key".to_string(),
+            expires: now + 300,
+            user_id: 1,
+        };
+
+        let pending = find_pending_nexus_download(&root, &nxm).unwrap();
+        assert_eq!(pending.profile_id, current_profile.id);
+        let cleaned =
+            read_store::<PendingNexusDownload>(&pending_nexus_downloads_path(&root)).unwrap();
+        assert_eq!(cleaned.items.len(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn new_nexus_handoff_replaces_the_same_download_from_an_old_profile() {
+        let root = temp_game_dir("pending-nexus-replacement");
+        fs::create_dir_all(&root).unwrap();
+        let now = Utc::now().timestamp();
+        let pending = |profile_id: &str, created_at| PendingNexusDownload {
+            profile_id: profile_id.to_string(),
+            domain: "runescapedragonwilds".to_string(),
+            mod_id: 4,
+            file_id: 620,
+            version: None,
+            provider_game_id: "7597".to_string(),
+            created_at,
+        };
+
+        store_pending_nexus_download(&root, pending("old-profile", now - 5), now).unwrap();
+        store_pending_nexus_download(&root, pending("current-profile", now), now).unwrap();
+
+        let store =
+            read_store::<PendingNexusDownload>(&pending_nexus_downloads_path(&root)).unwrap();
+        assert_eq!(store.items.len(), 1);
+        assert_eq!(store.items[0].profile_id, "current-profile");
+
+        remove_pending_nexus_downloads_for_profile(&root, "current-profile").unwrap();
+        let store =
+            read_store::<PendingNexusDownload>(&pending_nexus_downloads_path(&root)).unwrap();
+        assert!(store.items.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn profile_bundle_round_trip_restores_mods_configs_and_steam_identity() {
+        let root = temp_game_dir("profile-bundle-round-trip");
+        let source_game = root.join("source-game");
+        let steam_library = root.join("steam-library");
+        let target_game = steam_library
+            .join("steamapps")
+            .join("common")
+            .join("Windrose");
+        let import_source = root.join("downloads").join("FutureMod");
+        let bundle_path = root.join("Windrose.uniloader-profile");
+        fs::create_dir_all(source_game.join("R5/Content/Paks/~mods")).unwrap();
+        touch(&source_game, "Binaries/Win64/UE4SS.dll");
+        touch(&import_source, "FutureMod_P.pak");
+        fs::create_dir_all(target_game.join("R5/Content/Paks/~mods")).unwrap();
+        touch(&target_game, "Binaries/Win64/UE4SS.dll");
+        fs::write(
+            steam_library.join("steamapps/appmanifest_3041230.acf"),
+            r#""AppState"
+{
+    "appid"        "3041230"
+    "name"         "Windrose"
+    "installdir"   "Windrose"
+}"#,
+        )
+        .unwrap();
+
+        let mut profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
+        profile.game_path = source_game.to_string_lossy().to_string();
+        profile.steam_app_id = Some("3041230".to_string());
+        write_store(
+            &profiles_path(&root),
+            &StoreFile {
+                version: 1,
+                items: vec![profile.clone()],
+            },
+        )
+        .unwrap();
+
+        let scanned = scan_import_source(&root, &import_source).unwrap();
+        let analysis = analyze_scanned_archive(scanned, &profile);
+        let installed = install_archive_impl(
+            &root,
+            &profile,
+            import_source.to_string_lossy().as_ref(),
+            Some("FutureMod"),
+            Some(analysis.package_identity),
+            &analysis.recommended_plan.unwrap(),
+        )
+        .unwrap();
+        let config_path = source_game.join("Config/FutureMod.ini");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(&config_path, "enabled=true\n").unwrap();
+        let mut mod_store = read_store::<InstalledModRecord>(&installed_mods_path(&root)).unwrap();
+        mod_store
+            .items
+            .iter_mut()
+            .find(|record| record.id == installed.installed_mod_id)
+            .unwrap()
+            .config_files = vec![config_path.to_string_lossy().to_string()];
+        write_store(&installed_mods_path(&root), &mod_store).unwrap();
+
+        let exported = export_profile_bundle_impl(&root, &profile.id, &bundle_path).unwrap();
+        assert_eq!(exported.exported_mods, 1);
+        assert_eq!(exported.exported_config_files, 1);
+        assert!(exported.warnings.is_empty());
+
+        let installed_game = SteamGameRecord {
+            app_id: "3041230".to_string(),
+            name: "Windrose".to_string(),
+            install_dir: target_game.to_string_lossy().to_string(),
+            library_path: steam_library.to_string_lossy().to_string(),
+        };
+        let resolved =
+            resolve_profile_bundle_steam_game(&bundle_path, std::slice::from_ref(&installed_game))
+                .unwrap();
+        assert_eq!(resolved.app_id, installed_game.app_id);
+        assert!(resolve_profile_bundle_steam_game(&bundle_path, &[]).is_err());
+
+        let imported = import_profile_bundle_impl(&root, &bundle_path, &target_game).unwrap();
+        assert_eq!(imported.profile.steam_app_id.as_deref(), Some("3041230"));
+        assert_eq!(imported.installed_mods.len(), 1);
+        assert_eq!(imported.config_files_written.len(), 1);
+        assert!(target_game
+            .join("R5/Content/Paks/~mods/FutureMod_P.pak")
+            .is_file());
+        assert_eq!(
+            fs::read_to_string(target_game.join("Config/FutureMod.ini")).unwrap(),
+            "enabled=true\n"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     fn test_profile(game_id: &str, name: &str, engine: &str, loader: &str) -> GameProfile {

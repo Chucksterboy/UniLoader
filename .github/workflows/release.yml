@@ -51,13 +51,19 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "UniLoader ${{ github.ref_name }}"
           releaseBody: |
-            UniLoader v0.9.6 fixes false missing-file warnings after launching a game with Mods OFF.
-            Files deliberately parked for a clean launch are now tracked as safely suspended, while
-            genuinely missing files continue to trigger a health warning.
+            UniLoader v0.9.7 improves future-game and runtime compatibility across the shared
+            provider pipeline. Nexus game identities now use verified provider metadata and aliases,
+            encoded installation instructions are decoded correctly, and nested UE4SS layouts such
+            as RuneScape: Dragonwilds are detected and routed safely.
 
-            This release also improves the profile expand controls and explicitly applies the new
-            Vault shield artwork to the application window and system tray. The Windows shortcut,
-            taskbar, tray, executable, and installer now use the same current icon.
+            Installed BepInEx, BepInEx IL2CPP, UE4SS, and REFramework runtimes now satisfy
+            game-qualified Nexus requirements without unnecessary reinstall prompts. Stale Nexus
+            browser handoffs belonging to deleted profiles are cleaned up and the newest valid
+            profile request is always used.
+
+            Profile Import / Export is restored for Steam-only mode. Bundles preserve managed mods,
+            enabled states, installation plans, and configuration files, then automatically locate
+            and verify the matching installed Steam game before restoring the profile.
           releaseDraft: false
           prerelease: false
 

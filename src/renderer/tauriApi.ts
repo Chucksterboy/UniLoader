@@ -95,18 +95,7 @@ export const desktopApi: DesktopApi = {
       return null;
     }
 
-    const gameSelection = await open({
-      directory: true,
-      multiple: false,
-      title: "Select game install folder for imported profile"
-    });
-    const gamePath = normalizeDialogSelection(gameSelection);
-
-    if (!gamePath) {
-      return null;
-    }
-
-    return invoke<ProfileImportResult>("import_profile_bundle", { bundlePath, gamePath });
+    return invoke<ProfileImportResult>("import_profile_bundle", { bundlePath });
   },
   selectGameFolder: async () => {
     const selected = await open({
