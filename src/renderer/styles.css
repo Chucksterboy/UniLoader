@@ -2358,6 +2358,7 @@ svg {
   display: grid;
   width: min(1180px, 100%);
   gap: 18px;
+  margin-inline: auto;
 }
 
 .discover-hero {
@@ -2951,9 +2952,19 @@ svg {
 
 .discover-more-button span,
 .discover-pagination span {
+  display: inline-flex;
+  min-width: 82px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   color: var(--muted);
   font-size: 11px;
   font-weight: 900;
+}
+
+.discover-pagination-top {
+  justify-self: end;
+  margin-bottom: 4px;
 }
 
 .transfer-layout {
@@ -4560,6 +4571,12 @@ body {
   display: block;
   overflow: auto;
   padding: 22px 28px;
+}
+
+.discover-workspace {
+  display: grid;
+  align-content: start;
+  justify-items: center;
 }
 
 .workspace > .topbar,

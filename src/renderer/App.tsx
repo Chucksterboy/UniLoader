@@ -1291,7 +1291,7 @@ export function App() {
     page = 1,
     sort: OnlineSortMode = "downloads",
     query = ""
-  ) {
+  ): Promise<boolean> {
     const requestId = ++discoveryRequestSequence.current;
     setError("");
     setIsDiscoveringMods(true);
@@ -1305,7 +1305,7 @@ export function App() {
         query
       );
       if (requestId !== discoveryRequestSequence.current) {
-        return;
+        return false;
       }
       rememberOnlineModPresentations(result.items);
       setOnlineMods(result.items);
@@ -1318,12 +1318,11 @@ export function App() {
         title: "Discovery updated",
         detail: `${profile?.name ?? "Selected profile"}: found ${result.total} online mod(s).`
       });
+      return true;
     } catch (caughtError) {
       if (requestId !== discoveryRequestSequence.current) {
-        return;
+        return false;
       }
-      setOnlineMods([]);
-      setOnlineModTotal(0);
       setError(String(caughtError));
       setStatus("Discovery failed");
       setNotice({
@@ -1331,6 +1330,7 @@ export function App() {
         title: "Discovery failed",
         detail: String(caughtError)
       });
+      return false;
     } finally {
       if (requestId === discoveryRequestSequence.current) {
         setIsDiscoveringMods(false);
@@ -2177,7 +2177,7 @@ export function App() {
             onLoadFiles={loadOnlineModFiles}
             onNeedsAuth={openNexusAuthSettings}
             onOpenPage={(url) => void openExternalUrl(url)}
-            onLoad={(page, sort, query) => void loadOnlineMods(discoverProfileId, page, sort, query)}
+            onLoad={(page, sort, query) => loadOnlineMods(discoverProfileId, page, sort, query)}
             onSelectProfile={setDiscoverProfileId}
           />
         ) : (
@@ -2977,7 +2977,7 @@ interface DiscoverViewProps {
   onLoadFiles(mod: OnlineModRecord): Promise<OnlineModFileOption[]>;
   onNeedsAuth(): void;
   onOpenPage(url: string): void;
-  onLoad(page: number, sort: OnlineSortMode, query: string): void;
+  onLoad(page: number, sort: OnlineSortMode, query: string): Promise<boolean>;
   onSelectProfile(profileId: string): void;
 }
 
@@ -3031,23 +3031,25 @@ function DiscoverView({
     }
     const timeout = window.setTimeout(() => {
       setPage(1);
-      onLoad(1, sortMode, query.trim());
+      void onLoad(1, sortMode, query.trim());
     }, 300);
     return () => window.clearTimeout(timeout);
   }, [query]);
 
-  function changeSort(nextSort: OnlineSortMode) {
-    setSortMode(nextSort);
-    setPage(1);
+  async function changeSort(nextSort: OnlineSortMode) {
     setExpandedModId("");
-    onLoad(1, nextSort, query.trim());
+    if (await onLoad(1, nextSort, query.trim())) {
+      setSortMode(nextSort);
+      setPage(1);
+    }
   }
 
-  function changePage(nextPage: number) {
+  async function changePage(nextPage: number) {
     const safePage = Math.max(1, Math.min(pageCount, nextPage));
-    setPage(safePage);
     setExpandedModId("");
-    onLoad(safePage, sortMode, query.trim());
+    if (await onLoad(safePage, sortMode, query.trim())) {
+      setPage(safePage);
+    }
   }
 
   return (
@@ -3067,7 +3069,7 @@ function DiscoverView({
           disabled={!selectedProfileId || isLoading}
           onClick={() => {
             setExpandedModId("");
-            onLoad(currentPage, sortMode, query.trim());
+            void onLoad(currentPage, sortMode, query.trim());
           }}
           type="button"
         >
@@ -3124,21 +3126,21 @@ function DiscoverView({
         <div className="sort-toggle discover-sort" aria-label="Sort online mods">
           <button
             className={sortMode === "downloads" ? "active" : ""}
-            onClick={() => changeSort("downloads")}
+            onClick={() => void changeSort("downloads")}
             type="button"
           >
             Total Downloads
           </button>
           <button
             className={sortMode === "newest" ? "active" : ""}
-            onClick={() => changeSort("newest")}
+            onClick={() => void changeSort("newest")}
             type="button"
           >
             Newest
           </button>
           <button
             className={sortMode === "oldest" ? "active" : ""}
-            onClick={() => changeSort("oldest")}
+            onClick={() => void changeSort("oldest")}
             type="button"
           >
             Oldest
@@ -3147,6 +3149,15 @@ function DiscoverView({
       </section>
 
       <section className="discover-results" aria-label="Online mod results">
+        {total > discoverPageSize ? (
+          <DiscoveryPagination
+            currentPage={currentPage}
+            isLoading={isLoading}
+            pageCount={pageCount}
+            placement="top"
+            onChange={changePage}
+          />
+        ) : null}
         {visibleMods.map((mod) => (
           <OnlineModCard
             expanded={expandedModId === mod.id}
@@ -3178,36 +3189,63 @@ function DiscoverView({
             <p>No online mods match that search.</p>
           </div>
         ) : null}
-        {!isLoading && total > discoverPageSize ? (
-          <div className="discover-pagination">
-            <button
-              className="secondary-button compact-button"
-              disabled={currentPage <= 1}
-              onClick={() => changePage(currentPage - 1)}
-              type="button"
-            >
-              Previous
-            </button>
-            <span>
-              Page {currentPage} / {pageCount}
-            </span>
-            <button
-              className="secondary-button compact-button"
-              disabled={currentPage >= pageCount}
-              onClick={() => changePage(currentPage + 1)}
-              type="button"
-            >
-              Next
-            </button>
-          </div>
-        ) : null}
-        {isLoading ? (
-          <div className="empty-mods discover-empty">
-            <RefreshCw size={24} />
-            <p>Loading online mods...</p>
-          </div>
+        {total > discoverPageSize ? (
+          <DiscoveryPagination
+            currentPage={currentPage}
+            isLoading={isLoading}
+            pageCount={pageCount}
+            placement="bottom"
+            onChange={changePage}
+          />
         ) : null}
       </section>
+    </div>
+  );
+}
+
+interface DiscoveryPaginationProps {
+  currentPage: number;
+  isLoading: boolean;
+  pageCount: number;
+  placement: "top" | "bottom";
+  onChange(page: number): Promise<void>;
+}
+
+function DiscoveryPagination({
+  currentPage,
+  isLoading,
+  pageCount,
+  placement,
+  onChange
+}: DiscoveryPaginationProps) {
+  return (
+    <div className={`discover-pagination discover-pagination-${placement}`}>
+      <button
+        className="secondary-button compact-button"
+        disabled={isLoading || currentPage <= 1}
+        onClick={() => void onChange(currentPage - 1)}
+        type="button"
+      >
+        Previous
+      </button>
+      <span aria-live="polite">
+        {isLoading ? (
+          <>
+            <RefreshCw className="spin-icon" size={13} />
+            Loading
+          </>
+        ) : (
+          <>Page {currentPage} / {pageCount}</>
+        )}
+      </span>
+      <button
+        className="secondary-button compact-button"
+        disabled={isLoading || currentPage >= pageCount}
+        onClick={() => void onChange(currentPage + 1)}
+        type="button"
+      >
+        Next
+      </button>
     </div>
   );
 }

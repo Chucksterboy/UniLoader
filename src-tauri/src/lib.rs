@@ -43,7 +43,9 @@ const THUNDERSTORE_API_BASE: &str = "https://thunderstore.io/api/experimental/pa
 const THUNDERSTORE_COMMUNITY_API_BASE: &str = "https://thunderstore.io/c";
 const NEXUS_GRAPHQL_API_BASE: &str = "https://api.nexusmods.com/v2/graphql";
 const NEXUS_SITE_BASE: &str = "https://www.nexusmods.com";
-const NEXUS_DISCOVERY_PAGE_SIZE: usize = 80;
+// The full discovery query costs roughly 181 complexity points per record.
+// Keep batches comfortably below Nexus Mods' 10,000-point query ceiling.
+const NEXUS_DISCOVERY_PAGE_SIZE: usize = 40;
 const NEXUS_PENDING_DOWNLOAD_TTL_MINUTES: i64 = 30;
 const MAX_DISCOVERY_PAGE_SIZE: usize = 50;
 const MAX_PROVIDER_CANDIDATES: usize = 16;
@@ -6700,6 +6702,10 @@ fn discover_online_mods_for_profile(
         return Err(provider_errors.join(" "));
     }
 
+    if page > 1 && !provider_errors.is_empty() {
+        return Err(provider_errors.join(" "));
+    }
+
     let items = results
         .into_iter()
         .skip(offset)
@@ -7653,7 +7659,7 @@ fn discover_nexus_mods_for_profile(
 
     while offset < total_count && records.len() < max_results {
         let remaining = max_results.saturating_sub(records.len());
-        let page_size = remaining.min(NEXUS_DISCOVERY_PAGE_SIZE);
+        let page_size = nexus_discovery_batch_size(remaining);
         if page_size == 0 {
             break;
         }
@@ -7676,6 +7682,10 @@ fn discover_nexus_mods_for_profile(
     }
 
     Ok((records, total_count.min(usize::MAX - 1)))
+}
+
+fn nexus_discovery_batch_size(remaining: usize) -> usize {
+    remaining.min(NEXUS_DISCOVERY_PAGE_SIZE)
 }
 
 fn fetch_nexus_mod_page_sorted(
@@ -14007,6 +14017,14 @@ mod tests {
             "Server Mod Browser",
             "Browse and inspect server-side mods from inside the game."
         )));
+    }
+
+    #[test]
+    fn nexus_discovery_splits_later_pages_into_safe_query_batches() {
+        assert_eq!(nexus_discovery_batch_size(20), 20);
+        assert_eq!(nexus_discovery_batch_size(40), 40);
+        assert_eq!(nexus_discovery_batch_size(60), 40);
+        assert_eq!(nexus_discovery_batch_size(360), 40);
     }
 
     #[test]

@@ -55,6 +55,10 @@ jobs:
             experience, clearer Steam profiles, streamlined mod installation, install result
             sounds, improved Nexus and Thunderstore handoffs, and reliability fixes across
             loader detection, archives, dependencies, and window behavior.
+
+            v0.9.3 also fixes Discovery pagination beyond page two, centers the Discovery
+            workspace at fullscreen sizes, adds navigation above and below results, and replaces
+            the oversized page-loading panel with a compact loading state.
           releaseDraft: false
           prerelease: false
 
