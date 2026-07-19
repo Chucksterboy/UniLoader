@@ -47,6 +47,8 @@ export const desktopApi: DesktopApi = {
     invoke<GameProfile>("create_steam_profile", { game }),
   launchProfileGame: (profileId: string, modsEnabled: boolean) =>
     invoke<void>("launch_profile_game", { profileId, modsEnabled }),
+  profileGameRunning: (profileId: string) =>
+    invoke<boolean>("profile_game_running", { profileId }),
   setAllProfileModsEnabled: (profileId: string, enabled: boolean) =>
     invoke<ProfileModToggleResult>("set_all_profile_mods_enabled", { profileId, enabled }),
   listProfiles: () => invoke<GameProfile[]>("list_profiles"),

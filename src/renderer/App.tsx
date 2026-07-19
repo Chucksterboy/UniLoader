@@ -93,6 +93,7 @@ type TransferMode = "import" | "export" | null;
 type NoticeKind = "success" | "warning" | "error";
 type InstallSoundKind = keyof typeof installSoundUrls;
 type StartupSplashPhase = "intro" | "exiting" | "hidden";
+type GameLaunchState = "idle" | "requesting" | "waiting" | "running";
 
 interface PendingDependencyPrompt {
   mod: OnlineModRecord;
@@ -171,6 +172,10 @@ export function App() {
   const [installedMods, setInstalledMods] = useState<InstalledModRecord[]>([]);
   const [discoverProfileId, setDiscoverProfileId] = useState<string>("");
   const [discoverLoadedProfileId, setDiscoverLoadedProfileId] = useState<string>("");
+  const [discoverInstalledMods, setDiscoverInstalledMods] = useState<InstalledModRecord[]>([]);
+  const [discoverInstalledModsProfileId, setDiscoverInstalledModsProfileId] = useState("");
+  const [isLoadingDiscoverInstalledMods, setIsLoadingDiscoverInstalledMods] = useState(false);
+  const [removingDiscoverModId, setRemovingDiscoverModId] = useState("");
   const [onlineMods, setOnlineMods] = useState<OnlineModRecord[]>([]);
   const [onlineModTotal, setOnlineModTotal] = useState(0);
   const [modSortMode, setModSortMode] = useState<ModSortMode>("newest");
@@ -192,7 +197,7 @@ export function App() {
   const [isTransferringProfile, setIsTransferringProfile] = useState(false);
   const [isScanningSteamGames, setIsScanningSteamGames] = useState(false);
   const [isCreatingSteamProfile, setIsCreatingSteamProfile] = useState(false);
-  const [isLaunchingGame, setIsLaunchingGame] = useState(false);
+  const [gameLaunchState, setGameLaunchState] = useState<GameLaunchState>("idle");
   const [profileLaunchModes, setProfileLaunchModes] = useState<StoredProfileLaunchModes>(() =>
     loadStoredProfileLaunchModes()
   );
@@ -214,25 +219,27 @@ export function App() {
   const errorSequence = useRef(0);
   const updateAnnouncementShown = useRef(false);
   const installedModsRequestSequence = useRef(0);
+  const discoverInstalledModsRequestSequence = useRef(0);
   const discoveryRequestSequence = useRef(0);
   const processedNxmLinks = useRef(new Set<string>());
   const installSoundPlayers = useRef<Record<InstallSoundKind, HTMLAudioElement> | null>(null);
+  const gameLaunchStateRef = useRef<GameLaunchState>("idle");
+  const gameLaunchDeadlineRef = useRef(0);
 
   function setNotice(nextNotice: NoticeInput | null) {
     setNoticeState(nextNotice ? { ...nextNotice, motionId: ++noticeSequence.current } : null);
   }
-
-  useEffect(() => {
-    if (selectedProfileId) {
-      setExpandedProfileId(selectedProfileId);
-    }
-  }, [selectedProfileId]);
 
   function setError(nextError: string) {
     if (nextError) {
       setErrorMotionId(++errorSequence.current);
     }
     setErrorState(nextError);
+  }
+
+  function updateGameLaunchState(nextState: GameLaunchState) {
+    gameLaunchStateRef.current = nextState;
+    setGameLaunchState(nextState);
   }
 
   function playInstallSound(kind: InstallSoundKind) {
@@ -348,6 +355,7 @@ export function App() {
     ? profileLaunchModes[selectedProfile.id] ?? true
     : true;
   const profileModToggleLabel = selectedProfileLaunchModsEnabled ? "ON" : "OFF";
+  const gameLaunchBusy = gameLaunchState !== "idle";
   const displayedOnlineMods =
     discoverLoadedProfileId === discoverProfileId ? onlineMods : [];
   const selectedPlan = analysis?.recommendedPlan;
@@ -491,6 +499,80 @@ export function App() {
   }, [selectedProfile?.gamePath, selectedProfile?.id]);
 
   useEffect(() => {
+    const profileId = selectedProfile?.id;
+    const profileName = selectedProfile?.name;
+    if (!profileId || !selectedProfile?.steamAppId) {
+      gameLaunchDeadlineRef.current = 0;
+      updateGameLaunchState("idle");
+      return;
+    }
+
+    let cancelled = false;
+    let timeoutId = 0;
+    let consecutiveStoppedChecks = 0;
+    gameLaunchDeadlineRef.current = 0;
+    updateGameLaunchState("idle");
+
+    const checkRunningState = async () => {
+      try {
+        const running = await api.profileGameRunning(profileId);
+        if (cancelled) {
+          return;
+        }
+
+        const currentState = gameLaunchStateRef.current;
+        if (running) {
+          consecutiveStoppedChecks = 0;
+          if (currentState !== "running") {
+            updateGameLaunchState("running");
+            setStatus("Game running");
+            if (currentState === "requesting" || currentState === "waiting") {
+              setNotice({
+                kind: "success",
+                title: "Game launched",
+                detail: `${profileName} is now running.`
+              });
+            }
+          }
+        } else if (currentState === "running") {
+          consecutiveStoppedChecks += 1;
+          if (consecutiveStoppedChecks >= 2) {
+            updateGameLaunchState("idle");
+            setStatus("Ready");
+          }
+        } else if (
+          currentState === "waiting" &&
+          gameLaunchDeadlineRef.current > 0 &&
+          Date.now() >= gameLaunchDeadlineRef.current
+        ) {
+          gameLaunchDeadlineRef.current = 0;
+          updateGameLaunchState("idle");
+          setStatus("Launch not detected");
+          setNotice({
+            kind: "warning",
+            title: "Launch not detected",
+            detail: `Steam accepted the request, but UniLoader could not detect ${profileName} running.`
+          });
+        } else {
+          consecutiveStoppedChecks = 0;
+        }
+      } catch {
+        // A protected process can briefly reject inspection while a game starts or exits.
+      }
+
+      if (!cancelled) {
+        timeoutId = window.setTimeout(checkRunningState, 1500);
+      }
+    };
+
+    void checkRunningState();
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeoutId);
+    };
+  }, [selectedProfile?.id, selectedProfile?.name, selectedProfile?.steamAppId]);
+
+  useEffect(() => {
     if (activeView !== "discover") {
       return;
     }
@@ -508,6 +590,22 @@ export function App() {
     selectedProfile?.steamAppId,
     selectedProfileId
   ]);
+
+  useEffect(() => {
+    if (activeView !== "discover") {
+      return;
+    }
+
+    if (!discoverProfileId) {
+      discoverInstalledModsRequestSequence.current += 1;
+      setDiscoverInstalledMods([]);
+      setDiscoverInstalledModsProfileId("");
+      setIsLoadingDiscoverInstalledMods(false);
+      return;
+    }
+
+    void refreshDiscoverInstalledMods(discoverProfileId).catch(() => undefined);
+  }, [activeView, discoverProfileId, onlineInstallCompletionId]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -583,6 +681,28 @@ export function App() {
     }
   }
 
+  async function refreshDiscoverInstalledMods(profileId: string) {
+    const requestId = ++discoverInstalledModsRequestSequence.current;
+    setIsLoadingDiscoverInstalledMods(true);
+    try {
+      const mods = await api.listInstalledMods(profileId);
+      if (requestId === discoverInstalledModsRequestSequence.current) {
+        setDiscoverInstalledMods(mods);
+        setDiscoverInstalledModsProfileId(profileId);
+      }
+    } catch (caughtError) {
+      if (requestId === discoverInstalledModsRequestSequence.current) {
+        setDiscoverInstalledMods([]);
+        setDiscoverInstalledModsProfileId(profileId);
+      }
+      throw caughtError;
+    } finally {
+      if (requestId === discoverInstalledModsRequestSequence.current) {
+        setIsLoadingDiscoverInstalledMods(false);
+      }
+    }
+  }
+
   async function handleNxmUrls(urls: string[]) {
     for (const nxmUrl of urls) {
       if (!nxmUrl.toLowerCase().startsWith("nxm://")) {
@@ -607,7 +727,6 @@ export function App() {
         playInstallSound("success");
         setOnlineInstallCompletionId((current) => current + 1);
         setSelectedProfileId(result.installResult.profileId);
-        setExpandedProfileId(result.installResult.profileId);
         setOnlineMods((current) =>
           current.map((item) =>
             item.id === result.modId ? { ...item, installed: true } : item
@@ -1150,20 +1269,26 @@ export function App() {
     }
 
     setError("");
-    setIsLaunchingGame(true);
+    updateGameLaunchState("requesting");
+    gameLaunchDeadlineRef.current = Date.now() + 60_000;
     const launchWithMods = selectedProfileLaunchModsEnabled;
     setStatus(launchWithMods ? "Launching with mods" : "Launching without mods");
     try {
       await api.launchProfileGame(selectedProfile.id, launchWithMods);
-      setStatus("Game launched");
+      if (gameLaunchStateRef.current !== "running") {
+        updateGameLaunchState("waiting");
+      }
+      setStatus("Waiting for game");
       setNotice({
-        kind: "success",
-        title: "Launch requested",
+        kind: "warning",
+        title: "Starting game",
         detail: launchWithMods
-          ? `Steam is launching ${selectedProfile.name} with the enabled library mods.`
-          : `Steam is launching ${selectedProfile.name} without user mods.`
+          ? `Steam is starting ${selectedProfile.name} with the enabled library mods.`
+          : `Steam is starting ${selectedProfile.name} without user mods.`
       });
     } catch (caughtError) {
+      gameLaunchDeadlineRef.current = 0;
+      updateGameLaunchState("idle");
       setError(String(caughtError));
       setStatus("Launch failed");
       setNotice({
@@ -1171,8 +1296,6 @@ export function App() {
         title: "Launch failed",
         detail: String(caughtError)
       });
-    } finally {
-      setIsLaunchingGame(false);
     }
   }
 
@@ -1688,6 +1811,48 @@ export function App() {
     }
   }
 
+  async function removeDiscoverInstalledMod(mod: InstalledModRecord) {
+    const profileId = discoverProfileId;
+    if (!profileId || mod.runtimeId) {
+      return;
+    }
+
+    setError("");
+    setRemovingDiscoverModId(mod.id);
+    setStatus("Removing mod");
+    try {
+      const result = await api.removeMod(profileId, mod.id);
+      const refreshes: Promise<void>[] = [refreshDiscoverInstalledMods(profileId)];
+      if (profileId === selectedProfileId) {
+        refreshes.push(refreshInstalledMods(profileId));
+      }
+      await Promise.all(refreshes);
+      setOnlineMods((current) =>
+        current.map((onlineMod) =>
+          installedRecordMatchesOnlineMod(mod, onlineMod)
+            ? { ...onlineMod, installed: false }
+            : onlineMod
+        )
+      );
+      setStatus("Mod removed");
+      setNotice({
+        kind: "warning",
+        title: "Mod removed",
+        detail: `${displayModName(mod)}: ${result.filesChanged.length} file(s) changed.`
+      });
+    } catch (caughtError) {
+      setError(String(caughtError));
+      setStatus("Remove failed");
+      setNotice({
+        kind: "error",
+        title: "Remove failed",
+        detail: String(caughtError)
+      });
+    } finally {
+      setRemovingDiscoverModId("");
+    }
+  }
+
   async function openModConfig(mod: InstalledModRecord) {
     if (!selectedProfile) {
       return;
@@ -1825,30 +1990,46 @@ export function App() {
                   className={`profile${isSelected ? " active" : ""}${isExpanded ? " expanded" : ""}`}
                   key={profile.id}
                 >
-                  <button
-                    aria-expanded={isExpanded}
-                    className="profile-select"
-                    onClick={() => {
-                      if (isSelected) {
-                        setExpandedProfileId((current) => (current === profile.id ? "" : profile.id));
-                      } else {
-                        setSelectedProfileId(profile.id);
-                        setExpandedProfileId(profile.id);
-                      }
-                      setAnalysis(null);
-                      setNotice(null);
-                    }}
-                    type="button"
-                  >
-                    <ProfileArtwork profile={profile} />
-                    <span className="profile-copy">
-                      <strong>{profile.name}</strong>
-                      <small>{profileStatus}</small>
-                    </span>
-                    <span className="profile-chevron" aria-hidden="true">
+                  <div className="profile-summary">
+                    <button
+                      aria-pressed={isSelected}
+                      className="profile-select"
+                      onClick={() => {
+                        if (!isSelected) {
+                          setSelectedProfileId(profile.id);
+                          setExpandedProfileId("");
+                        }
+                        setAnalysis(null);
+                        setNotice(null);
+                      }}
+                      type="button"
+                    >
+                      <ProfileArtwork profile={profile} />
+                      <span className="profile-copy">
+                        <strong>{profile.name}</strong>
+                        <small>{profileStatus}</small>
+                      </span>
+                    </button>
+                    <button
+                      aria-expanded={isExpanded}
+                      aria-label={`${isExpanded ? "Hide" : "Show"} controls for ${profile.name}`}
+                      className="profile-expand-button"
+                      onClick={() => {
+                        if (!isSelected) {
+                          setSelectedProfileId(profile.id);
+                          setAnalysis(null);
+                          setNotice(null);
+                        }
+                        setExpandedProfileId((current) =>
+                          current === profile.id ? "" : profile.id
+                        );
+                      }}
+                      title={isExpanded ? "Hide profile controls" : "Show profile controls"}
+                      type="button"
+                    >
                       {isExpanded ? <ChevronUp size={18} /> : <ChevronDown size={18} />}
-                    </span>
-                  </button>
+                    </button>
+                  </div>
                   {isExpanded ? (
                     <div className="profile-expanded-content">
                       <div className="profile-actions">
@@ -2005,7 +2186,7 @@ export function App() {
             >
               <input
                 checked={selectedProfileLaunchModsEnabled}
-                disabled={!selectedProfile || isLaunchingGame}
+                disabled={!selectedProfile || gameLaunchBusy}
                 onChange={(event) => setProfileLaunchModsEnabled(event.currentTarget.checked)}
                 type="checkbox"
               />
@@ -2023,14 +2204,37 @@ export function App() {
               Refresh
             </button>
             <button
-              className="primary-button vault-launch-button"
-              disabled={!selectedProfile || !selectedProfile.steamAppId || isLaunchingGame}
+              aria-live="polite"
+              className={`primary-button vault-launch-button ${
+                gameLaunchState === "running"
+                  ? "is-running"
+                  : gameLaunchState === "requesting" || gameLaunchState === "waiting"
+                    ? "is-pending"
+                    : ""
+              }`}
+              disabled={!selectedProfile || !selectedProfile.steamAppId || gameLaunchBusy}
               onClick={() => void launchSelectedProfileGame()}
-              title="Launch selected game through Steam"
+              title={
+                gameLaunchState === "running"
+                  ? `${selectedProfile?.name ?? "Game"} is running`
+                  : gameLaunchState === "requesting" || gameLaunchState === "waiting"
+                    ? `Waiting for ${selectedProfile?.name ?? "the game"} to start`
+                    : "Launch selected game through Steam"
+              }
               type="button"
             >
-              <Play size={17} />
-              {isLaunchingGame ? "Launching" : "Launch Game"}
+              {gameLaunchState === "running" ? (
+                <CheckCircle2 size={17} />
+              ) : gameLaunchState === "requesting" || gameLaunchState === "waiting" ? (
+                <RefreshCw className="spin-icon" size={17} />
+              ) : (
+                <Play size={17} />
+              )}
+              {gameLaunchState === "running"
+                ? "Launched"
+                : gameLaunchState === "requesting" || gameLaunchState === "waiting"
+                  ? "Launching"
+                  : "Launch Game"}
             </button>
           </div>
         </section>
@@ -2151,9 +2355,18 @@ export function App() {
           <DiscoverView
             hasLoaded={discoverLoadedProfileId === discoverProfileId}
             installCompletionId={onlineInstallCompletionId}
+            installedMods={
+              discoverInstalledModsProfileId === discoverProfileId ? discoverInstalledMods : []
+            }
             installingModId={installingOnlineModId}
+            isLoadingInstalledMods={
+              isLoadingDiscoverInstalledMods ||
+              Boolean(discoverProfileId && discoverInstalledModsProfileId !== discoverProfileId)
+            }
             isLoading={isDiscoveringMods}
             mods={displayedOnlineMods}
+            modPresentations={modPresentations}
+            removingModId={removingDiscoverModId}
             total={discoverLoadedProfileId === discoverProfileId ? onlineModTotal : 0}
             profiles={profiles}
             selectedProfileId={discoverProfileId}
@@ -2162,6 +2375,7 @@ export function App() {
             onNeedsAuth={openNexusAuthSettings}
             onOpenPage={(url) => void openExternalUrl(url)}
             onLoad={(page, sort, query) => loadOnlineMods(discoverProfileId, page, sort, query)}
+            onRemoveInstalledMod={(mod) => void removeDiscoverInstalledMod(mod)}
             onSelectProfile={setDiscoverProfileId}
           />
         ) : (
@@ -2951,9 +3165,13 @@ function StartupSplash({ phase }: { phase: StartupSplashPhase }) {
 interface DiscoverViewProps {
   hasLoaded: boolean;
   installCompletionId: number;
+  installedMods: InstalledModRecord[];
   installingModId: string;
+  isLoadingInstalledMods: boolean;
   isLoading: boolean;
   mods: OnlineModRecord[];
+  modPresentations: StoredModPresentations;
+  removingModId: string;
   total: number;
   profiles: GameProfile[];
   selectedProfileId: string;
@@ -2962,15 +3180,20 @@ interface DiscoverViewProps {
   onNeedsAuth(): void;
   onOpenPage(url: string): void;
   onLoad(page: number, sort: OnlineSortMode, query: string): Promise<boolean>;
+  onRemoveInstalledMod(mod: InstalledModRecord): void;
   onSelectProfile(profileId: string): void;
 }
 
 function DiscoverView({
   hasLoaded,
   installCompletionId,
+  installedMods,
   installingModId,
+  isLoadingInstalledMods,
   isLoading,
   mods,
+  modPresentations,
+  removingModId,
   total,
   profiles,
   selectedProfileId,
@@ -2979,6 +3202,7 @@ function DiscoverView({
   onNeedsAuth,
   onOpenPage,
   onLoad,
+  onRemoveInstalledMod,
   onSelectProfile
 }: DiscoverViewProps) {
   const [query, setQuery] = useState("");
@@ -3132,58 +3356,156 @@ function DiscoverView({
         </div>
       </section>
 
-      <section className="discover-results" aria-label="Online mod results">
-        {total > discoverPageSize ? (
-          <DiscoveryPagination
-            currentPage={currentPage}
-            isLoading={isLoading}
-            pageCount={pageCount}
-            placement="top"
-            onChange={changePage}
-          />
-        ) : null}
-        {visibleMods.map((mod) => (
-          <OnlineModCard
-            expanded={expandedModId === mod.id}
-            installing={installingModId === mod.id}
-            key={`${mod.provider}:${mod.id}:${mod.version}`}
-            mod={mod}
-            onInstall={onInstall}
-            onLoadFiles={onLoadFiles}
-            onNeedsAuth={onNeedsAuth}
-            onOpenPage={onOpenPage}
-            onToggle={() => setExpandedModId((current) => (current === mod.id ? "" : mod.id))}
-          />
-        ))}
-        {!isLoading && !hasLoaded ? (
-          <div className="empty-mods discover-empty">
-            <Compass size={26} />
-            <p>Select a profile, then load online mods when you are ready.</p>
-          </div>
-        ) : null}
-        {!isLoading && hasLoaded && mods.length === 0 ? (
-          <div className="empty-mods discover-empty">
-            <Compass size={26} />
-            <p>No online provider results were found for this profile.</p>
-          </div>
-        ) : null}
-        {!isLoading && hasLoaded && mods.length > 0 && visibleMods.length === 0 ? (
-          <div className="empty-mods discover-empty">
-            <Search size={24} />
-            <p>No online mods match that search.</p>
-          </div>
-        ) : null}
-        {total > discoverPageSize ? (
-          <DiscoveryPagination
-            currentPage={currentPage}
-            isLoading={isLoading}
-            pageCount={pageCount}
-            placement="bottom"
-            onChange={changePage}
-          />
-        ) : null}
-      </section>
+      <div className="discover-content-grid">
+        <section className="discover-results" aria-label="Online mod results">
+          {total > discoverPageSize ? (
+            <DiscoveryPagination
+              currentPage={currentPage}
+              isLoading={isLoading}
+              pageCount={pageCount}
+              placement="top"
+              onChange={changePage}
+            />
+          ) : null}
+          {visibleMods.map((mod) => (
+            <OnlineModCard
+              expanded={expandedModId === mod.id}
+              installing={installingModId === mod.id}
+              key={`${mod.provider}:${mod.id}:${mod.version}`}
+              mod={mod}
+              onInstall={onInstall}
+              onLoadFiles={onLoadFiles}
+              onNeedsAuth={onNeedsAuth}
+              onOpenPage={onOpenPage}
+              onToggle={() => setExpandedModId((current) => (current === mod.id ? "" : mod.id))}
+            />
+          ))}
+          {!isLoading && !hasLoaded ? (
+            <div className="empty-mods discover-empty">
+              <Compass size={26} />
+              <p>Select a profile, then load online mods when you are ready.</p>
+            </div>
+          ) : null}
+          {!isLoading && hasLoaded && mods.length === 0 ? (
+            <div className="empty-mods discover-empty">
+              <Compass size={26} />
+              <p>No online provider results were found for this profile.</p>
+            </div>
+          ) : null}
+          {!isLoading && hasLoaded && mods.length > 0 && visibleMods.length === 0 ? (
+            <div className="empty-mods discover-empty">
+              <Search size={24} />
+              <p>No online mods match that search.</p>
+            </div>
+          ) : null}
+          {total > discoverPageSize ? (
+            <DiscoveryPagination
+              currentPage={currentPage}
+              isLoading={isLoading}
+              pageCount={pageCount}
+              placement="bottom"
+              onChange={changePage}
+            />
+          ) : null}
+        </section>
+
+        <DiscoveryInstalledRail
+          isLoading={isLoadingInstalledMods}
+          mods={installedMods}
+          presentations={modPresentations}
+          removingModId={removingModId}
+          onRemove={onRemoveInstalledMod}
+        />
+      </div>
     </div>
+  );
+}
+
+interface DiscoveryInstalledRailProps {
+  isLoading: boolean;
+  mods: InstalledModRecord[];
+  presentations: StoredModPresentations;
+  removingModId: string;
+  onRemove(mod: InstalledModRecord): void;
+}
+
+function DiscoveryInstalledRail({
+  isLoading,
+  mods,
+  presentations,
+  removingModId,
+  onRemove
+}: DiscoveryInstalledRailProps) {
+  const orderedMods = [...mods].sort((first, second) => {
+    if (Boolean(first.runtimeId) !== Boolean(second.runtimeId)) {
+      return first.runtimeId ? 1 : -1;
+    }
+    return (Date.parse(second.installedAt) || 0) - (Date.parse(first.installedAt) || 0);
+  });
+
+  return (
+    <aside className="discover-installed-rail" aria-label="Currently installed mods">
+      <div className="discover-installed-header">
+        <div>
+          <p className="eyebrow">Installed</p>
+          <h3>Current Mods</h3>
+        </div>
+        <span aria-live="polite">{mods.length}</span>
+      </div>
+
+      <div className="discover-installed-list">
+        {orderedMods.map((mod) => {
+          const modName = displayModName(mod);
+          const presentation = getStoredModPresentation(mod, presentations);
+          const isRuntime = Boolean(mod.runtimeId);
+          const isRemoving = removingModId === mod.id;
+
+          return (
+            <article
+              className={`discover-installed-item${isRuntime ? " runtime" : ""}`}
+              key={mod.id}
+            >
+              <ModArtwork mod={mod} name={modName} presentation={presentation} />
+              <div className="discover-installed-copy">
+                <strong title={modName}>{modName}</strong>
+                <span>{isRuntime ? "System runtime" : presentation.providerLabel ?? adapterDisplayName(mod.adapterId)}</span>
+              </div>
+              {isRuntime ? (
+                <span
+                  className="discover-installed-protected"
+                  title="Required runtime"
+                >
+                  <ShieldCheck size={16} />
+                </span>
+              ) : (
+                <button
+                  aria-label={`Remove ${modName}`}
+                  className="discover-installed-remove"
+                  disabled={Boolean(removingModId)}
+                  onClick={() => onRemove(mod)}
+                  title={`Remove ${modName}`}
+                  type="button"
+                >
+                  {isRemoving ? <RefreshCw className="spin-icon" size={15} /> : <X size={16} />}
+                </button>
+              )}
+            </article>
+          );
+        })}
+
+        {isLoading && mods.length === 0 ? (
+          <div className="discover-installed-empty">
+            <RefreshCw className="spin-icon" size={18} />
+            <span>Loading</span>
+          </div>
+        ) : !isLoading && mods.length === 0 ? (
+          <div className="discover-installed-empty">
+            <PackagePlus size={19} />
+            <span>No installed mods</span>
+          </div>
+        ) : null}
+      </div>
+    </aside>
   );
 }
 
@@ -4029,6 +4351,14 @@ function getStoredModPresentation(
     providerLabel: adapterDisplayName(mod.adapterId),
     version: dependencyVersion(mod.dependencyString)
   };
+}
+
+function installedRecordMatchesOnlineMod(
+  installedMod: InstalledModRecord,
+  onlineMod: OnlineModRecord
+): boolean {
+  const packageId = installedMod.packageId?.trim().toLowerCase();
+  return Boolean(packageId && packageId === onlineMod.id.trim().toLowerCase());
 }
 
 function findStoredPresentationByName(

@@ -407,6 +407,7 @@ export interface DesktopApi {
   scanSteamGames(): Promise<SteamGameRecord[]>;
   createSteamProfile(game: SteamGameRecord): Promise<GameProfile>;
   launchProfileGame(profileId: string, modsEnabled: boolean): Promise<void>;
+  profileGameRunning(profileId: string): Promise<boolean>;
   setAllProfileModsEnabled(profileId: string, enabled: boolean): Promise<ProfileModToggleResult>;
   listProfiles(): Promise<GameProfile[]>;
   profileFolderExists(profileId: string): Promise<boolean>;

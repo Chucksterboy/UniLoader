@@ -53,6 +53,14 @@ const PROFILE_LAUNCH_SUSPENSION_VERSION: u32 = 1;
 const PROFILE_RUNTIME_SAMPLE_SIZE: usize = 40;
 const PROFILE_RUNTIME_MAX_DEPENDENCY_DEPTH: usize = 5;
 const PROFILE_RUNTIME_MIN_SUPPORT: usize = 2;
+const PROFILE_ROUTE_KNOWLEDGE_VERSION: u32 = 1;
+const PROFILE_ROUTE_SAMPLE_SIZE: usize = 32;
+const PROFILE_ROUTE_FULL_TEXT_SAMPLE_SIZE: usize = 18;
+const PROFILE_ROUTE_FETCH_CONCURRENCY: usize = 6;
+const PROFILE_ROUTE_MIN_SUPPORT: usize = 2;
+const PROFILE_ROUTE_MAX_EVIDENCE: usize = 8;
+const PROFILE_ROUTE_CACHE_HOURS: i64 = 24 * 7;
+const PROFILE_ROUTE_NEGATIVE_CACHE_MINUTES: i64 = 10;
 const PROVIDER_MAPPING_CACHE_HOURS: u64 = 12;
 const PROVIDER_MAPPING_NEGATIVE_CACHE_MINUTES: u64 = 10;
 const GITHUB_API_BASE: &str = "https://api.github.com/repos";
@@ -98,6 +106,74 @@ struct ProviderRuntimeInference {
     providers: Vec<String>,
     supporting_mods: usize,
     sampled_mods: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderRouteDocument {
+    provider: String,
+    mod_id: String,
+    mod_name: String,
+    text: String,
+}
+
+#[derive(Debug, Clone)]
+struct InstallRouteCandidate {
+    relative_path: String,
+    adapter_id: String,
+    scopes: Vec<String>,
+    excerpt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RouteEvidence {
+    provider: String,
+    mod_id: String,
+    mod_name: String,
+    excerpt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LearnedInstallRoute {
+    relative_path: String,
+    adapter_id: String,
+    #[serde(default)]
+    scopes: Vec<String>,
+    confidence: f64,
+    supporting_mods: usize,
+    #[serde(default)]
+    providers: Vec<String>,
+    #[serde(default)]
+    evidence: Vec<RouteEvidence>,
+    #[serde(default)]
+    trusted: bool,
+    #[serde(default)]
+    package_verified: bool,
+    #[serde(default)]
+    created: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileRouteKnowledge {
+    version: u32,
+    profile_id: String,
+    learned_at: String,
+    sampled_mods: usize,
+    #[serde(default)]
+    providers: Vec<String>,
+    #[serde(default)]
+    routes: Vec<LearnedInstallRoute>,
+    #[serde(default)]
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct RouteKnowledgeOutcome {
+    expected_routes: Vec<String>,
+    created_routes: Vec<String>,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -216,6 +292,12 @@ struct ThunderstorePackageRef {
 #[derive(Debug, Deserialize)]
 struct ThunderstorePackageResponse {
     latest: ThunderstoreVersion,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThunderstoreMarkdownResponse {
+    #[serde(default)]
+    markdown: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -409,6 +491,16 @@ struct NexusModNode {
     status: Option<String>,
     #[serde(default)]
     mod_requirements: Option<NexusModRequirements>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct NexusModDetails {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    description: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1325,6 +1417,7 @@ fn create_steam_profile_sync(app: AppHandle, game: SteamGameRecord) -> Result<Ga
         persist_profile(&root, &profile)?;
     }
     let _ = install_profile_bootstrap_dependencies(&root, &profile);
+    let _ = ensure_profile_route_knowledge(&root, &profile, true);
     Ok(profile)
 }
 
@@ -1385,6 +1478,115 @@ fn launch_profile_game(
 
     prepare_profile_mod_launch(&root, &profile, mods_enabled)?;
     open_url_in_shell(&format!("steam://run/{steam_app_id}"))
+}
+
+#[tauri::command]
+fn profile_game_running(app: AppHandle, profile_id: String) -> Result<bool, String> {
+    let root = store_root(&app)?;
+    let profile = get_profile(&root, &profile_id)?;
+    if profile
+        .steam_app_id
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        return Ok(false);
+    }
+
+    game_process_running(Path::new(&profile.game_path))
+}
+
+#[cfg(target_os = "windows")]
+fn game_process_running(game_path: &Path) -> Result<bool, String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let game_root = fs::canonicalize(game_path).unwrap_or_else(|_| game_path.to_path_buf());
+    if !game_root.is_dir() {
+        return Ok(false);
+    }
+
+    // SAFETY: Toolhelp returns an owned snapshot handle that is closed before this function exits.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(format!(
+            "Could not inspect running games: {}",
+            io::Error::last_os_error()
+        ));
+    }
+
+    let mut process = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `process` is correctly sized and remains valid throughout enumeration.
+    let mut has_process = unsafe { Process32FirstW(snapshot, &mut process) } != 0;
+    let mut found = false;
+
+    while has_process {
+        if process.th32ProcessID != 0 && process.th32ProcessID != std::process::id() {
+            // SAFETY: The returned process handle is checked for null and closed after querying.
+            let handle =
+                unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process.th32ProcessID) };
+            if !handle.is_null() {
+                let mut buffer = vec![0u16; 32_768];
+                let mut length = buffer.len() as u32;
+                // SAFETY: `buffer` is writable for `length` UTF-16 units and the handle is valid.
+                let queried = unsafe {
+                    QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut length)
+                } != 0;
+                // SAFETY: `handle` was returned by OpenProcess and is closed exactly once.
+                unsafe {
+                    CloseHandle(handle);
+                }
+
+                if queried {
+                    let executable = PathBuf::from(OsString::from_wide(&buffer[..length as usize]));
+                    if path_is_within_directory(&executable, &game_root) {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // SAFETY: `process` remains a valid, correctly sized output buffer for the snapshot.
+        has_process = unsafe { Process32NextW(snapshot, &mut process) } != 0;
+    }
+
+    // SAFETY: `snapshot` is a valid owned Toolhelp handle and is closed exactly once.
+    unsafe {
+        CloseHandle(snapshot);
+    }
+    Ok(found)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn game_process_running(_game_path: &Path) -> Result<bool, String> {
+    Ok(false)
+}
+
+fn path_is_within_directory(path: &Path, directory: &Path) -> bool {
+    let normalized_path = normalize_process_path(path);
+    let normalized_directory = normalize_process_path(directory);
+    let directory_prefix = format!("{}/", normalized_directory.trim_end_matches('/'));
+    normalized_path.starts_with(&directory_prefix)
+}
+
+fn normalize_process_path(path: &Path) -> String {
+    let normalized = normalize_filesystem_identity(path.to_string_lossy().as_ref());
+    normalized
+        .strip_prefix("//?/")
+        .unwrap_or(&normalized)
+        .to_string()
 }
 
 fn scan_steam_games_impl() -> Vec<SteamGameRecord> {
@@ -1831,6 +2033,13 @@ fn refresh_profile_sync(
     profiles.items[profile_index] = profile.clone();
 
     let bootstrap_warnings = install_profile_bootstrap_dependencies(&root, &profile);
+    let route_outcome = ensure_profile_route_knowledge(&root, &profile, false);
+    for route in &route_outcome.expected_routes {
+        push_unique_route(&mut detection.expected_mod_folders, route);
+    }
+    for route in &route_outcome.created_routes {
+        push_unique_route(&mut detection.created_mod_folders, route);
+    }
     apply_profile_identity_to_detection(&profile, &mut detection, runtime_inference.as_ref());
 
     let discovered_config_files = discover_profile_config_files(&profile);
@@ -1893,6 +2102,7 @@ fn refresh_profile_sync(
     let mut warnings =
         profile_refresh_warnings(&detection, &mod_file_health, &missing_dependencies);
     warnings.extend(bootstrap_warnings);
+    warnings.extend(route_outcome.warnings);
 
     Ok(ProfileRefreshResult {
         profile,
@@ -3297,7 +3507,20 @@ fn list_installed_mods(
     let profile = get_profile(&root, &profile_id)?;
     let store_path = installed_mods_path(&root);
     let mut store = read_store::<InstalledModRecord>(&store_path).map_err(error_to_string)?;
-    if ensure_visible_runtime_records(&root, &profile, &mut store)? > 0 {
+    let mut changed = ensure_visible_runtime_records(&root, &profile, &mut store)? > 0;
+    let discovered_config_files = discover_profile_config_files(&profile);
+    for record in store
+        .items
+        .iter_mut()
+        .filter(|record| record.profile_id == profile_id)
+    {
+        let resolved = resolved_config_files_for_record(&profile, record, &discovered_config_files);
+        if record.config_files != resolved {
+            record.config_files = resolved;
+            changed = true;
+        }
+    }
+    if changed {
         write_store(&store_path, &store).map_err(error_to_string)?;
     }
     Ok(store
@@ -3877,6 +4100,7 @@ pub fn run() {
             scan_steam_games,
             create_steam_profile,
             launch_profile_game,
+            profile_game_running,
             set_all_profile_mods_enabled,
             list_profiles,
             profile_folder_exists,
@@ -5369,69 +5593,106 @@ fn bepinex_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<Insta
     let files = installable_files(&scanned.entries);
     let mut mappings = Vec::new();
     let mut warnings = Vec::new();
+    let target_roots = bepinex_target_roots(profile);
 
     for file in &files {
         let lower_path = file.logical_path.to_lowercase();
         if let Some(relative_path) = path_after_named_segment(&file.logical_path, "bepinex") {
-            mappings.push(mapping(
-                &file.path,
-                "game",
-                &format!("BepInEx/{}", relative_path),
-                "Archive contains a BepInEx folder layout.",
-            ));
+            for target_root in &target_roots {
+                mappings.push(mapping(
+                    &file.path,
+                    "game",
+                    &join_install_route(target_root, &relative_path),
+                    "Archive contains a BepInEx folder layout.",
+                ));
+            }
         } else if let Some(relative_path) =
             path_after_named_segment(&file.logical_path, "doorstop_libs")
         {
-            mappings.push(mapping(
-                &file.path,
-                "game",
-                &format!("doorstop_libs/{}", relative_path),
-                "Doorstop runtime support file.",
-            ));
+            for target_root in &target_roots {
+                mappings.push(mapping(
+                    &file.path,
+                    "game",
+                    &join_install_route(
+                        &install_route_parent(target_root),
+                        &format!("doorstop_libs/{relative_path}"),
+                    ),
+                    "Doorstop runtime support file.",
+                ));
+            }
         } else if let Some(relative_path) =
             path_after_named_segment(&file.logical_path, "unstripped_corlib")
         {
-            mappings.push(mapping(
-                &file.path,
-                "game",
-                &format!("unstripped_corlib/{}", relative_path),
-                "BepInEx runtime support file.",
-            ));
+            for target_root in &target_roots {
+                mappings.push(mapping(
+                    &file.path,
+                    "game",
+                    &join_install_route(
+                        &install_route_parent(target_root),
+                        &format!("unstripped_corlib/{relative_path}"),
+                    ),
+                    "BepInEx runtime support file.",
+                ));
+            }
         } else if let Some(relative_path) = path_after_named_segment(&file.logical_path, "dotnet") {
-            mappings.push(mapping(
-                &file.path,
-                "game",
-                &format!("dotnet/{}", relative_path),
-                "BepInEx bundled runtime file.",
-            ));
+            for target_root in &target_roots {
+                mappings.push(mapping(
+                    &file.path,
+                    "game",
+                    &join_install_route(
+                        &install_route_parent(target_root),
+                        &format!("dotnet/{relative_path}"),
+                    ),
+                    "BepInEx bundled runtime file.",
+                ));
+            }
         } else if is_bepinex_root_runtime_file(&file.logical_path) {
-            mappings.push(mapping(
-                &file.path,
-                "game",
-                &basename(&file.logical_path),
-                "BepInEx bootstrap file.",
-            ));
+            for target_root in &target_roots {
+                mappings.push(mapping(
+                    &file.path,
+                    "game",
+                    &join_install_route(
+                        &install_route_parent(target_root),
+                        &basename(&file.logical_path),
+                    ),
+                    "BepInEx bootstrap file.",
+                ));
+            }
         } else if lower_path.starts_with("plugins/") {
-            mappings.push(mapping(
-                &file.path,
-                "game",
-                &format!("BepInEx/{}", file.logical_path),
-                "Plugin folder maps into BepInEx/plugins.",
-            ));
+            for target_root in &target_roots {
+                mappings.push(mapping(
+                    &file.path,
+                    "game",
+                    &join_install_route(target_root, &file.logical_path),
+                    "Plugin folder maps into BepInEx/plugins.",
+                ));
+            }
         } else if lower_path.starts_with("config/") || lower_path.ends_with(".cfg") {
-            mappings.push(mapping(
-                &file.path,
-                "game",
-                &format!("BepInEx/config/{}", basename(&file.logical_path)),
-                "BepInEx config file.",
-            ));
+            let target_suffix = if lower_path.starts_with("config/") {
+                file.logical_path.clone()
+            } else {
+                format!("config/{}", basename(&file.logical_path))
+            };
+            for target_root in &target_roots {
+                mappings.push(mapping(
+                    &file.path,
+                    "game",
+                    &join_install_route(target_root, &target_suffix),
+                    "BepInEx config file.",
+                ));
+            }
         } else if is_probable_bepinex_plugin_dll(&file.logical_path, profile) {
-            mappings.push(mapping(
-                &file.path,
-                "game",
-                &format!("BepInEx/plugins/{}", basename(&file.logical_path)),
-                "Managed plugin DLL.",
-            ));
+            for target_root in &target_roots {
+                mappings.push(mapping(
+                    &file.path,
+                    "game",
+                    &join_install_route(
+                        target_root,
+                        &format!("plugins/{}", basename(&file.logical_path)),
+                    ),
+                    "Managed plugin DLL.",
+                ));
+            }
         }
     }
 
@@ -5471,8 +5732,9 @@ fn bepinex_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<Insta
             0.78
         },
         summary: format!(
-            "Install {} file(s) into the BepInEx layout.",
-            mappings.len()
+            "Install {} file(s) into {}.",
+            mappings.len(),
+            join_human_list(&target_roots)
         ),
         mappings,
         dependencies: vec![known_runtime_dependency(profile, runtime)],
@@ -5543,40 +5805,39 @@ fn ue4ss_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<Install
     let mut mappings = Vec::new();
     let mut warnings = Vec::new();
     let mod_folder_name = archive_stem(&scanned.archive_name);
+    let target_roots = ue4ss_target_roots(profile);
 
     for file in &files {
         let lower_path = file.logical_path.to_lowercase();
-        if is_ue4ss_root_runtime_file(&file.logical_path) {
-            mappings.push(mapping(
-                &file.path,
-                "game",
-                &format!("Binaries/Win64/{}", basename(&file.logical_path)),
+        let (target_suffix, reason) = if is_ue4ss_root_runtime_file(&file.logical_path) {
+            (
+                Some(basename(&file.logical_path)),
                 "UE4SS runtime bootstrap file.",
-            ));
+            )
         } else if lower_path.starts_with("mods/") {
-            mappings.push(mapping(
-                &file.path,
-                "game",
-                &format!("Binaries/Win64/{}", file.logical_path),
-                "UE4SS Mods folder.",
-            ));
+            (Some(file.logical_path.clone()), "UE4SS Mods folder.")
         } else if lower_path.starts_with("ue4ss/") {
-            mappings.push(mapping(
-                &file.path,
-                "game",
-                &format!("Binaries/Win64/{}", file.logical_path),
+            (
+                Some(file.logical_path.clone()),
                 "UE4SS runtime or configuration files.",
-            ));
+            )
         } else if lower_path.contains("/scripts/") || lower_path.ends_with(".lua") {
-            mappings.push(mapping(
-                &file.path,
-                "game",
-                &format!(
-                    "Binaries/Win64/Mods/{}/{}",
-                    mod_folder_name, file.logical_path
-                ),
+            (
+                Some(format!("Mods/{}/{}", mod_folder_name, file.logical_path)),
                 "UE4SS script file.",
-            ));
+            )
+        } else {
+            (None, "")
+        };
+        if let Some(target_suffix) = target_suffix {
+            for target_root in &target_roots {
+                mappings.push(mapping(
+                    &file.path,
+                    "game",
+                    &format!("{target_root}/{target_suffix}"),
+                    reason,
+                ));
+            }
         }
     }
 
@@ -5615,8 +5876,9 @@ fn ue4ss_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<Install
         adapter_name: "UE4SS / Unreal Scripts".to_string(),
         confidence: if profile.loader == "ue4ss" { 0.9 } else { 0.72 },
         summary: format!(
-            "Install {} file(s) into the default UE4SS layout.",
-            mappings.len()
+            "Install {} file(s) into {}.",
+            mappings.len(),
+            join_human_list(&target_roots)
         ),
         mappings,
         dependencies: vec![known_runtime_dependency(profile, "ue4ss")],
@@ -5629,43 +5891,63 @@ fn reframework_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<I
     let files = installable_files(&scanned.entries);
     let mut mappings = Vec::new();
     let mut warnings = Vec::new();
+    let target_roots = reframework_target_roots(profile);
 
     for file in &files {
         let lower_path = file.logical_path.to_lowercase();
         if is_reframework_root_runtime_file(&file.logical_path) {
-            mappings.push(mapping(
-                &file.path,
-                "game",
-                &basename(&file.logical_path),
-                "REFramework bootstrap/runtime file.",
-            ));
-        } else if lower_path.starts_with("reframework/") {
-            mappings.push(mapping(
-                &file.path,
-                "game",
-                &file.logical_path,
-                "Archive already contains an REFramework folder layout.",
-            ));
+            for target_root in &target_roots {
+                mappings.push(mapping(
+                    &file.path,
+                    "game",
+                    &join_install_route(
+                        &install_route_parent(target_root),
+                        &basename(&file.logical_path),
+                    ),
+                    "REFramework bootstrap/runtime file.",
+                ));
+            }
+        } else if let Some(relative_path) =
+            path_after_named_segment(&file.logical_path, "reframework")
+        {
+            for target_root in &target_roots {
+                mappings.push(mapping(
+                    &file.path,
+                    "game",
+                    &join_install_route(target_root, &relative_path),
+                    "Archive already contains an REFramework folder layout.",
+                ));
+            }
         } else if lower_path.ends_with(".lua") {
-            mappings.push(mapping(
-                &file.path,
-                "game",
-                &format!("reframework/autorun/{}", basename(&file.logical_path)),
-                "REFramework autorun Lua script.",
-            ));
+            for target_root in &target_roots {
+                mappings.push(mapping(
+                    &file.path,
+                    "game",
+                    &join_install_route(
+                        target_root,
+                        &format!("autorun/{}", basename(&file.logical_path)),
+                    ),
+                    "REFramework autorun Lua script.",
+                ));
+            }
         } else if lower_path.ends_with(".dll") {
-            mappings.push(mapping(
-                &file.path,
-                "game",
-                &format!("reframework/plugins/{}", basename(&file.logical_path)),
-                "REFramework native plugin.",
-            ));
+            for target_root in &target_roots {
+                mappings.push(mapping(
+                    &file.path,
+                    "game",
+                    &join_install_route(
+                        target_root,
+                        &format!("plugins/{}", basename(&file.logical_path)),
+                    ),
+                    "REFramework native plugin.",
+                ));
+            }
         }
     }
 
     let has_signal = files.iter().any(|file| {
         let lower_path = file.logical_path.to_lowercase();
-        lower_path.starts_with("reframework/")
+        path_after_named_segment(&file.logical_path, "reframework").is_some()
             || lower_path.ends_with(".lua")
             || is_reframework_root_runtime_file(&file.logical_path)
     });
@@ -5687,8 +5969,9 @@ fn reframework_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<I
             0.76
         },
         summary: format!(
-            "Install {} file(s) into the REFramework layout.",
-            mappings.len()
+            "Install {} file(s) into {}.",
+            mappings.len(),
+            join_human_list(&target_roots)
         ),
         mappings,
         dependencies: vec![known_runtime_dependency(profile, "reframework")],
@@ -6272,18 +6555,17 @@ fn supported_adapters_for_detection(
     loader: &str,
     entries: &[ProbeEntry],
 ) -> Vec<String> {
-    if let Some(definition) = game_id.and_then(game_definition_by_id) {
-        return definition.supported_adapters.clone();
-    }
-
-    let mut adapters = Vec::new();
+    let mut adapters = game_id
+        .and_then(game_definition_by_id)
+        .map(|definition| definition.supported_adapters.clone())
+        .unwrap_or_default();
     if engine.starts_with("unity") || loader.starts_with("bepinex") {
         push_unique_string_value(&mut adapters, "bepinex");
     }
-    if engine == "unreal" && !find_unreal_pak_roots(game_path).is_empty() {
+    if !find_unreal_pak_roots(game_path).is_empty() {
         push_unique_string_value(&mut adapters, "unreal-pak");
     }
-    if engine == "unreal" && supports_native_script_mods(game_id, entries) {
+    if supports_native_script_mods(game_id, entries) {
         push_unique_string_value(&mut adapters, "script-files");
     }
     if engine == "unreal" && loader == "ue4ss" && !find_unreal_win64_dirs(entries).is_empty() {
@@ -7392,6 +7674,1253 @@ fn choose_runtime_inference(
     })
 }
 
+fn ensure_profile_route_knowledge(
+    root: &Path,
+    profile: &GameProfile,
+    force_refresh: bool,
+) -> RouteKnowledgeOutcome {
+    let existing = read_profile_route_knowledge(root, &profile.id)
+        .ok()
+        .flatten();
+    let mut knowledge = if !force_refresh
+        && existing
+            .as_ref()
+            .is_some_and(profile_route_knowledge_is_fresh)
+    {
+        existing.unwrap()
+    } else {
+        learn_profile_route_knowledge(root, profile, existing.as_ref())
+    };
+
+    let outcome = apply_profile_route_knowledge(profile, &mut knowledge);
+    if let Err(error) = write_profile_route_knowledge(root, &knowledge) {
+        let mut outcome = outcome;
+        outcome
+            .warnings
+            .push(format!("Could not save learned install routes: {error}"));
+        return outcome;
+    }
+    outcome
+}
+
+fn profile_route_knowledge_is_fresh(knowledge: &ProfileRouteKnowledge) -> bool {
+    if knowledge.version != PROFILE_ROUTE_KNOWLEDGE_VERSION {
+        return false;
+    }
+    let Ok(learned_at) = chrono::DateTime::parse_from_rfc3339(&knowledge.learned_at) else {
+        return false;
+    };
+    let age = Utc::now().signed_duration_since(learned_at.with_timezone(&Utc));
+    let maximum_age = if knowledge.sampled_mods == 0 {
+        chrono::Duration::minutes(PROFILE_ROUTE_NEGATIVE_CACHE_MINUTES)
+    } else {
+        chrono::Duration::hours(PROFILE_ROUTE_CACHE_HOURS)
+    };
+    age >= chrono::Duration::zero() && age <= maximum_age
+}
+
+fn learn_profile_route_knowledge(
+    root: &Path,
+    profile: &GameProfile,
+    previous: Option<&ProfileRouteKnowledge>,
+) -> ProfileRouteKnowledge {
+    let settings = read_app_settings(root).ok();
+    let nexus_api_key = settings
+        .as_ref()
+        .and_then(AppSettings::nexus_api_key)
+        .map(str::to_string);
+    let (documents, warnings) = collect_profile_route_documents(profile, nexus_api_key.as_deref());
+    let mut knowledge = build_profile_route_knowledge(profile, &documents, warnings);
+
+    if let Some(previous) = previous {
+        for retained in previous
+            .routes
+            .iter()
+            .filter(|route| route.package_verified)
+        {
+            merge_learned_route(&mut knowledge.routes, retained.clone());
+        }
+    }
+
+    knowledge.routes.sort_by(|first, second| {
+        first
+            .relative_path
+            .to_lowercase()
+            .cmp(&second.relative_path.to_lowercase())
+    });
+    knowledge.routes.truncate(32);
+    knowledge
+}
+
+fn collect_profile_route_documents(
+    profile: &GameProfile,
+    nexus_api_key: Option<&str>,
+) -> (Vec<ProviderRouteDocument>, Vec<String>) {
+    let mut documents = Vec::new();
+    let mut warnings = Vec::new();
+
+    if let Some(community) = thunderstore_community_for_profile(profile) {
+        match fetch_thunderstore_route_documents(&community) {
+            Ok(mut provider_documents) => documents.append(&mut provider_documents),
+            Err(error) => warnings.push(format!(
+                "Thunderstore route metadata was unavailable: {error}"
+            )),
+        }
+    }
+
+    if let Some(domain) = nexus_domain_for_profile(profile) {
+        match fetch_nexus_route_documents(&domain, nexus_api_key) {
+            Ok(mut provider_documents) => documents.append(&mut provider_documents),
+            Err(error) => warnings.push(format!("Nexus route metadata was unavailable: {error}")),
+        }
+    }
+
+    (documents, warnings)
+}
+
+fn fetch_thunderstore_route_documents(
+    community: &str,
+) -> Result<Vec<ProviderRouteDocument>, String> {
+    let packages = fetch_thunderstore_community_packages(community)?;
+    let mut sampled = packages
+        .into_iter()
+        .filter(is_discoverable_thunderstore_package)
+        .filter_map(|package| {
+            let version = latest_active_thunderstore_version(&package)?.clone();
+            Some((package, version))
+        })
+        .collect::<Vec<_>>();
+    sampled.sort_by_key(|(_, version)| std::cmp::Reverse(version.downloads));
+    sampled.truncate(PROFILE_ROUTE_SAMPLE_SIZE);
+
+    let client = thunderstore_client()?;
+    let mut documents = Vec::new();
+    for (batch_index, chunk) in sampled.chunks(PROFILE_ROUTE_FETCH_CONCURRENCY).enumerate() {
+        let include_readme =
+            batch_index * PROFILE_ROUTE_FETCH_CONCURRENCY < PROFILE_ROUTE_FULL_TEXT_SAMPLE_SIZE;
+        let batch_documents = std::thread::scope(|scope| {
+            let handles = chunk
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, (package, version))| {
+                    let client = client.clone();
+                    let fetch_readme = include_readme
+                        && batch_index * PROFILE_ROUTE_FETCH_CONCURRENCY + index
+                            < PROFILE_ROUTE_FULL_TEXT_SAMPLE_SIZE;
+                    let community = community.to_string();
+                    scope.spawn(move || {
+                        let package_ref = ThunderstorePackageRef {
+                            namespace: package.owner.clone(),
+                            name: package.name.clone(),
+                            version: Some(version.version_number.clone()),
+                        };
+                        let readme = fetch_readme
+                            .then(|| {
+                                fetch_thunderstore_package_readme_with_client(
+                                    &client,
+                                    &package_ref,
+                                    &version.version_number,
+                                )
+                                .ok()
+                            })
+                            .flatten()
+                            .unwrap_or_default();
+                        let text = [version.description.as_str(), readme.as_str()]
+                            .into_iter()
+                            .filter(|value| !value.trim().is_empty())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        ProviderRouteDocument {
+                            provider: "Thunderstore".to_string(),
+                            mod_id: format!(
+                                "thunderstore:{community}:{}/{}",
+                                package.owner, package.name
+                            ),
+                            mod_name: humanize_mod_display_name(&package.full_name),
+                            text,
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .filter_map(|handle| handle.join().ok())
+                .collect::<Vec<_>>()
+        });
+        documents.extend(batch_documents);
+    }
+    Ok(documents)
+}
+
+fn fetch_thunderstore_package_readme_with_client(
+    client: &Client,
+    package_ref: &ThunderstorePackageRef,
+    version: &str,
+) -> Result<String, String> {
+    let url = format!(
+        "{}/{}/{}/{}/readme/",
+        THUNDERSTORE_API_BASE,
+        sanitize_url_path_segment(&package_ref.namespace),
+        sanitize_url_path_segment(&package_ref.name),
+        sanitize_url_path_segment(version)
+    );
+    client
+        .get(url)
+        .send()
+        .map_err(error_to_string)?
+        .error_for_status()
+        .map_err(error_to_string)?
+        .json::<ThunderstoreMarkdownResponse>()
+        .map(|response| response.markdown)
+        .map_err(error_to_string)
+}
+
+fn thunderstore_route_document(
+    package_ref: &ThunderstorePackageRef,
+    version: &ThunderstoreVersion,
+) -> ProviderRouteDocument {
+    let readme = thunderstore_client()
+        .and_then(|client| {
+            fetch_thunderstore_package_readme_with_client(
+                &client,
+                package_ref,
+                &version.version_number,
+            )
+        })
+        .unwrap_or_default();
+    ProviderRouteDocument {
+        provider: "Thunderstore".to_string(),
+        mod_id: thunderstore_package_id(package_ref),
+        mod_name: humanize_mod_display_name(&version.full_name),
+        text: [version.description.as_str(), readme.as_str()]
+            .into_iter()
+            .filter(|value| !value.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+fn fetch_nexus_route_documents(
+    domain: &str,
+    api_key: Option<&str>,
+) -> Result<Vec<ProviderRouteDocument>, String> {
+    let client = provider_client()?;
+    let page = fetch_nexus_mod_page(&client, domain, 0, PROFILE_ROUTE_SAMPLE_SIZE)?;
+    let nodes = page
+        .nodes
+        .into_iter()
+        .filter(|node| node.mod_id.is_some())
+        .collect::<Vec<_>>();
+    let mut details_by_id = HashMap::<u64, NexusModDetails>::new();
+
+    if let Some(api_key) = api_key.filter(|value| !value.trim().is_empty()) {
+        for chunk in nodes[..nodes.len().min(PROFILE_ROUTE_FULL_TEXT_SAMPLE_SIZE)]
+            .chunks(PROFILE_ROUTE_FETCH_CONCURRENCY)
+        {
+            let batch_details = std::thread::scope(|scope| {
+                let handles = chunk
+                    .iter()
+                    .filter_map(|node| node.mod_id)
+                    .map(|mod_id| {
+                        let client = client.clone();
+                        let api_key = api_key.to_string();
+                        let domain = domain.to_string();
+                        scope.spawn(move || {
+                            fetch_nexus_mod_details(&client, &api_key, &domain, mod_id)
+                                .ok()
+                                .map(|details| (mod_id, details))
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .filter_map(|handle| handle.join().ok().flatten())
+                    .collect::<Vec<_>>()
+            });
+            details_by_id.extend(batch_details);
+        }
+    }
+
+    Ok(nodes
+        .into_iter()
+        .filter_map(|node| {
+            let mod_id = node.mod_id?;
+            let details = details_by_id.remove(&mod_id).unwrap_or_default();
+            let name = non_empty_string(details.name.trim())
+                .or(node.name)
+                .unwrap_or_else(|| format!("Nexus mod {mod_id}"));
+            let summary = node.summary.unwrap_or_default();
+            let text = [
+                summary.as_str(),
+                details.summary.as_str(),
+                details.description.as_str(),
+            ]
+            .into_iter()
+            .filter(|value| !value.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+            Some(ProviderRouteDocument {
+                provider: "Nexus Mods".to_string(),
+                mod_id: format!("nexus:{domain}/{mod_id}"),
+                mod_name: name,
+                text,
+            })
+        })
+        .collect())
+}
+
+fn fetch_nexus_mod_details(
+    client: &Client,
+    api_key: &str,
+    domain: &str,
+    mod_id: u64,
+) -> Result<NexusModDetails, String> {
+    let url = format!(
+        "https://api.nexusmods.com/v1/games/{}/mods/{}.json",
+        sanitize_url_path_segment(domain),
+        mod_id
+    );
+    nexus_api_get(client, &url, api_key)
+        .send()
+        .map_err(error_to_string)?
+        .error_for_status()
+        .map_err(error_to_string)?
+        .json::<NexusModDetails>()
+        .map_err(error_to_string)
+}
+
+fn build_profile_route_knowledge(
+    profile: &GameProfile,
+    documents: &[ProviderRouteDocument],
+    warnings: Vec<String>,
+) -> ProfileRouteKnowledge {
+    #[derive(Default)]
+    struct RouteAggregate {
+        relative_path: String,
+        adapter_id: String,
+        scopes: HashSet<String>,
+        supporters: HashSet<String>,
+        providers: HashSet<String>,
+        evidence: Vec<RouteEvidence>,
+    }
+
+    let mut aggregates = HashMap::<String, RouteAggregate>::new();
+    for document in documents {
+        let mut document_routes = HashSet::new();
+        for candidate in extract_install_route_candidates(profile, &document.text) {
+            let key = install_route_key(&candidate.adapter_id, &candidate.relative_path);
+            if !document_routes.insert(key.clone()) {
+                continue;
+            }
+            let aggregate = aggregates.entry(key).or_default();
+            aggregate.relative_path = candidate.relative_path;
+            aggregate.adapter_id = candidate.adapter_id;
+            aggregate.scopes.extend(candidate.scopes);
+            aggregate.supporters.insert(document.mod_id.clone());
+            aggregate.providers.insert(document.provider.clone());
+            if aggregate.evidence.len() < PROFILE_ROUTE_MAX_EVIDENCE {
+                aggregate.evidence.push(RouteEvidence {
+                    provider: document.provider.clone(),
+                    mod_id: document.mod_id.clone(),
+                    mod_name: document.mod_name.clone(),
+                    excerpt: candidate.excerpt,
+                });
+            }
+        }
+    }
+
+    let mut routes = aggregates
+        .into_values()
+        .filter_map(|aggregate| {
+            if !validate_learned_route_shape(&aggregate.adapter_id, &aggregate.relative_path) {
+                return None;
+            }
+            let supporting_mods = aggregate.supporters.len();
+            let route_exists = safe_join(Path::new(&profile.game_path), &aggregate.relative_path)
+                .map(|path| path.is_dir())
+                .unwrap_or(false);
+            let compatible = route_adapter_compatible(profile, &aggregate.adapter_id);
+            let trusted = supporting_mods >= PROFILE_ROUTE_MIN_SUPPORT
+                && (compatible || route_exists || profile.engine == "unknown");
+            let confidence = (0.58
+                + 0.1 * supporting_mods.min(4) as f64
+                + if aggregate.providers.len() > 1 {
+                    0.08
+                } else {
+                    0.0
+                }
+                + if route_exists { 0.05 } else { 0.0 })
+            .min(0.98);
+            let mut scopes = aggregate.scopes.into_iter().collect::<Vec<_>>();
+            scopes.sort();
+            let mut providers = aggregate.providers.into_iter().collect::<Vec<_>>();
+            providers.sort();
+            Some(LearnedInstallRoute {
+                relative_path: aggregate.relative_path,
+                adapter_id: aggregate.adapter_id,
+                scopes,
+                confidence,
+                supporting_mods,
+                providers,
+                evidence: aggregate.evidence,
+                trusted,
+                package_verified: false,
+                created: false,
+            })
+        })
+        .collect::<Vec<_>>();
+    routes.sort_by(|first, second| {
+        second
+            .trusted
+            .cmp(&first.trusted)
+            .then_with(|| {
+                second
+                    .confidence
+                    .partial_cmp(&first.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| first.relative_path.cmp(&second.relative_path))
+    });
+
+    let mut providers = documents
+        .iter()
+        .map(|document| document.provider.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    providers.sort();
+    let sampled_mods = documents
+        .iter()
+        .map(|document| document.mod_id.to_lowercase())
+        .collect::<HashSet<_>>()
+        .len();
+
+    ProfileRouteKnowledge {
+        version: PROFILE_ROUTE_KNOWLEDGE_VERSION,
+        profile_id: profile.id.clone(),
+        learned_at: now_string(),
+        sampled_mods,
+        providers,
+        routes,
+        warnings,
+    }
+}
+
+fn merge_learned_route(routes: &mut Vec<LearnedInstallRoute>, incoming: LearnedInstallRoute) {
+    let key = install_route_key(&incoming.adapter_id, &incoming.relative_path);
+    if let Some(existing) = routes
+        .iter_mut()
+        .find(|route| install_route_key(&route.adapter_id, &route.relative_path) == key)
+    {
+        for scope in incoming.scopes {
+            push_unique_string_value(&mut existing.scopes, &scope);
+        }
+        for provider in incoming.providers {
+            push_unique_string_value(&mut existing.providers, &provider);
+        }
+        for evidence in incoming.evidence {
+            if existing.evidence.len() >= PROFILE_ROUTE_MAX_EVIDENCE {
+                break;
+            }
+            if !existing.evidence.iter().any(|item| {
+                item.mod_id.eq_ignore_ascii_case(&evidence.mod_id)
+                    && item.provider.eq_ignore_ascii_case(&evidence.provider)
+            }) {
+                existing.evidence.push(evidence);
+            }
+        }
+        existing.supporting_mods = existing.supporting_mods.max(incoming.supporting_mods).max(
+            existing
+                .evidence
+                .iter()
+                .map(|evidence| evidence.mod_id.to_lowercase())
+                .collect::<HashSet<_>>()
+                .len(),
+        );
+        existing.confidence = existing.confidence.max(incoming.confidence);
+        existing.trusted |= incoming.trusted;
+        existing.package_verified |= incoming.package_verified;
+        existing.created |= incoming.created;
+    } else {
+        routes.push(incoming);
+    }
+}
+
+fn install_route_key(adapter_id: &str, relative_path: &str) -> String {
+    format!(
+        "{}|{}",
+        adapter_id.to_lowercase(),
+        normalize_archive_path(relative_path).to_lowercase()
+    )
+}
+
+fn extract_install_route_candidates(
+    profile: &GameProfile,
+    text: &str,
+) -> Vec<InstallRouteCandidate> {
+    let scan_text = provider_text_for_route_scan(text);
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+
+    for line in scan_text.lines() {
+        let context = line.trim();
+        if context.is_empty() {
+            continue;
+        }
+        for token in context.split(|character: char| {
+            character.is_whitespace()
+                || matches!(
+                    character,
+                    '\'' | '"' | '`' | '=' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '|'
+                )
+        }) {
+            let Some((relative_path, adapter_id)) =
+                normalize_install_route_candidate(profile, token)
+            else {
+                continue;
+            };
+            let key = install_route_key(&adapter_id, &relative_path);
+            if !seen.insert(key) {
+                continue;
+            }
+            candidates.push(InstallRouteCandidate {
+                relative_path,
+                adapter_id,
+                scopes: install_route_scopes(context),
+                excerpt: compact_route_excerpt(context),
+            });
+        }
+    }
+
+    candidates
+}
+
+fn provider_text_for_route_scan(text: &str) -> String {
+    let decoded = text
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#92;", "\\")
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&");
+    let characters = decoded.chars().collect::<Vec<_>>();
+    let mut output = String::with_capacity(decoded.len());
+    let mut index = 0usize;
+
+    while index < characters.len() {
+        if characters[index] != '<' {
+            output.push(characters[index]);
+            index += 1;
+            continue;
+        }
+        let Some(relative_end) = characters[index + 1..]
+            .iter()
+            .position(|character| *character == '>')
+        else {
+            output.push('<');
+            index += 1;
+            continue;
+        };
+        let end = index + 1 + relative_end;
+        let content = characters[index + 1..end].iter().collect::<String>();
+        let tag_name = content
+            .trim()
+            .trim_start_matches('/')
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches('/')
+            .to_lowercase();
+        if is_provider_html_tag(&tag_name) {
+            if matches!(
+                tag_name.as_str(),
+                "br" | "p" | "div" | "li" | "tr" | "h1" | "h2" | "h3" | "h4" | "pre"
+            ) {
+                output.push('\n');
+            } else {
+                output.push(' ');
+            }
+        } else {
+            output.push('<');
+            for character in content.chars() {
+                output.push(if character.is_whitespace() {
+                    '_'
+                } else {
+                    character
+                });
+            }
+            output.push('>');
+        }
+        index = end + 1;
+    }
+    output
+}
+
+fn is_provider_html_tag(tag_name: &str) -> bool {
+    matches!(
+        tag_name,
+        "a" | "b"
+            | "blockquote"
+            | "br"
+            | "code"
+            | "div"
+            | "em"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "i"
+            | "img"
+            | "li"
+            | "ol"
+            | "p"
+            | "pre"
+            | "span"
+            | "strong"
+            | "table"
+            | "tbody"
+            | "td"
+            | "th"
+            | "thead"
+            | "tr"
+            | "ul"
+    )
+}
+
+fn normalize_install_route_candidate(
+    profile: &GameProfile,
+    raw_token: &str,
+) -> Option<(String, String)> {
+    let mut token = raw_token.trim_matches(|character: char| {
+        !(character.is_ascii_alphanumeric()
+            || matches!(
+                character,
+                '/' | '\\' | '.' | '_' | '-' | '~' | '<' | '>' | ':'
+            ))
+    });
+    if token.is_empty()
+        || token.to_lowercase().contains("://")
+        || token.to_lowercase().starts_with("www.")
+    {
+        return None;
+    }
+    if let Some(colon_index) = token.rfind(':') {
+        if colon_index == 1
+            && token
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_alphabetic())
+        {
+            return None;
+        }
+        token = &token[colon_index + 1..];
+    }
+
+    let mut normalized = token.replace('\\', "/");
+    while normalized.contains("//") {
+        normalized = normalized.replace("//", "/");
+    }
+    normalized = normalized
+        .trim_matches(|character: char| {
+            !(character.is_ascii_alphanumeric()
+                || matches!(character, '/' | '.' | '_' | '-' | '~' | '<' | '>'))
+        })
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_string();
+
+    if normalized.starts_with('<') {
+        let placeholder_end = normalized.find('>')?;
+        let placeholder = &normalized[1..placeholder_end];
+        if !profile_route_placeholder_matches(profile, placeholder) {
+            return None;
+        }
+        normalized = normalized[placeholder_end + 1..]
+            .trim_start_matches('/')
+            .to_string();
+    }
+
+    let aliases = profile_route_root_aliases(profile);
+    let mut parts = normalized
+        .split('/')
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| part.trim().to_string())
+        .collect::<Vec<_>>();
+    if parts
+        .first()
+        .is_some_and(|part| aliases.contains(&compact_provider_slug(part)))
+    {
+        parts.remove(0);
+    }
+    if parts.is_empty() || parts.len() > 12 {
+        return None;
+    }
+    if parts.iter().any(|part| !safe_install_route_component(part)) {
+        return None;
+    }
+
+    let (relative_path, adapter_id) = canonical_install_route(&parts)?;
+    if relative_path.len() > 260
+        || !validate_learned_route_shape(&adapter_id, &relative_path)
+        || !route_has_safe_internal_root(profile, &relative_path, &adapter_id)
+    {
+        return None;
+    }
+    safe_join(Path::new(&profile.game_path), &relative_path).ok()?;
+    Some((relative_path, adapter_id))
+}
+
+fn profile_route_placeholder_matches(profile: &GameProfile, placeholder: &str) -> bool {
+    let compact = compact_provider_slug(placeholder);
+    if matches!(
+        compact.as_str(),
+        "game" | "gamefolder" | "gamedirectory" | "gameroot" | "installfolder" | "steamlocation"
+    ) {
+        return true;
+    }
+    profile_route_root_aliases(profile).contains(&compact)
+}
+
+fn profile_route_root_aliases(profile: &GameProfile) -> HashSet<String> {
+    let mut aliases = HashSet::new();
+    aliases.insert(compact_provider_slug(&profile.name));
+    if let Some(folder_name) = Path::new(&profile.game_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+    {
+        aliases.insert(compact_provider_slug(folder_name));
+    }
+    if let Some(definition) = profile.game_id.as_deref().and_then(game_definition_by_id) {
+        aliases.insert(compact_provider_slug(&definition.display_name));
+        aliases.insert(compact_provider_slug(&definition.id));
+    }
+    aliases.retain(|alias| !alias.is_empty());
+    aliases
+}
+
+fn safe_install_route_component(component: &str) -> bool {
+    let trimmed = component.trim();
+    if trimmed.is_empty()
+        || matches!(trimmed, "." | "..")
+        || trimmed.len() > 80
+        || trimmed.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    ':' | '*' | '?' | '"' | '<' | '>' | '|' | '$' | '%'
+                )
+        })
+    {
+        return false;
+    }
+    !matches!(
+        trimmed.trim_end_matches('.').to_lowercase().as_str(),
+        "con"
+            | "prn"
+            | "aux"
+            | "nul"
+            | "com1"
+            | "com2"
+            | "com3"
+            | "com4"
+            | "lpt1"
+            | "lpt2"
+            | "lpt3"
+    )
+}
+
+fn canonical_install_route(parts: &[String]) -> Option<(String, String)> {
+    let lower = parts
+        .iter()
+        .map(|part| part.to_lowercase())
+        .collect::<Vec<_>>();
+    if let Some(index) = lower
+        .windows(2)
+        .position(|parts| parts[0] == "content" && parts[1] == "paks")
+    {
+        let mut route = parts[..=index + 1].to_vec();
+        route.push("~mods".to_string());
+        return Some((route.join("/"), "unreal-pak".to_string()));
+    }
+    if let Some(index) = lower
+        .windows(2)
+        .position(|parts| matches!(parts[0].as_str(), "script" | "scripts") && parts[1] == "mods")
+    {
+        return Some((parts[..=index + 1].join("/"), "script-files".to_string()));
+    }
+    if let Some(index) = lower
+        .windows(3)
+        .position(|parts| parts[0] == "binaries" && parts[1] == "win64" && parts[2] == "mods")
+    {
+        return Some((parts[..=index + 2].join("/"), "ue4ss".to_string()));
+    }
+    if let Some(index) = lower.windows(2).position(|parts| {
+        parts[0] == "bepinex" && matches!(parts[1].as_str(), "plugins" | "config")
+    }) {
+        return Some((parts[..=index + 1].join("/"), "bepinex".to_string()));
+    }
+    if let Some(index) = lower.windows(2).position(|parts| {
+        parts[0] == "reframework" && matches!(parts[1].as_str(), "autorun" | "plugins")
+    }) {
+        return Some((parts[..=index + 1].join("/"), "reframework".to_string()));
+    }
+    None
+}
+
+fn validate_learned_route_shape(adapter_id: &str, relative_path: &str) -> bool {
+    let parts = normalize_archive_path(relative_path)
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(|part| part.to_lowercase())
+        .collect::<Vec<_>>();
+    if parts.is_empty() || parts.len() > 12 || parts.iter().any(|part| part == "..") {
+        return false;
+    }
+    match adapter_id {
+        "unreal-pak" => {
+            parts.len() >= 3
+                && parts[parts.len() - 3] == "content"
+                && parts[parts.len() - 2] == "paks"
+                && parts[parts.len() - 1] == "~mods"
+        }
+        "script-files" => {
+            parts.len() >= 2
+                && matches!(parts[parts.len() - 2].as_str(), "script" | "scripts")
+                && parts[parts.len() - 1] == "mods"
+        }
+        "ue4ss" => {
+            parts.len() >= 3
+                && parts[parts.len() - 3] == "binaries"
+                && parts[parts.len() - 2] == "win64"
+                && parts[parts.len() - 1] == "mods"
+        }
+        "bepinex" => {
+            parts.len() >= 2
+                && parts[parts.len() - 2] == "bepinex"
+                && matches!(parts[parts.len() - 1].as_str(), "plugins" | "config")
+        }
+        "reframework" => {
+            parts.len() >= 2
+                && parts[parts.len() - 2] == "reframework"
+                && matches!(parts[parts.len() - 1].as_str(), "autorun" | "plugins")
+        }
+        _ => false,
+    }
+}
+
+fn route_has_safe_internal_root(
+    profile: &GameProfile,
+    relative_path: &str,
+    adapter_id: &str,
+) -> bool {
+    let Some(first) = normalize_archive_path(relative_path)
+        .split('/')
+        .find(|part| !part.is_empty())
+        .map(str::to_string)
+    else {
+        return false;
+    };
+    let lower = first.to_lowercase();
+    if matches!(
+        lower.as_str(),
+        "users"
+            | "windows"
+            | "programdata"
+            | "appdata"
+            | "documents"
+            | "desktop"
+            | "downloads"
+            | "steamapps"
+    ) {
+        return false;
+    }
+    if Path::new(&profile.game_path).join(&first).exists() {
+        return true;
+    }
+    matches!(
+        (adapter_id, lower.as_str()),
+        ("unreal-pak", "content")
+            | ("script-files", "script")
+            | ("script-files", "scripts")
+            | ("ue4ss", "binaries")
+            | ("bepinex", "bepinex")
+            | ("reframework", "reframework")
+    )
+}
+
+fn install_route_scopes(context: &str) -> Vec<String> {
+    let lower = context.to_lowercase();
+    let mut scopes = Vec::new();
+    if lower.contains("single player") || lower.contains("single-player") || lower.contains("solo")
+    {
+        scopes.push("client".to_string());
+    }
+    if lower.contains("multiplayer")
+        || lower.contains("local server")
+        || lower.contains("hosting")
+        || lower.contains("windowsserver")
+    {
+        scopes.push("hosted-server".to_string());
+    }
+    if lower.contains("dedicated server") || lower.contains("dedicated-server") {
+        scopes.push("dedicated-server".to_string());
+    }
+    if scopes.is_empty() {
+        scopes.push("general".to_string());
+    }
+    scopes
+}
+
+fn compact_route_excerpt(context: &str) -> String {
+    context
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(240)
+        .collect()
+}
+
+fn route_adapter_compatible(profile: &GameProfile, adapter_id: &str) -> bool {
+    if profile
+        .game_id
+        .as_deref()
+        .and_then(game_definition_by_id)
+        .is_some_and(|definition| {
+            definition
+                .supported_adapters
+                .iter()
+                .any(|adapter| adapter.eq_ignore_ascii_case(adapter_id))
+        })
+    {
+        return true;
+    }
+    match adapter_id {
+        "bepinex" => profile.engine.starts_with("unity") || profile.loader.starts_with("bepinex"),
+        "unreal-pak" | "script-files" | "ue4ss" => {
+            profile.engine == "unreal" || profile.loader == "ue4ss"
+        }
+        "reframework" => profile.engine == "re-engine" || profile.loader == "reframework",
+        _ => false,
+    }
+}
+
+fn apply_profile_route_knowledge(
+    profile: &GameProfile,
+    knowledge: &mut ProfileRouteKnowledge,
+) -> RouteKnowledgeOutcome {
+    let mut outcome = RouteKnowledgeOutcome::default();
+    for route in knowledge.routes.iter_mut().filter(|route| route.trusted) {
+        if !validate_learned_route_shape(&route.adapter_id, &route.relative_path)
+            || !route_has_safe_internal_root(profile, &route.relative_path, &route.adapter_id)
+            || !(route_adapter_compatible(profile, &route.adapter_id)
+                || route.package_verified
+                || profile.engine == "unknown")
+        {
+            outcome.warnings.push(format!(
+                "Skipped an unsafe or incompatible learned route: {}.",
+                route.relative_path
+            ));
+            continue;
+        }
+        push_unique_route(&mut outcome.expected_routes, &route.relative_path);
+        match ensure_directory_beneath_root(Path::new(&profile.game_path), &route.relative_path) {
+            Ok(created) => {
+                route.created |= created;
+                if created {
+                    push_unique_route(&mut outcome.created_routes, &route.relative_path);
+                }
+            }
+            Err(error) => outcome.warnings.push(format!(
+                "Could not prepare learned install route {}: {}",
+                route.relative_path, error
+            )),
+        }
+    }
+    outcome
+}
+
+fn ensure_directory_beneath_root(root: &Path, relative_path: &str) -> Result<bool, String> {
+    if !root.is_dir() {
+        return Err("The verified Steam game folder no longer exists.".to_string());
+    }
+    let root_canonical = fs::canonicalize(root).map_err(error_to_string)?;
+    let target = safe_join(root, relative_path)?;
+    if target.exists() && !target.is_dir() {
+        return Err("The expected route exists as a file.".to_string());
+    }
+
+    let mut existing_ancestor = target.as_path();
+    while !existing_ancestor.exists() {
+        existing_ancestor = existing_ancestor
+            .parent()
+            .ok_or_else(|| "The route has no safe existing parent.".to_string())?;
+    }
+    let ancestor_canonical = fs::canonicalize(existing_ancestor).map_err(error_to_string)?;
+    if !ancestor_canonical.starts_with(&root_canonical) {
+        return Err("The route escapes the verified Steam game folder.".to_string());
+    }
+    if target.is_dir() {
+        let target_canonical = fs::canonicalize(&target).map_err(error_to_string)?;
+        if !target_canonical.starts_with(&root_canonical) {
+            return Err("The route resolves outside the verified Steam game folder.".to_string());
+        }
+        return Ok(false);
+    }
+
+    fs::create_dir_all(&target).map_err(error_to_string)?;
+    let target_canonical = fs::canonicalize(&target).map_err(error_to_string)?;
+    if !target_canonical.starts_with(&root_canonical) {
+        return Err(
+            "The created route resolves outside the verified Steam game folder.".to_string(),
+        );
+    }
+    Ok(true)
+}
+
+fn prepare_package_install_routes(
+    root: &Path,
+    profile: &GameProfile,
+    scanned: &ScannedArchive,
+    document: &ProviderRouteDocument,
+) -> RouteKnowledgeOutcome {
+    let candidates = extract_install_route_candidates(profile, &document.text)
+        .into_iter()
+        .filter(|candidate| archive_supports_adapter(scanned, &candidate.adapter_id))
+        .filter(|candidate| {
+            route_adapter_compatible(profile, &candidate.adapter_id) || profile.engine == "unknown"
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return RouteKnowledgeOutcome::default();
+    }
+
+    let mut knowledge = read_profile_route_knowledge(root, &profile.id)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| ProfileRouteKnowledge {
+            version: PROFILE_ROUTE_KNOWLEDGE_VERSION,
+            profile_id: profile.id.clone(),
+            learned_at: now_string(),
+            sampled_mods: 0,
+            providers: Vec::new(),
+            routes: Vec::new(),
+            warnings: Vec::new(),
+        });
+    push_unique_string_value(&mut knowledge.providers, &document.provider);
+
+    for candidate in candidates {
+        merge_learned_route(
+            &mut knowledge.routes,
+            LearnedInstallRoute {
+                relative_path: candidate.relative_path,
+                adapter_id: candidate.adapter_id,
+                scopes: candidate.scopes,
+                confidence: 0.92,
+                supporting_mods: 1,
+                providers: vec![document.provider.clone()],
+                evidence: vec![RouteEvidence {
+                    provider: document.provider.clone(),
+                    mod_id: document.mod_id.clone(),
+                    mod_name: document.mod_name.clone(),
+                    excerpt: candidate.excerpt,
+                }],
+                trusted: true,
+                package_verified: true,
+                created: false,
+            },
+        );
+    }
+    knowledge.learned_at = now_string();
+    let mut outcome = apply_profile_route_knowledge(profile, &mut knowledge);
+    if let Err(error) = write_profile_route_knowledge(root, &knowledge) {
+        outcome.warnings.push(format!(
+            "Could not remember this package's install route: {error}"
+        ));
+    }
+    outcome
+}
+
+fn archive_supports_adapter(scanned: &ScannedArchive, adapter_id: &str) -> bool {
+    scanned.entries.iter().any(|entry| {
+        if entry.is_directory {
+            return false;
+        }
+        let path = entry.logical_path.to_lowercase();
+        let name = basename(&path).to_lowercase();
+        match adapter_id {
+            "unreal-pak" => {
+                path.ends_with(".pak") || path.ends_with(".ucas") || path.ends_with(".utoc")
+            }
+            "script-files" => path.ends_with(".as"),
+            "ue4ss" => {
+                path.ends_with(".lua")
+                    || path.starts_with("mods/")
+                    || path.starts_with("ue4ss/")
+                    || is_ue4ss_root_runtime_file(&path)
+            }
+            "bepinex" => {
+                path.contains("bepinex/")
+                    || path.starts_with("plugins/")
+                    || name.ends_with(".dll")
+                    || is_bepinex_root_runtime_file(&path)
+            }
+            "reframework" => {
+                path.starts_with("reframework/")
+                    || path.ends_with(".lua")
+                    || is_reframework_root_runtime_file(&path)
+            }
+            _ => false,
+        }
+    })
+}
+
+fn description_runtime_dependencies(
+    profile: &GameProfile,
+    text: &str,
+    provided_runtime: Option<&str>,
+) -> Vec<DependencySpec> {
+    let searchable = ascii_requirement_text(text);
+    if searchable.is_empty() {
+        return Vec::new();
+    }
+    let mut dependencies = Vec::new();
+    for definition in runtime_definitions() {
+        if provided_runtime.is_some_and(|runtime| runtime.eq_ignore_ascii_case(&definition.id))
+            || !runtime_definition_matches_profile(definition, profile)
+            || !runtime_alias_is_required(&searchable, &runtime_requirement_aliases(&definition.id))
+        {
+            continue;
+        }
+        let dependency = known_runtime_dependency(profile, &definition.id);
+        if !dependencies.iter().any(|existing: &DependencySpec| {
+            dependency_key(existing) == dependency_key(&dependency)
+        }) {
+            dependencies.push(dependency);
+        }
+    }
+    dependencies
+}
+
+fn runtime_definition_matches_profile(
+    definition: &RuntimeDefinition,
+    profile: &GameProfile,
+) -> bool {
+    profile.engine == "unknown"
+        || definition
+            .profile_engines
+            .iter()
+            .any(|engine| engine.eq_ignore_ascii_case(&profile.engine))
+        || definition
+            .profile_loaders
+            .iter()
+            .any(|loader| loader.eq_ignore_ascii_case(&profile.loader))
+}
+
+fn runtime_requirement_aliases(runtime_id: &str) -> Vec<&'static str> {
+    match runtime_id {
+        "bepinex" | "bepinex-il2cpp" => vec!["bepinex", "bep in ex"],
+        "ue4ss" => vec!["ue4ss", "re ue4ss"],
+        "reframework" => vec!["reframework", "re framework"],
+        _ => Vec::new(),
+    }
+}
+
+fn ascii_requirement_text(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn runtime_alias_is_required(searchable: &str, aliases: &[&str]) -> bool {
+    const REQUIREMENT_WORDS: [&str; 10] = [
+        "require",
+        "requires",
+        "required",
+        "requirement",
+        "requirements",
+        "dependency",
+        "dependencies",
+        "prerequisite",
+        "needs",
+        "install first",
+    ];
+    aliases.iter().any(|alias| {
+        let mut offset = 0usize;
+        while let Some(relative_index) = searchable[offset..].find(alias) {
+            let index = offset + relative_index;
+            let alias_end = index + alias.len();
+            let starts_on_boundary =
+                index == 0 || !searchable.as_bytes()[index - 1].is_ascii_alphanumeric();
+            let ends_on_boundary = alias_end == searchable.len()
+                || !searchable.as_bytes()[alias_end].is_ascii_alphanumeric();
+            if !starts_on_boundary || !ends_on_boundary {
+                offset = index + 1;
+                continue;
+            }
+            let start = index.saturating_sub(140);
+            let end = (alias_end + 140).min(searchable.len());
+            let local_start = index.saturating_sub(64);
+            let local_end = (alias_end + 64).min(searchable.len());
+            let local = &searchable[local_start..local_end];
+            if !runtime_requirement_is_negated(local, alias)
+                && REQUIREMENT_WORDS
+                    .iter()
+                    .any(|word| searchable[start..end].contains(word))
+            {
+                return true;
+            }
+            offset = alias_end;
+        }
+        false
+    })
+}
+
+fn runtime_requirement_is_negated(context: &str, alias: &str) -> bool {
+    [
+        format!("does not require {alias}"),
+        format!("doesnt require {alias}"),
+        format!("do not require {alias}"),
+        format!("not require {alias}"),
+        format!("without {alias}"),
+        format!("no need for {alias}"),
+        format!("{alias} is not required"),
+        format!("{alias} not required"),
+        format!("{alias} is optional"),
+        format!("{alias} optional"),
+        format!("optional {alias}"),
+    ]
+    .iter()
+    .any(|phrase| context.contains(phrase))
+}
+
+fn append_unique_dependencies(
+    destination: &mut Vec<DependencySpec>,
+    dependencies: impl IntoIterator<Item = DependencySpec>,
+) {
+    for dependency in dependencies {
+        if !destination
+            .iter()
+            .any(|existing| dependency_key(existing) == dependency_key(&dependency))
+        {
+            destination.push(dependency);
+        }
+    }
+}
+
 fn runtime_id_for_provider_package(
     profile: &GameProfile,
     provider: &str,
@@ -8475,8 +10004,35 @@ fn install_resolved_nexus_file(
         );
     }
 
+    let details =
+        fetch_nexus_mod_details(client, api_key, domain, nexus_mod_id).unwrap_or_default();
+    let mod_name =
+        non_empty_string(details.name.trim()).unwrap_or_else(|| nexus_file_display_name(file));
+    let provider_document = ProviderRouteDocument {
+        provider: "Nexus Mods".to_string(),
+        mod_id: format!("nexus:{domain}/{nexus_mod_id}"),
+        mod_name: mod_name.clone(),
+        text: [
+            details.summary.as_str(),
+            details.description.as_str(),
+            file.description.as_deref().unwrap_or_default(),
+        ]
+        .into_iter()
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n"),
+    };
+    let provided_runtime = runtime_id_for_provider_package(profile, "nexus", None, &mod_name);
     let requirements = fetch_nexus_mod_requirements(client, domain, nexus_mod_id)?;
-    let dependencies = nexus_requirement_dependencies(profile, domain, &requirements);
+    let mut dependencies = nexus_requirement_dependencies(profile, domain, &requirements);
+    append_unique_dependencies(
+        &mut dependencies,
+        description_runtime_dependencies(
+            profile,
+            &provider_document.text,
+            provided_runtime.as_deref(),
+        ),
+    );
     let dependency_warnings = install_nexus_requirement_dependencies(
         store_root,
         profile,
@@ -8499,6 +10055,8 @@ fn install_resolved_nexus_file(
         "Nexus Mods discovery result and file download",
     );
     let scanned = scan_import_source(store_root, &archive_path)?;
+    let route_outcome =
+        prepare_package_install_routes(store_root, profile, &scanned, &provider_document);
     let analysis = analyze_scanned_archive_with_identity(scanned, profile, Some(source_identity));
     let install_source_path = analysis.archive_path.clone();
     let package_identity = analysis.package_identity.clone();
@@ -8506,16 +10064,9 @@ fn install_resolved_nexus_file(
         .recommended_plan
         .ok_or_else(|| analysis.compatibility.reason.clone())?;
 
-    for dependency in dependencies {
-        if !plan
-            .dependencies
-            .iter()
-            .any(|existing| dependency_key(existing) == dependency_key(&dependency))
-        {
-            plan.dependencies.push(dependency);
-        }
-    }
+    append_unique_dependencies(&mut plan.dependencies, dependencies);
     plan.warnings.extend(dependency_warnings);
+    plan.warnings.extend(route_outcome.warnings);
 
     if plan.adapter_id == "loose-files" || plan.requires_confirmation {
         return Err(format!(
@@ -9104,6 +10655,13 @@ fn install_thunderstore_discovered_mod(
     let package_id = thunderstore_package_id(&package_ref);
     let dependency_string =
         thunderstore_dependency_string(&package_ref, &package_version.version_number);
+    let provider_document = thunderstore_route_document(&resolved_ref, &package_version);
+    let provided_runtime = runtime_id_for_provider_package(
+        profile,
+        "thunderstore",
+        Some(&package_ref.namespace),
+        &package_ref.name,
+    );
 
     if thunderstore_package_installed(store_root, profile, &package_id, Some(&dependency_string)) {
         return Err(format!(
@@ -9121,6 +10679,8 @@ fn install_thunderstore_discovered_mod(
         "Thunderstore community catalogue and package manifest",
     );
     let scanned = scan_zip_archive(&archive_path)?;
+    let route_outcome =
+        prepare_package_install_routes(store_root, profile, &scanned, &provider_document);
     let analysis = analyze_scanned_archive_with_identity(scanned, profile, Some(source_identity));
     let package_identity = analysis.package_identity.clone();
     let mut plan = analysis
@@ -9133,6 +10693,15 @@ fn install_thunderstore_discovered_mod(
             plan.dependencies.push(parsed);
         }
     }
+    append_unique_dependencies(
+        &mut plan.dependencies,
+        description_runtime_dependencies(
+            profile,
+            &provider_document.text,
+            provided_runtime.as_deref(),
+        ),
+    );
+    plan.warnings.extend(route_outcome.warnings);
 
     if plan.adapter_id == "loose-files" || plan.requires_confirmation {
         return Err(format!(
@@ -9195,6 +10764,13 @@ fn install_thunderstore_dependency(
     let package_id = thunderstore_package_id(&package_ref);
     let dependency_string =
         thunderstore_dependency_string(&package_ref, &package_version.version_number);
+    let provider_document = thunderstore_route_document(&resolved_ref, &package_version);
+    let provided_runtime = runtime_id_for_provider_package(
+        profile,
+        "thunderstore",
+        Some(&package_ref.namespace),
+        &package_ref.name,
+    );
 
     if thunderstore_package_installed(store_root, profile, &package_id, Some(&dependency_string))
         || thunderstore_runtime_available(profile, &package_ref)
@@ -9202,8 +10778,10 @@ fn install_thunderstore_dependency(
         return Ok(Vec::new());
     }
 
-    let archive_path = download_thunderstore_package(store_root, &package_ref, &package_version)?;
+    let archive_path = download_thunderstore_package(store_root, &resolved_ref, &package_version)?;
     let scanned = scan_zip_archive(&archive_path)?;
+    let route_outcome =
+        prepare_package_install_routes(store_root, profile, &scanned, &provider_document);
     let analysis = analyze_scanned_archive(scanned, profile);
     let mut plan = analysis.recommended_plan.ok_or_else(|| {
         format!(
@@ -9218,6 +10796,15 @@ fn install_thunderstore_dependency(
             plan.dependencies.push(parsed);
         }
     }
+    append_unique_dependencies(
+        &mut plan.dependencies,
+        description_runtime_dependencies(
+            profile,
+            &provider_document.text,
+            provided_runtime.as_deref(),
+        ),
+    );
+    plan.warnings.extend(route_outcome.warnings);
 
     if plan.adapter_id == "loose-files" || plan.requires_confirmation {
         return Err(format!(
@@ -11578,7 +13165,7 @@ fn discover_profile_config_files(profile: &GameProfile) -> Vec<String> {
     for root in profile_config_roots(profile) {
         if root.is_dir() {
             discover_config_files_in_dir(&root, 0, &mut files, &mut seen);
-        } else if root.is_file() && is_supported_config_file(&root) {
+        } else if root.is_file() && is_user_editable_config_file(&root) {
             push_unique_config_path(&mut files, &mut seen, &root);
         }
 
@@ -11648,7 +13235,7 @@ fn discover_config_files_in_dir(
         };
 
         if file_type.is_file() {
-            if is_supported_config_file(&path) {
+            if is_user_editable_config_file(&path) {
                 push_unique_config_path(files, seen, &path);
             }
         } else if file_type.is_dir() && should_descend_config_dir(&path) {
@@ -11667,7 +13254,7 @@ fn should_descend_config_dir(path: &Path) -> bool {
     !matches!(
         name.as_str(),
         ".git" | "cache" | "core" | "logs" | "plugins" | "tmp" | "temp"
-    )
+    ) && !is_localization_directory_name(&name)
 }
 
 fn push_unique_config_path(files: &mut Vec<String>, seen: &mut HashSet<String>, path: &Path) {
@@ -11698,6 +13285,121 @@ fn is_supported_config_file(path: &Path) -> bool {
     )
 }
 
+fn is_user_editable_config_file(path: &Path) -> bool {
+    is_supported_config_file(path) && !is_localization_resource_path(path)
+}
+
+fn is_localization_resource_path(path: &Path) -> bool {
+    let components = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect::<Vec<_>>();
+    if components.len() > 1 {
+        let directories = &components[..components.len() - 1];
+        let subtree_start = directories
+            .iter()
+            .rposition(|component| is_config_tree_boundary(component))
+            .map(|index| index + 1)
+            .unwrap_or_else(|| directories.len().saturating_sub(3));
+        if directories[subtree_start..]
+            .iter()
+            .any(|component| is_localization_directory_name(component))
+        {
+            return true;
+        }
+    }
+
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
+    let tokens = stem
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+
+    tokens.iter().any(|token| is_language_resource_token(token))
+}
+
+fn is_config_tree_boundary(name: &str) -> bool {
+    let compact = name
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect::<String>();
+    matches!(
+        compact.as_str(),
+        "config" | "configs" | "mods" | "userdata" | "ue4ss" | "reframework" | "melonloader"
+    )
+}
+
+fn is_localization_directory_name(name: &str) -> bool {
+    let compact = name
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect::<String>();
+    compact.contains("translation")
+        || compact.contains("localization")
+        || matches!(
+            compact.as_str(),
+            "i18n" | "l10n" | "lang" | "langs" | "language" | "languages" | "locale" | "locales"
+        )
+}
+
+fn is_language_resource_token(token: &str) -> bool {
+    matches!(
+        token,
+        "arabic"
+            | "brazilian"
+            | "chinese"
+            | "czech"
+            | "danish"
+            | "dutch"
+            | "english"
+            | "finnish"
+            | "french"
+            | "german"
+            | "hungarian"
+            | "indonesian"
+            | "italian"
+            | "japanese"
+            | "korean"
+            | "norwegian"
+            | "polish"
+            | "portuguese"
+            | "romanian"
+            | "russian"
+            | "spanish"
+            | "swedish"
+            | "thai"
+            | "traditionalchinese"
+            | "simplifiedchinese"
+            | "turkish"
+            | "ukrainian"
+            | "vietnamese"
+            | "en"
+            | "enus"
+            | "engb"
+            | "zh"
+            | "zhcn"
+            | "zhtw"
+            | "ja"
+            | "jp"
+            | "ko"
+            | "kr"
+            | "de"
+            | "fr"
+            | "es"
+            | "it"
+            | "pt"
+            | "ptbr"
+            | "ru"
+            | "pl"
+    )
+}
+
 fn resolved_config_files_for_record(
     profile: &GameProfile,
     record: &InstalledModRecord,
@@ -11707,11 +13409,16 @@ fn resolved_config_files_for_record(
     let mut seen = HashSet::new();
 
     for path in &record.config_files {
-        push_unique_config_path(&mut files, &mut seen, Path::new(path));
+        let path = Path::new(path);
+        if path.is_file() && is_user_editable_config_file(path) {
+            push_unique_config_path(&mut files, &mut seen, path);
+        }
     }
 
     for path in discovered_config_files {
-        if config_file_matches_record(profile, record, path) {
+        if is_user_editable_config_file(Path::new(path))
+            && config_file_matches_record(profile, record, path)
+        {
             push_unique_config_path(&mut files, &mut seen, Path::new(path));
         }
     }
@@ -11900,6 +13607,12 @@ fn read_mod_config_file(
         ));
     }
 
+    if is_localization_resource_path(&path) {
+        return Ok(warning_file(
+            "This is a translation/localization resource, not a user setting.".to_string(),
+        ));
+    }
+
     let game_path = Path::new(&profile.game_path);
     if !path_is_inside(&path, game_path) && !path_is_inside(&path, store_root) {
         return Ok(warning_file(
@@ -11960,6 +13673,11 @@ fn validate_config_file_for_edit(
 
     if !is_supported_config_file(path) {
         return Err("This file type is not editable as a config file yet.".to_string());
+    }
+    if is_localization_resource_path(path) {
+        return Err(
+            "Translation/localization resources are not exposed as user settings.".to_string(),
+        );
     }
 
     let game_path = Path::new(&profile.game_path);
@@ -13153,6 +14871,67 @@ fn native_script_target_dirs(profile: &GameProfile) -> Vec<String> {
     native_script_routes_for_detection(profile.game_id.as_deref(), &entries)
 }
 
+fn bepinex_target_roots(profile: &GameProfile) -> Vec<String> {
+    loader_target_roots(profile, "bepinex", "BepInEx")
+}
+
+fn reframework_target_roots(profile: &GameProfile) -> Vec<String> {
+    loader_target_roots(profile, "reframework", "reframework")
+}
+
+fn loader_target_roots(profile: &GameProfile, loader_dir: &str, fallback: &str) -> Vec<String> {
+    let game_path = Path::new(&profile.game_path);
+    let entries = if game_path.is_dir() {
+        walk_game_folder(game_path)
+    } else {
+        Vec::new()
+    };
+    detected_loader_roots(&entries, loader_dir, fallback)
+}
+
+fn install_route_parent(route: &str) -> String {
+    normalize_archive_path(route)
+        .rsplit_once('/')
+        .map(|(parent, _)| parent.to_string())
+        .unwrap_or_default()
+}
+
+fn join_install_route(parent: &str, child: &str) -> String {
+    let parent = normalize_archive_path(parent).trim_matches('/').to_string();
+    let child = normalize_archive_path(child).trim_matches('/').to_string();
+    if parent.is_empty() {
+        child
+    } else if child.is_empty() {
+        parent
+    } else {
+        format!("{parent}/{child}")
+    }
+}
+
+fn ue4ss_target_roots(profile: &GameProfile) -> Vec<String> {
+    let game_path = Path::new(&profile.game_path);
+    let entries = if game_path.is_dir() {
+        walk_game_folder(game_path)
+    } else {
+        Vec::new()
+    };
+    let mut roots = find_unreal_win64_dirs(&entries);
+    roots.sort_by(|left, right| {
+        let left_server = left.to_lowercase().contains("/windowsserver/");
+        let right_server = right.to_lowercase().contains("/windowsserver/");
+        left_server
+            .cmp(&right_server)
+            .then(left.matches('/').count().cmp(&right.matches('/').count()))
+            .then(left.len().cmp(&right.len()))
+    });
+    roots.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    if roots.is_empty() {
+        vec!["Binaries/Win64".to_string()]
+    } else {
+        roots
+    }
+}
+
 fn native_script_payload_relative(path: &str) -> String {
     relative_after_native_script_mods(path)
         .or_else(|| {
@@ -13605,6 +15384,32 @@ fn profile_dir(root: &Path, profile_id: &str) -> PathBuf {
     root.join("profiles").join(profile_id)
 }
 
+fn profile_route_knowledge_path(root: &Path, profile_id: &str) -> PathBuf {
+    profile_dir(root, profile_id).join("install-routes.json")
+}
+
+fn read_profile_route_knowledge(
+    root: &Path,
+    profile_id: &str,
+) -> Result<Option<ProfileRouteKnowledge>, String> {
+    let path = profile_route_knowledge_path(root, profile_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    read_json_with_backup(&path)
+        .map(Some)
+        .map_err(error_to_string)
+}
+
+fn write_profile_route_knowledge(
+    root: &Path,
+    knowledge: &ProfileRouteKnowledge,
+) -> Result<(), String> {
+    let path = profile_route_knowledge_path(root, &knowledge.profile_id);
+    let content = serde_json::to_string_pretty(knowledge).map_err(error_to_string)?;
+    atomic_write(&path, format!("{}\n", content).as_bytes()).map_err(error_to_string)
+}
+
 fn profile_backup_dir(root: &Path, profile_id: &str, install_id: &str) -> PathBuf {
     profile_dir(root, profile_id)
         .join("backups")
@@ -14023,6 +15828,75 @@ fn launch_update_installer(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_paths_must_be_inside_the_exact_game_directory() {
+        let game_root = Path::new(r"D:\Steam\steamapps\common\Windrose");
+
+        assert!(path_is_within_directory(
+            Path::new(r"D:\Steam\steamapps\common\Windrose\R5\Binaries\Windrose.exe"),
+            game_root,
+        ));
+        assert!(path_is_within_directory(
+            Path::new(r"\\?\D:\Steam\steamapps\common\Windrose\Windrose.exe"),
+            game_root,
+        ));
+        assert!(!path_is_within_directory(
+            Path::new(r"D:\Steam\steamapps\common\Windrose Server\Windrose.exe"),
+            game_root,
+        ));
+        assert!(!path_is_within_directory(
+            Path::new(r"D:\Tools\Windrose.exe"),
+            game_root,
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn running_game_probe_tracks_a_process_inside_the_game_directory() {
+        use std::os::windows::process::CommandExt;
+        use std::process::Stdio;
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+        let game_root = temp_game_dir("running-game-probe");
+        fs::create_dir_all(&game_root).unwrap();
+        let system_ping = PathBuf::from(std::env::var("WINDIR").unwrap())
+            .join("System32")
+            .join("ping.exe");
+        let probe_executable = game_root.join("UniLoaderGameProbe.exe");
+        fs::copy(system_ping, &probe_executable).unwrap();
+
+        let mut child = Command::new(&probe_executable)
+            .args(["127.0.0.1", "-n", "6"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let detected = (0..20).any(|_| {
+            std::thread::sleep(Duration::from_millis(50));
+            game_process_running(&game_root).unwrap()
+        });
+        assert!(
+            detected,
+            "the process inside the game folder was not detected"
+        );
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let stopped = (0..20).any(|_| {
+            if !game_process_running(&game_root).unwrap() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            false
+        });
+        assert!(stopped, "the stopped game process remained visible");
+
+        let _ = fs::remove_dir_all(game_root);
+    }
 
     fn online_mod_fixture(name: &str, description: &str) -> OnlineModRecord {
         OnlineModRecord {
@@ -14737,6 +16611,183 @@ mod tests {
     }
 
     #[test]
+    fn route_text_extracts_windrose_client_and_hosted_server_but_not_external_dedicated_server() {
+        let root = temp_game_dir("windrose-route-text");
+        fs::create_dir_all(root.join("R5")).unwrap();
+        let mut profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
+        profile.game_path = root.to_string_lossy().to_string();
+        let text = r#"
+            Solo PAK: <Windrose>\R5\Content\Paks\~mods
+            Local Multiplayer: <Windrose>\R5\Builds\WindowsServer\R5\Content\Paks\~mods
+            Dedicated Server: <Windrose Dedicated Server>\R5\Content\Paks\~mods
+        "#;
+
+        let candidates = extract_install_route_candidates(&profile, text);
+
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.iter().any(|candidate| {
+            candidate.relative_path == "R5/Content/Paks/~mods"
+                && candidate.scopes.contains(&"client".to_string())
+        }));
+        assert!(candidates.iter().any(|candidate| {
+            candidate.relative_path == "R5/Builds/WindowsServer/R5/Content/Paks/~mods"
+                && candidate.scopes.contains(&"hosted-server".to_string())
+        }));
+        assert!(!candidates
+            .iter()
+            .any(|candidate| candidate.excerpt.contains("Dedicated Server")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn catalogue_routes_require_independent_mod_consensus_before_creation() {
+        let root = temp_game_dir("route-consensus");
+        fs::create_dir_all(root.join("R5")).unwrap();
+        let mut profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
+        profile.game_path = root.to_string_lossy().to_string();
+        let route_text = r#"
+            Single Player: Windrose\R5\Content\Paks\~mods
+            Multiplayer hosting: Windrose\R5\Builds\WindowsServer\R5\Content\Paks\~mods
+        "#;
+        let first = ProviderRouteDocument {
+            provider: "Nexus Mods".to_string(),
+            mod_id: "nexus:windrose/1".to_string(),
+            mod_name: "First Mod".to_string(),
+            text: route_text.to_string(),
+        };
+        let second = ProviderRouteDocument {
+            provider: "Nexus Mods".to_string(),
+            mod_id: "nexus:windrose/2".to_string(),
+            mod_name: "Second Mod".to_string(),
+            text: route_text.to_string(),
+        };
+
+        let mut one_source =
+            build_profile_route_knowledge(&profile, std::slice::from_ref(&first), Vec::new());
+        let one_source_outcome = apply_profile_route_knowledge(&profile, &mut one_source);
+        assert!(one_source_outcome.created_routes.is_empty());
+        assert!(!root.join("R5/Content/Paks/~mods").exists());
+
+        let mut consensus = build_profile_route_knowledge(&profile, &[first, second], Vec::new());
+        let consensus_outcome = apply_profile_route_knowledge(&profile, &mut consensus);
+        assert!(consensus_outcome
+            .created_routes
+            .contains(&"R5/Content/Paks/~mods".to_string()));
+        assert!(consensus_outcome
+            .created_routes
+            .contains(&"R5/Builds/WindowsServer/R5/Content/Paks/~mods".to_string()));
+        assert!(root.join("R5/Content/Paks/~mods").is_dir());
+        assert!(root
+            .join("R5/Builds/WindowsServer/R5/Content/Paks/~mods")
+            .is_dir());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn selected_pak_mod_instructions_prepare_and_use_all_internal_routes() {
+        let game_root = temp_game_dir("selected-pak-routes-game");
+        let store_root = temp_game_dir("selected-pak-routes-store");
+        fs::create_dir_all(game_root.join("R5")).unwrap();
+        fs::create_dir_all(&store_root).unwrap();
+        let mut profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        let scanned = scanned_package("MoreResources.pak", None);
+        let document = ProviderRouteDocument {
+            provider: "Nexus Mods".to_string(),
+            mod_id: "nexus:windrose/44".to_string(),
+            mod_name: "More Resources".to_string(),
+            text: r#"
+                Solo: <Windrose>\R5\Content\Paks\~mods
+                Local Multiplayer: <Windrose>\R5\Builds\WindowsServer\R5\Content\Paks\~mods
+                Dedicated Server: <Windrose Dedicated Server>\R5\Content\Paks\~mods
+            "#
+            .to_string(),
+        };
+
+        let outcome = prepare_package_install_routes(&store_root, &profile, &scanned, &document);
+        let plan = unreal_pak_plan(&scanned, &profile).unwrap();
+        let targets = plan
+            .mappings
+            .iter()
+            .map(|mapping| mapping.target_relative_path.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(outcome.created_routes.len(), 2);
+        assert!(targets.contains(&"R5/Content/Paks/~mods/MoreResources.pak".to_string()));
+        assert!(targets.contains(
+            &"R5/Builds/WindowsServer/R5/Content/Paks/~mods/MoreResources.pak".to_string()
+        ));
+        assert_eq!(targets.len(), 2);
+
+        let _ = fs::remove_dir_all(store_root);
+        let _ = fs::remove_dir_all(game_root);
+    }
+
+    #[test]
+    fn nested_loader_planners_deploy_to_every_verified_in_game_root() {
+        let bepinex_root = temp_game_dir("multi-bepinex-roots");
+        fs::create_dir_all(bepinex_root.join("Client/BepInEx/plugins")).unwrap();
+        fs::create_dir_all(bepinex_root.join("HostedServer/BepInEx/plugins")).unwrap();
+        let mut bepinex_profile = test_profile("test", "Test", "unity-mono", "bepinex");
+        bepinex_profile.game_path = bepinex_root.to_string_lossy().to_string();
+        let bepinex_plan = bepinex_plan(
+            &scanned_package("plugins/CoolMod.dll", None),
+            &bepinex_profile,
+        )
+        .unwrap();
+        let bepinex_targets = bepinex_plan
+            .mappings
+            .iter()
+            .map(|mapping| mapping.target_relative_path.as_str())
+            .collect::<Vec<_>>();
+        assert!(bepinex_targets.contains(&"Client/BepInEx/plugins/CoolMod.dll"));
+        assert!(bepinex_targets.contains(&"HostedServer/BepInEx/plugins/CoolMod.dll"));
+
+        let reframework_root = temp_game_dir("multi-reframework-roots");
+        fs::create_dir_all(reframework_root.join("Client/reframework/autorun")).unwrap();
+        fs::create_dir_all(reframework_root.join("HostedServer/reframework/autorun")).unwrap();
+        let mut reframework_profile = test_profile("test", "Test", "re-engine", "reframework");
+        reframework_profile.game_path = reframework_root.to_string_lossy().to_string();
+        let reframework_plan = reframework_plan(
+            &scanned_package("scripts/CoolMod.lua", None),
+            &reframework_profile,
+        )
+        .unwrap();
+        let reframework_targets = reframework_plan
+            .mappings
+            .iter()
+            .map(|mapping| mapping.target_relative_path.as_str())
+            .collect::<Vec<_>>();
+        assert!(reframework_targets.contains(&"Client/reframework/autorun/CoolMod.lua"));
+        assert!(reframework_targets.contains(&"HostedServer/reframework/autorun/CoolMod.lua"));
+
+        let _ = fs::remove_dir_all(reframework_root);
+        let _ = fs::remove_dir_all(bepinex_root);
+    }
+
+    #[test]
+    fn description_requirements_add_known_runtimes_without_accepting_negated_mentions() {
+        let profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
+
+        let required = description_runtime_dependencies(
+            &profile,
+            "Requirements: UE4SS must be installed before this mod.",
+            None,
+        );
+        let negated = description_runtime_dependencies(
+            &profile,
+            "This mod does not require UE4SS and works without it.",
+            None,
+        );
+
+        assert_eq!(required.len(), 1);
+        assert_eq!(required[0].id, "runtime:ue4ss");
+        assert!(negated.is_empty());
+    }
+
+    #[test]
     fn detection_prepares_valheim_bepinex_routes_without_marking_loader_installed() {
         let root = temp_game_dir("valheim-routes");
         touch(&root, "Valheim.exe");
@@ -15125,6 +17176,69 @@ mod tests {
 
         assert_eq!(matched.len(), 1);
         assert!(matched[0].contains("bigger_item_Stack.cfg"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn localization_resources_are_not_exposed_as_mod_configuration() {
+        let root = temp_game_dir("localization-config-filter");
+        let config_dir = root.join("BepInEx/config");
+        let translation_path = config_dir.join("TherzieTranslations/Warfare/Warfare.Chinese.yml");
+        let root_translation_path = config_dir.join("Warfare.English.yml");
+        let settings_path = config_dir.join("Warfare.yml");
+        touch(
+            &root,
+            "BepInEx/config/TherzieTranslations/Warfare/Warfare.Chinese.yml",
+        );
+        touch(&root, "BepInEx/config/Warfare.English.yml");
+        touch(&root, "BepInEx/config/Warfare.yml");
+
+        let mut profile = test_profile("valheim", "Valheim", "unity-mono", "bepinex");
+        profile.game_path = root.to_string_lossy().to_string();
+        let record = InstalledModRecord {
+            id: "warfare-mod".to_string(),
+            profile_id: profile.id.clone(),
+            archive_path: "Warfare.zip".to_string(),
+            archive_name: "Warfare.zip".to_string(),
+            display_name: Some("Warfare".to_string()),
+            package_id: None,
+            dependency_string: None,
+            adapter_id: "bepinex".to_string(),
+            summary: String::new(),
+            installed_at: now_string(),
+            files_written: Vec::new(),
+            backups_written: Vec::new(),
+            written_file_hashes: HashMap::new(),
+            dependencies: Vec::new(),
+            config_files: vec![translation_path.to_string_lossy().to_string()],
+            runtime_id: None,
+            externally_managed: false,
+            enabled: true,
+            last_status: "installed".to_string(),
+            plan: None,
+        };
+
+        let discovered = discover_profile_config_files(&profile);
+        let resolved = resolved_config_files_for_record(&profile, &record, &discovered);
+        let discovered = discovered
+            .iter()
+            .map(|path| normalize_filesystem_identity(path))
+            .collect::<Vec<_>>();
+        let resolved = resolved
+            .iter()
+            .map(|path| normalize_filesystem_identity(path))
+            .collect::<Vec<_>>();
+        let settings_path = normalize_filesystem_identity(settings_path.to_string_lossy().as_ref());
+        let translation_path =
+            normalize_filesystem_identity(translation_path.to_string_lossy().as_ref());
+        let root_translation_path =
+            normalize_filesystem_identity(root_translation_path.to_string_lossy().as_ref());
+
+        assert!(discovered.contains(&settings_path));
+        assert!(!discovered.contains(&translation_path));
+        assert!(!discovered.contains(&root_translation_path));
+        assert_eq!(resolved, vec![settings_path]);
 
         let _ = fs::remove_dir_all(root);
     }

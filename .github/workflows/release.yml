@@ -51,15 +51,15 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "UniLoader ${{ github.ref_name }}"
           releaseBody: |
-            UniLoader's Vault Gallery update introduces an image-first library and discovery
-            experience, clearer Steam profiles, streamlined mod installation, install result
-            sounds, improved Nexus and Thunderstore handoffs, and reliability fixes across
-            loader detection, archives, dependencies, and window behavior.
+            UniLoader v0.9.5 adds live Steam game process detection to the Library launch control.
+            The button now shows Launching while Steam starts the selected game, changes to a
+            subdued Launched state once the game process is confirmed, and automatically restores
+            the launch action after the game closes.
 
-            v0.9.4 adds title-only Discovery search, a clean-launch Mods ON/OFF mode that
-            preserves every individual library choice, and responsive profile controls that stay
-            readable at the application's minimum window size. It also includes the Discovery
-            pagination, fullscreen centering, and compact page-loading fixes from v0.9.3.
+            This release also gives the installed-mod Library a stable seven-row maximum viewport
+            with a visible themed scrollbar, adds the compact installed-mod rail to Discovery,
+            improves profile-card behavior, expands safe route and dependency learning, and keeps
+            localization resources out of the configuration editor.
           releaseDraft: false
           prerelease: false
 
