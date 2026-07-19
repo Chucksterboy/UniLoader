@@ -1498,15 +1498,10 @@ fn profile_game_running(app: AppHandle, profile_id: String) -> Result<bool, Stri
 
 #[cfg(target_os = "windows")]
 fn game_process_running(game_path: &Path) -> Result<bool, String> {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
-    };
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
     let game_root = fs::canonicalize(game_path).unwrap_or_else(|_| game_path.to_path_buf());
@@ -1532,30 +1527,13 @@ fn game_process_running(game_path: &Path) -> Result<bool, String> {
     let mut found = false;
 
     while has_process {
-        if process.th32ProcessID != 0 && process.th32ProcessID != std::process::id() {
-            // SAFETY: The returned process handle is checked for null and closed after querying.
-            let handle =
-                unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process.th32ProcessID) };
-            if !handle.is_null() {
-                let mut buffer = vec![0u16; 32_768];
-                let mut length = buffer.len() as u32;
-                // SAFETY: `buffer` is writable for `length` UTF-16 units and the handle is valid.
-                let queried = unsafe {
-                    QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut length)
-                } != 0;
-                // SAFETY: `handle` was returned by OpenProcess and is closed exactly once.
-                unsafe {
-                    CloseHandle(handle);
-                }
-
-                if queried {
-                    let executable = PathBuf::from(OsString::from_wide(&buffer[..length as usize]));
-                    if path_is_within_directory(&executable, &game_root) {
-                        found = true;
-                        break;
-                    }
-                }
-            }
+        if process.th32ProcessID != 0
+            && process.th32ProcessID != std::process::id()
+            && process_executable_path(process.th32ProcessID)
+                .is_some_and(|executable| path_is_within_directory(&executable, &game_root))
+        {
+            found = true;
+            break;
         }
 
         // SAFETY: `process` remains a valid, correctly sized output buffer for the snapshot.
@@ -1567,6 +1545,34 @@ fn game_process_running(game_path: &Path) -> Result<bool, String> {
         CloseHandle(snapshot);
     }
     Ok(found)
+}
+
+#[cfg(target_os = "windows")]
+fn process_executable_path(process_id: u32) -> Option<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // SAFETY: OpenProcess is called with query-only access for the supplied process ID.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    if handle.is_null() {
+        return None;
+    }
+
+    let mut buffer = vec![0u16; 32_768];
+    let mut length = buffer.len() as u32;
+    // SAFETY: `buffer` is writable for `length` UTF-16 units and the handle is valid.
+    let queried =
+        unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut length) } != 0;
+    // SAFETY: `handle` was returned by OpenProcess and is closed exactly once.
+    unsafe {
+        CloseHandle(handle);
+    }
+
+    queried.then(|| PathBuf::from(OsString::from_wide(&buffer[..length as usize])))
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -15853,6 +15859,20 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
+    fn windows_process_path_probe_reads_current_executable() {
+        let expected = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        let actual = process_executable_path(std::process::id())
+            .expect("the current process path should be queryable");
+
+        assert_eq!(
+            normalize_process_path(&actual),
+            normalize_process_path(&expected)
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires an interactive desktop process namespace"]
     fn running_game_probe_tracks_a_process_inside_the_game_directory() {
         use std::os::windows::process::CommandExt;
         use std::process::Stdio;
