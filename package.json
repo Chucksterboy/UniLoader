@@ -1,11 +1,12 @@
 {
   "name": "uniloader",
-  "version": "0.9.1",
+  "version": "0.9.2",
   "private": true,
   "description": "UniLoader cross-game mod manager prototype with per-game adapters and dependency planning.",
   "scripts": {
     "dev": "tauri dev",
-    "build": "tauri build",
+    "build": "tauri build --features custom-protocol",
+    "build:app": "tauri build --features custom-protocol --no-bundle",
     "build:web": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "test": "pnpm run typecheck && cargo test --manifest-path src-tauri/Cargo.toml",

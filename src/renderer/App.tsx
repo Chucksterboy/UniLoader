@@ -12,6 +12,8 @@ import {
   Gamepad2,
   Heart,
   Home,
+  Library,
+  LockKeyhole,
   Minus,
   PackagePlus,
   Pencil,
@@ -29,9 +31,12 @@ import {
   X
 } from "lucide-react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getVersion } from "@tauri-apps/api/app";
 import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import {
+  type MouseEvent as ReactMouseEvent,
+  type ReactNode,
   useEffect,
   useMemo,
   useRef,
@@ -75,12 +80,18 @@ const defaultAppSettings: AppSettings = {
 
 const defaultThemeId = "neon-circuit";
 const supportPageUrl = "https://ko-fi.com/chucksterboy";
+const installSoundUrls = {
+  success: "./sounds/mod-install-success.mp3",
+  failure: "./sounds/mod-install-failed.mp3"
+} as const;
+const installSoundVolume = 0.72;
 
 type ViewMode = "manager" | "discover" | "transfer" | "settings";
 type ModSortMode = "newest" | "oldest";
 type OnlineSortMode = "downloads" | "newest" | "oldest";
 type TransferMode = "import" | "export" | null;
 type NoticeKind = "success" | "warning" | "error";
+type InstallSoundKind = keyof typeof installSoundUrls;
 type StartupSplashPhase = "intro" | "exiting" | "hidden";
 
 interface PendingDependencyPrompt {
@@ -125,6 +136,19 @@ const nexusApiKeysUrl = "https://www.nexusmods.com/settings/api-keys";
 const startupSplashPulseMs = 2700;
 const startupSplashFadeMs = 420;
 const startupSplashMaximumMs = 8000;
+const modPresentationStorageKey = "uniloader.mod-presentations.v2";
+
+interface StoredModPresentation {
+  description?: string;
+  iconUrl?: string;
+  name?: string;
+  owner?: string;
+  providerLabel?: string;
+  updatedAt?: string;
+  version?: string;
+}
+
+type StoredModPresentations = Record<string, StoredModPresentation>;
 
 export function App() {
   const [activeView, setActiveView] = useState<ViewMode>("manager");
@@ -148,6 +172,10 @@ export function App() {
   const [onlineMods, setOnlineMods] = useState<OnlineModRecord[]>([]);
   const [onlineModTotal, setOnlineModTotal] = useState(0);
   const [modSortMode, setModSortMode] = useState<ModSortMode>("newest");
+  const [installedModQuery, setInstalledModQuery] = useState("");
+  const [modPresentations, setModPresentations] = useState<StoredModPresentations>(() =>
+    loadStoredModPresentations()
+  );
   const [transferMode, setTransferMode] = useState<TransferMode>(null);
   const [detection, setDetection] = useState<GameDetectionResult | null>(null);
   const [isDetecting, setIsDetecting] = useState(false);
@@ -156,6 +184,7 @@ export function App() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isDiscoveringMods, setIsDiscoveringMods] = useState(false);
   const [installingOnlineModId, setInstallingOnlineModId] = useState<string>("");
+  const [onlineInstallCompletionId, setOnlineInstallCompletionId] = useState(0);
   const [isCheckingForUpdate, setIsCheckingForUpdate] = useState(false);
   const [isDownloadingUpdate, setIsDownloadingUpdate] = useState(false);
   const [isTransferringProfile, setIsTransferringProfile] = useState(false);
@@ -183,6 +212,7 @@ export function App() {
   const installedModsRequestSequence = useRef(0);
   const discoveryRequestSequence = useRef(0);
   const processedNxmLinks = useRef(new Set<string>());
+  const installSoundPlayers = useRef<Record<InstallSoundKind, HTMLAudioElement> | null>(null);
 
   function setNotice(nextNotice: NoticeInput | null) {
     setNoticeState(nextNotice ? { ...nextNotice, motionId: ++noticeSequence.current } : null);
@@ -199,6 +229,55 @@ export function App() {
       setErrorMotionId(++errorSequence.current);
     }
     setErrorState(nextError);
+  }
+
+  function playInstallSound(kind: InstallSoundKind) {
+    const player = installSoundPlayers.current?.[kind];
+    if (!player) {
+      return;
+    }
+
+    try {
+      player.pause();
+      player.currentTime = 0;
+      void player.play().catch(() => undefined);
+    } catch {
+      // Sound playback must never interfere with the installation result.
+    }
+  }
+
+  function rememberOnlineModPresentations(mods: OnlineModRecord[]) {
+    setModPresentations((current) => {
+      let changed = false;
+      const next = { ...current };
+
+      for (const mod of mods) {
+        if (!mod.id) {
+          continue;
+        }
+        const presentationKey = mod.id.trim().toLowerCase();
+        const presentation: StoredModPresentation = {
+          description: mod.description || undefined,
+          iconUrl: mod.iconUrl || undefined,
+          name: mod.name || undefined,
+          owner: mod.owner || undefined,
+          providerLabel: mod.providerLabel || undefined,
+          updatedAt: mod.updatedAt || undefined,
+          version: mod.version || undefined
+        };
+        const existing = current[presentationKey];
+        if (JSON.stringify(existing) !== JSON.stringify(presentation)) {
+          next[presentationKey] = presentation;
+          changed = true;
+        }
+      }
+
+      if (!changed) {
+        return current;
+      }
+      saveStoredModPresentations(next);
+      return next;
+    });
   }
 
   const api = desktopApi;
@@ -220,13 +299,33 @@ export function App() {
     [profiles]
   );
   const sortedInstalledMods = useMemo(
-    () =>
-      [...installedMods].sort((first, second) => {
+    () => {
+      const query = installedModQuery.trim().toLowerCase();
+      return [...installedMods]
+        .filter((mod) => {
+          if (!query) {
+            return true;
+          }
+          const presentation = getStoredModPresentation(mod, modPresentations);
+          return [
+            displayModName(mod),
+            mod.archiveName,
+            mod.adapterId,
+            mod.packageId ?? "",
+            presentation.owner ?? "",
+            presentation.providerLabel ?? ""
+          ]
+            .join(" ")
+            .toLowerCase()
+            .includes(query);
+        })
+        .sort((first, second) => {
         const firstTime = Date.parse(first.installedAt) || 0;
         const secondTime = Date.parse(second.installedAt) || 0;
         return modSortMode === "newest" ? secondTime - firstTime : firstTime - secondTime;
-      }),
-    [installedMods, modSortMode]
+        });
+    },
+    [installedModQuery, installedMods, modPresentations, modSortMode]
   );
   const selectedSteamGame = useMemo(
     () => steamGames.find((game) => game.appId === selectedSteamGameAppId),
@@ -264,6 +363,28 @@ export function App() {
   useEffect(() => {
     void bootstrap();
     void getVersion().then(setAppVersion).catch(() => setAppVersion("unknown"));
+  }, []);
+
+  useEffect(() => {
+    const players = {
+      success: new Audio(installSoundUrls.success),
+      failure: new Audio(installSoundUrls.failure)
+    };
+    Object.values(players).forEach((player) => {
+      player.preload = "auto";
+      player.volume = installSoundVolume;
+      player.load();
+    });
+    installSoundPlayers.current = players;
+
+    return () => {
+      Object.values(players).forEach((player) => {
+        player.pause();
+        player.removeAttribute("src");
+        player.load();
+      });
+      installSoundPlayers.current = null;
+    };
   }, []);
 
   useEffect(() => {
@@ -479,6 +600,8 @@ export function App() {
 
       try {
         const result = await api.installNexusNxmLink(nxmUrl);
+        playInstallSound("success");
+        setOnlineInstallCompletionId((current) => current + 1);
         setSelectedProfileId(result.installResult.profileId);
         setExpandedProfileId(result.installResult.profileId);
         setOnlineMods((current) =>
@@ -486,7 +609,7 @@ export function App() {
             item.id === result.modId ? { ...item, installed: true } : item
           )
         );
-        await refreshInstalledMods(result.installResult.profileId);
+        await refreshInstalledMods(result.installResult.profileId).catch(() => undefined);
         setStatus("Mod installed");
         setNotice({
           kind: result.installResult.warnings.length > 0 ? "warning" : "success",
@@ -498,6 +621,7 @@ export function App() {
           )
         });
       } catch (caughtError) {
+        playInstallSound("failure");
         processedNxmLinks.current.delete(replayKey);
         setError(String(caughtError));
         setStatus("Nexus install failed");
@@ -1183,6 +1307,7 @@ export function App() {
       if (requestId !== discoveryRequestSequence.current) {
         return;
       }
+      rememberOnlineModPresentations(result.items);
       setOnlineMods(result.items);
       setOnlineModTotal(result.total);
       setDiscoverLoadedProfileId(profileId);
@@ -1243,6 +1368,7 @@ export function App() {
           return;
         }
       } catch (caughtError) {
+        playInstallSound("failure");
         setError(String(caughtError));
         setStatus("Dependency check failed");
         setNotice({
@@ -1269,6 +1395,7 @@ export function App() {
           detail: "Click Slow download, then Open via UniLoader for automated installs."
         });
       } catch (caughtError) {
+        playInstallSound("failure");
         setError(String(caughtError));
         setStatus("Nexus handoff failed");
         setNotice({
@@ -1299,11 +1426,13 @@ export function App() {
     setStatus("Installing online mod");
     try {
       const result = await api.installDiscoveredMod(discoverProfileId, mod, file);
+      playInstallSound("success");
+      setOnlineInstallCompletionId((current) => current + 1);
       setOnlineMods((current) =>
         current.map((item) => (item.id === mod.id ? { ...item, installed: true } : item))
       );
       if (discoverProfileId === selectedProfileId) {
-        await refreshInstalledMods(discoverProfileId);
+        await refreshInstalledMods(discoverProfileId).catch(() => undefined);
       }
       setStatus("Mod installed");
       setNotice({
@@ -1312,6 +1441,7 @@ export function App() {
         detail: installSuccessDetail(mod.name, result.filesWritten.length, result.warnings)
       });
     } catch (caughtError) {
+      playInstallSound("failure");
       setError(String(caughtError));
       setStatus("Install failed");
       setNotice({
@@ -1358,6 +1488,7 @@ export function App() {
           detail: "Click Slow download, then Open via UniLoader. Retry the original mod after this requirement installs."
         });
       } catch (caughtError) {
+        playInstallSound("failure");
         setError(String(caughtError));
         setStatus("Requirement handoff failed");
         setNotice({
@@ -1426,6 +1557,7 @@ export function App() {
 
       await installAnalysis(nextAnalysis);
     } catch (caughtError) {
+      playInstallSound("failure");
       setError(String(caughtError));
       setStatus("Install failed");
     }
@@ -1452,6 +1584,7 @@ export function App() {
 
       await installAnalysis(nextAnalysis);
     } catch (caughtError) {
+      playInstallSound("failure");
       setError(String(caughtError));
       setStatus("Install failed");
     }
@@ -1473,6 +1606,7 @@ export function App() {
       const nextAnalysis = await api.analyzeArchivePath(selectedProfile.id, archivePath);
       await installAnalysis(nextAnalysis);
     } catch (caughtError) {
+      playInstallSound("failure");
       setError(String(caughtError));
       setStatus("Install failed");
       setNotice({
@@ -1492,6 +1626,7 @@ export function App() {
     setAnalysis(nextAnalysis);
 
     if (!plan) {
+      playInstallSound("failure");
       setStatus("No install route");
       setNotice({
         kind: "error",
@@ -1511,7 +1646,8 @@ export function App() {
         packageIdentity: nextAnalysis.packageIdentity,
         plan
       });
-      await refreshInstalledMods(selectedProfile.id);
+      playInstallSound("success");
+      await refreshInstalledMods(selectedProfile.id).catch(() => undefined);
       setStatus("Mod installed");
       setNotice({
         kind: "success",
@@ -1623,6 +1759,24 @@ export function App() {
   const profileToRemove = profileRemovalPresence.value;
   const dependencyPrompt = dependencyPromptPresence.value;
 
+  function startTitlebarDrag(event: ReactMouseEvent<HTMLElement>) {
+    if (event.button !== 0 || event.defaultPrevented) {
+      return;
+    }
+
+    const target = event.target as HTMLElement;
+    if (
+      target.closest(
+        "button, a, input, select, textarea, label, [role='button'], [contenteditable='true'], [data-no-window-drag]"
+      )
+    ) {
+      return;
+    }
+
+    event.preventDefault();
+    void getCurrentWindow().startDragging().catch(() => undefined);
+  }
+
   return (
     <>
     {startupSplashPhase !== "hidden" ? <StartupSplash phase={startupSplashPhase} /> : null}
@@ -1630,71 +1784,46 @@ export function App() {
       className={renderedView === "manager" ? "app-shell" : "app-shell settings-shell"}
       data-theme={defaultThemeId}
     >
-      <header className="window-title-strip" data-tauri-drag-region>
-        <span className="window-title-identity">
-          <span className="window-title-mark">
-            <UniLoaderMark />
-          </span>
+      <header className="vault-titlebar" onMouseDown={startTitlebarDrag}>
+        <div className="vault-brand">
+          <span className="vault-brand-mark"><UniLoaderMark /></span>
           <strong>UniLoader</strong>
-        </span>
-        <span className="window-title-trace" />
-      </header>
-      <WindowControls
-        onClose={() => void api.closeWindow()}
-        onMaximize={() => void api.toggleMaximizeWindow()}
-        onMinimize={() => void api.minimizeWindow()}
-      />
-      <aside className="nav-rail">
-        <nav className="rail-nav" aria-label="Primary">
+        </div>
+        <nav className="vault-primary-nav" aria-label="Primary navigation">
           <button
-            className={activeView === "manager" ? "rail-button active" : "rail-button"}
+            className={activeView === "manager" ? "active" : ""}
             onClick={() => setActiveView("manager")}
-            title="Mod manager"
             type="button"
           >
-            <Home size={18} />
+            <Library size={16} />
+            Library
           </button>
           <button
-            className={activeView === "discover" ? "rail-button active" : "rail-button"}
+            className={activeView === "discover" ? "active" : ""}
             onClick={() => setActiveView("discover")}
-            title="Discover online mods"
             type="button"
           >
-            <Compass size={18} />
+            <Compass size={16} />
+            Discover
           </button>
+        </nav>
+        <div className="vault-titlebar-actions">
           <button
-            className={activeView === "settings" ? "rail-button active" : "rail-button"}
+            aria-label="Settings"
+            className={activeView === "settings" ? "vault-settings-button active" : "vault-settings-button"}
             onClick={() => setActiveView("settings")}
             title="Settings"
             type="button"
           >
             <Settings2 size={18} />
           </button>
-        </nav>
-        <div className="rail-footer">
-          <UpdateRailIndicator
-            isChecking={isCheckingForUpdate}
-            isDownloading={isDownloadingUpdate}
-            updateInfo={updateInfo}
-            onClick={() => void showUpdateDetails()}
+          <WindowControls
+            onClose={() => void api.closeWindow()}
+            onMaximize={() => void api.toggleMaximizeWindow()}
+            onMinimize={() => void api.minimizeWindow()}
           />
-          <button
-            aria-label="Support Me"
-            className="rail-support-button"
-            data-tooltip="Support Me"
-            onClick={() => void openSupportPage()}
-            type="button"
-          >
-            <Heart size={17} />
-          </button>
-          <div className="rail-version-row">
-            <div className="rail-status" title={status} />
-            <span className="app-version" title={`UniLoader ${appVersion || "loading"}`}>
-              {appVersion ? `v${appVersion}` : ""}
-            </span>
-          </div>
         </div>
-      </aside>
+      </header>
       {renderedView === "manager" ? (
       <aside className={`sidebar view-motion ${viewMotion.className}`}>
         <section className="panel">
@@ -1860,31 +1989,32 @@ export function App() {
           />
         ) : null}
 
-        <section className="profile-command-panel">
-          <div className="profile-command-copy">
-            <p className="eyebrow">Profile controls</p>
-            <h3>Launch & mod state</h3>
-            <small>
-              {selectedProfile?.steamAppId
-                ? `Steam App ${selectedProfile.steamAppId}`
-                : "Steam launch is available for profiles added from Steam scan."}
-            </small>
+        <section className="profile-command-panel vault-game-hero">
+          <GameHeroArtwork profile={selectedProfile} />
+          <div className="vault-hero-overlay" />
+          <div className="vault-hero-title">
+            <p className="eyebrow">Active game</p>
+            <h1>{selectedProfile?.name ?? "Select a Steam game"}</h1>
           </div>
-          <div className="profile-command-actions">
-            <button
-              className="primary-button"
-              disabled={!selectedProfile || !selectedProfile.steamAppId || isLaunchingGame}
-              onClick={() => void launchSelectedProfileGame()}
-              title={
-                selectedProfile?.steamAppId
-                  ? "Launch selected game through Steam"
-                  : "Add this profile from Steam scan to enable Steam launch"
-              }
-              type="button"
-            >
-              <Play size={17} />
-              {isLaunchingGame ? "Launching" : "Launch Game"}
-            </button>
+          <div className="vault-hero-metadata">
+            <div>
+              <Gamepad2 size={20} />
+              <span><small>Steam ID</small><strong>{selectedProfile?.steamAppId ?? "Not connected"}</strong></span>
+            </div>
+            <div title={selectedProfile?.gamePath}>
+              <FolderOpen size={20} />
+              <span><small>Folder</small><strong>{selectedProfileFolderConnected ? "Connected" : "Unavailable"}</strong></span>
+            </div>
+            <div>
+              <LockKeyhole size={20} />
+              <span><small>Runtime</small><strong>{selectedProfile ? loaderDisplayName(selectedProfile.loader, selectedProfile.engine) : "Waiting"}</strong></span>
+            </div>
+            <div className={`vault-hero-health ${healthTone}`}>
+              <Heart size={20} />
+              <span><small>Health</small><strong>{healthMessage}</strong></span>
+            </div>
+          </div>
+          <div className="profile-command-actions vault-hero-actions">
             <label
               className={isTogglingAllMods ? "master-mod-toggle busy" : "master-mod-toggle"}
               title="Enable or disable every installed mod in this profile"
@@ -1895,13 +2025,29 @@ export function App() {
                 onChange={(event) => void setAllModsEnabled(event.currentTarget.checked)}
                 type="checkbox"
               />
-              <span className="master-mod-track">
-                <span />
-              </span>
-              <span className="master-mod-copy">
-                <strong>{profileModToggleLabel}</strong>
-              </span>
+              <span className="master-mod-track"><span /></span>
+              <span className="master-mod-copy"><strong>Mods {profileModToggleLabel}</strong></span>
             </label>
+            <button
+              className="secondary-button vault-hero-refresh"
+              disabled={!selectedProfile || isRefreshing}
+              onClick={() => void refreshSelectedProfile()}
+              title="Rescan selected profile"
+              type="button"
+            >
+              <RefreshCw className={isRefreshing ? "spin-icon" : ""} size={16} />
+              Refresh
+            </button>
+            <button
+              className="primary-button vault-launch-button"
+              disabled={!selectedProfile || !selectedProfile.steamAppId || isLaunchingGame}
+              onClick={() => void launchSelectedProfileGame()}
+              title="Launch selected game through Steam"
+              type="button"
+            >
+              <Play size={17} />
+              {isLaunchingGame ? "Launching" : "Launch Game"}
+            </button>
           </div>
         </section>
 
@@ -1909,8 +2055,9 @@ export function App() {
             <section className="work-panel analysis-panel">
               <div className="panel-title-row">
                 <div>
-                  <p className="eyebrow">Add mod</p>
-                  <h3>Drop & Install</h3>
+                  <p className="eyebrow">Install vault</p>
+                  <h3>Import a Mod</h3>
+                  <small className="vault-panel-note">Drag a mod or folder into the vault.</small>
                 </div>
                 <div className="import-actions">
                   <button
@@ -1947,10 +2094,19 @@ export function App() {
             <section className="work-panel history-panel">
               <div className="panel-title-row compact">
                 <div>
-                  <p className="eyebrow">Mod library</p>
-                  <h3>Available Mods</h3>
+                  <p className="eyebrow">Library</p>
+                  <h3>Mods ({installedMods.length})</h3>
                 </div>
                 <div className="library-toolbar">
+                  <label className="vault-mod-search">
+                    <Search size={15} />
+                    <input
+                      aria-label="Search installed mods"
+                      onChange={(event) => setInstalledModQuery(event.target.value)}
+                      placeholder="Search mods"
+                      value={installedModQuery}
+                    />
+                  </label>
                   <div className="sort-toggle" aria-label="Sort installed mods">
                     <button
                       className={modSortMode === "newest" ? "active" : ""}
@@ -1975,6 +2131,7 @@ export function App() {
                   <ModCard
                     key={mod.id}
                     mod={mod}
+                    presentation={getStoredModPresentation(mod, modPresentations)}
                     onConfigure={() => void openModConfig(mod)}
                     onEnable={() => void handleModAction("enable", mod)}
                     onDisable={() => void handleModAction("disable", mod)}
@@ -1985,6 +2142,11 @@ export function App() {
                   <div className="empty-mods">
                     <SlidersHorizontal size={22} />
                     <p>No mods installed yet.</p>
+                  </div>
+                ) : sortedInstalledMods.length === 0 ? (
+                  <div className="empty-mods">
+                    <Search size={22} />
+                    <p>No installed mods match this search.</p>
                   </div>
                 ) : null}
               </div>
@@ -2004,6 +2166,7 @@ export function App() {
         ) : renderedView === "discover" ? (
           <DiscoverView
             hasLoaded={discoverLoadedProfileId === discoverProfileId}
+            installCompletionId={onlineInstallCompletionId}
             installingModId={installingOnlineModId}
             isLoading={isDiscoveringMods}
             mods={displayedOnlineMods}
@@ -2027,16 +2190,49 @@ export function App() {
           />
         )}
       </section>
-      {renderedView === "manager" ? (
-      <HealthPanel
-        healthMessage={healthMessage}
-        healthTone={healthTone}
-        isRefreshing={isRefreshing}
-        motionClassName={viewMotion.className}
-        status={status}
-        onRefresh={() => void refreshSelectedProfile()}
-      />
-      ) : null}
+      <footer className="vault-statusbar">
+        <UpdateRailIndicator
+          isChecking={isCheckingForUpdate}
+          isDownloading={isDownloadingUpdate}
+          updateInfo={updateInfo}
+          onClick={() => void showUpdateDetails()}
+        />
+        <button
+          aria-label="Support Me"
+          className="vault-support-button"
+          onClick={() => void openSupportPage()}
+          type="button"
+        >
+          <Heart size={19} />
+          <span>Support Me</span>
+        </button>
+        <div className="vault-version" title={`UniLoader ${appVersion || "loading"}`}>
+          <span className="rail-status" />
+          {appVersion ? `v${appVersion}` : ""}
+        </div>
+        <HealthPanel
+          healthMessage={healthMessage}
+          healthTone={healthTone}
+          motionClassName={viewMotion.className}
+          status={status}
+        />
+        <button
+          className={appSettings.nexusApiKeyConfigured ? "vault-footer-service connected" : "vault-footer-service"}
+          onClick={() => setActiveView("settings")}
+          type="button"
+        >
+          <Compass size={18} />
+          <span><small>Nexus Mods</small><strong>{appSettings.nexusApiKeyConfigured ? "Connected" : "Connect account"}</strong></span>
+        </button>
+        <button
+          className={activeView === "transfer" ? "vault-footer-service active" : "vault-footer-service"}
+          onClick={() => setActiveView("transfer")}
+          type="button"
+        >
+          <Upload size={18} />
+          <span><small>Profiles</small><strong>Import / Export</strong></span>
+        </button>
+      </footer>
     </main>
     {profileCreatorPresence.value ? (
       <ProfileCreatorDialog
@@ -2499,18 +2695,6 @@ interface WindowControlsProps {
 }
 
 function ProfileArtwork({ profile }: { profile: GameProfile }) {
-  const [imageSourceIndex, setImageSourceIndex] = useState(0);
-  const steamAppId = profile.steamAppId?.trim();
-  const imageUrls =
-    steamAppId && /^\d+$/.test(steamAppId)
-      ? [
-          `https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_600x900_2x.jpg`,
-          `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_600x900_2x.jpg`,
-          `https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_600x900.jpg`,
-          `https://cdn.cloudflare.steamstatic.com/steam/apps/${steamAppId}/capsule_231x87.jpg`
-        ]
-      : [];
-  const imageUrl = imageUrls[imageSourceIndex];
   const initials =
     profile.name
       .split(/\s+/)
@@ -2519,28 +2703,146 @@ function ProfileArtwork({ profile }: { profile: GameProfile }) {
       .map((word) => word[0]?.toUpperCase())
       .join("") || "G";
 
-  useEffect(() => {
-    setImageSourceIndex(0);
-  }, [steamAppId]);
-
   return (
     <span className="profile-artwork" aria-hidden="true">
-      {imageUrl ? (
-        <img
-          alt=""
-          draggable={false}
-          loading="lazy"
-          onError={() => setImageSourceIndex((current) => current + 1)}
-          src={imageUrl}
-        />
-      ) : (
-        <span className="profile-artwork-fallback">
-          <Gamepad2 size={19} />
-          <b>{initials}</b>
-        </span>
-      )}
+      <SteamArtworkImage
+        fallback={
+          <span className="profile-artwork-fallback">
+            <Gamepad2 size={19} />
+            <b>{initials}</b>
+          </span>
+        }
+        profile={profile}
+        variant="poster"
+      />
     </span>
   );
+}
+
+function GameHeroArtwork({ profile }: { profile?: GameProfile }) {
+  return (
+    <div className="vault-hero-artwork" aria-hidden="true">
+      {profile ? (
+        <SteamArtworkImage
+          fallback={<div className="vault-hero-fallback"><Gamepad2 size={54} /></div>}
+          profile={profile}
+          variant="hero"
+        />
+      ) : (
+        <div className="vault-hero-fallback"><Gamepad2 size={54} /></div>
+      )}
+    </div>
+  );
+}
+
+interface SteamArtworkImageProps {
+  fallback: ReactNode;
+  profile: GameProfile;
+  variant: "hero" | "poster";
+}
+
+function SteamArtworkImage({ fallback, profile, variant }: SteamArtworkImageProps) {
+  const [imageSourceIndex, setImageSourceIndex] = useState(0);
+  const steamAppId = profile.steamAppId?.trim();
+  const imageUrls = steamArtworkUrls(steamAppId, variant);
+  const imageUrl = imageUrls[imageSourceIndex];
+
+  useEffect(() => {
+    setImageSourceIndex(0);
+  }, [steamAppId, variant]);
+
+  return imageUrl ? (
+    <img
+      alt=""
+      decoding="async"
+      draggable={false}
+      loading={variant === "poster" ? "lazy" : "eager"}
+      onError={() => setImageSourceIndex((current) => current + 1)}
+      src={imageUrl}
+    />
+  ) : (
+    <>{fallback}</>
+  );
+}
+
+function steamArtworkUrls(
+  steamAppId: string | undefined,
+  variant: "hero" | "poster"
+): string[] {
+  if (!steamAppId || !/^\d+$/.test(steamAppId)) {
+    return [];
+  }
+
+  if (variant === "hero") {
+    return [
+      `https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_hero.jpg`,
+      `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_hero.jpg`,
+      `https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/header.jpg`,
+      `https://cdn.cloudflare.steamstatic.com/steam/apps/${steamAppId}/header.jpg`
+    ];
+  }
+
+  return [
+    `https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_600x900_2x.jpg`,
+    `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_600x900_2x.jpg`,
+    `https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_600x900.jpg`,
+    `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_600x900.jpg`,
+    `https://cdn.cloudflare.steamstatic.com/steam/apps/${steamAppId}/capsule_231x87.jpg`
+  ];
+}
+
+function ModArtwork({
+  mod,
+  name,
+  presentation
+}: {
+  mod: InstalledModRecord;
+  name: string;
+  presentation: StoredModPresentation;
+}) {
+  const [imageFailed, setImageFailed] = useState(false);
+  const initials = name
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0]?.toUpperCase())
+    .join("");
+
+  useEffect(() => {
+    setImageFailed(false);
+  }, [presentation.iconUrl]);
+
+  return (
+    <div className={`vault-mod-artwork adapter-${mod.adapterId}`} aria-hidden="true">
+      {presentation.iconUrl && !imageFailed ? (
+        <img
+          alt=""
+          decoding="async"
+          draggable={false}
+          loading="lazy"
+          onError={() => setImageFailed(true)}
+          src={presentation.iconUrl}
+        />
+      ) : (
+        <span>
+          {mod.runtimeId ? <LockKeyhole size={24} /> : <PackagePlus size={24} />}
+          <b>{initials || "MOD"}</b>
+        </span>
+      )}
+    </div>
+  );
+}
+
+function loaderDisplayName(loader: GameProfile["loader"], engine: GameProfile["engine"]): string {
+  const loaderLabels: Record<GameProfile["loader"], string> = {
+    none: engine === "unknown" ? "Detecting" : `${humanizeModName(engine)} native`,
+    bepinex: "BepInEx",
+    "bepinex-il2cpp": "BepInEx IL2CPP",
+    ue4ss: "UE4SS",
+    reframework: "REFramework",
+    "loose-files": "Native files"
+  };
+  return loaderLabels[loader];
 }
 
 function WindowControls({ onClose, onMaximize, onMinimize }: WindowControlsProps) {
@@ -2605,19 +2907,15 @@ function UpdateRailIndicator({
 interface HealthPanelProps {
   healthMessage: string;
   healthTone: NoticeKind;
-  isRefreshing: boolean;
   motionClassName?: string;
   status: string;
-  onRefresh(): void;
 }
 
 function HealthPanel({
   healthMessage,
   healthTone,
-  isRefreshing,
   motionClassName = "",
-  status,
-  onRefresh
+  status
 }: HealthPanelProps) {
   return (
     <div className={`health-panel health-dock ${healthTone} ${motionClassName}`}>
@@ -2629,16 +2927,6 @@ function HealthPanel({
         <strong>{healthMessage}</strong>
       </div>
       <span className="health-status" title={status}>{status}</span>
-      <button
-        className="health-refresh"
-        disabled={isRefreshing}
-        onClick={onRefresh}
-        title="Rescan selected profile"
-        type="button"
-      >
-        <RefreshCw size={15} />
-        {isRefreshing ? "Refreshing" : "Refresh"}
-      </button>
     </div>
   );
 }
@@ -2647,21 +2935,17 @@ function UniLoaderMark() {
   return (
     <svg aria-hidden="true" viewBox="0 0 48 48">
       <path
-        d="M13 13v14c0 6.6 4.9 11 11 11s11-4.4 11-11V13"
-        fill="none"
+        d="M24 3 41 10v14c0 10.2-6.2 16.7-17 21C13.2 40.7 7 34.2 7 24V10L24 3Z"
+        fill="currentColor"
+        fillOpacity="0.13"
         stroke="currentColor"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        strokeWidth="5"
+        strokeWidth="1.7"
       />
       <path
-        d="M9 20 13 13l4 7M31 20l4-7 4 7M24 7v18M17 18l7 7 7-7"
-        fill="none"
-        stroke="currentColor"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        strokeWidth="4"
+        d="M13 12h7v14.2c0 3.7 1.4 6 4 7.4 2.6-1.4 4-3.7 4-7.4V12h7v14.2c0 7.6-4.4 12.1-11 14.9-6.6-2.8-11-7.3-11-14.9V12Z"
+        fill="currentColor"
       />
+      <path d="m20 12 4-4 4 4-4 4-4-4Z" fill="#fff" fillOpacity="0.5" />
     </svg>
   );
 }
@@ -2682,6 +2966,7 @@ function StartupSplash({ phase }: { phase: StartupSplashPhase }) {
 
 interface DiscoverViewProps {
   hasLoaded: boolean;
+  installCompletionId: number;
   installingModId: string;
   isLoading: boolean;
   mods: OnlineModRecord[];
@@ -2698,6 +2983,7 @@ interface DiscoverViewProps {
 
 function DiscoverView({
   hasLoaded,
+  installCompletionId,
   installingModId,
   isLoading,
   mods,
@@ -2732,6 +3018,12 @@ function DiscoverView({
       setExpandedModId("");
     }
   }, [expandedModId, mods]);
+
+  useEffect(() => {
+    if (installCompletionId > 0) {
+      setExpandedModId("");
+    }
+  }, [installCompletionId]);
 
   useEffect(() => {
     if (!hasLoaded || !selectedProfileId) {
@@ -3620,6 +3912,168 @@ function actionableDependencyWarnings(warnings: string[]): string[] {
   return warnings.filter((warning) => !warning.startsWith("Installed dependency "));
 }
 
+function loadStoredModPresentations(): StoredModPresentations {
+  try {
+    const raw = window.localStorage.getItem(modPresentationStorageKey);
+    if (!raw) {
+      return {};
+    }
+    const parsed = JSON.parse(raw) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as StoredModPresentations)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveStoredModPresentations(presentations: StoredModPresentations) {
+  try {
+    window.localStorage.setItem(modPresentationStorageKey, JSON.stringify(presentations));
+  } catch {
+    // Artwork metadata is optional; installs must keep working if storage is unavailable.
+  }
+}
+
+function getStoredModPresentation(
+  mod: InstalledModRecord,
+  presentations: StoredModPresentations
+): StoredModPresentation {
+  const packageKey = mod.packageId?.trim().toLowerCase();
+  const stored = packageKey ? presentations[packageKey] : undefined;
+  if (stored) {
+    return stored;
+  }
+
+  const nameMatch = findStoredPresentationByName(mod, presentations);
+  if (nameMatch) {
+    return nameMatch;
+  }
+
+  if (mod.runtimeId) {
+    return {
+      owner: runtimeDisplayOwner(mod.runtimeId),
+      providerLabel: "System runtime",
+      version: dependencyVersion(mod.dependencyString)
+    };
+  }
+
+  if (packageKey?.startsWith("thunderstore:")) {
+    const reference = packageKey.slice("thunderstore:".length);
+    return {
+      owner: humanizeModName(reference.split("/")[0] ?? "Thunderstore"),
+      providerLabel: "Thunderstore",
+      version: dependencyVersion(mod.dependencyString)
+    };
+  }
+
+  if (packageKey?.startsWith("nexus:")) {
+    return {
+      providerLabel: "Nexus Mods",
+      version: dependencyVersion(mod.dependencyString)
+    };
+  }
+
+  return {
+    providerLabel: adapterDisplayName(mod.adapterId),
+    version: dependencyVersion(mod.dependencyString)
+  };
+}
+
+function findStoredPresentationByName(
+  mod: InstalledModRecord,
+  presentations: StoredModPresentations
+): StoredModPresentation | undefined {
+  const installedName = mod.displayName || mod.archiveName;
+  const strictKey = modPresentationNameKey(installedName, false);
+  const variantKey = modPresentationNameKey(installedName, true);
+  if (!strictKey) {
+    return undefined;
+  }
+
+  const exactMatches = Object.values(presentations).filter(
+    (presentation) =>
+      presentation.name && modPresentationNameKey(presentation.name, false) === strictKey
+  );
+  const exactMatch = uniquePresentation(exactMatches);
+  if (exactMatch) {
+    return exactMatch;
+  }
+
+  if (variantKey.length < 6) {
+    return undefined;
+  }
+  const variantMatches = Object.values(presentations).filter(
+    (presentation) =>
+      presentation.name && modPresentationNameKey(presentation.name, true) === variantKey
+  );
+  return uniquePresentation(variantMatches);
+}
+
+function uniquePresentation(
+  matches: StoredModPresentation[]
+): StoredModPresentation | undefined {
+  if (matches.length === 1) {
+    return matches[0];
+  }
+  if (matches.length === 0) {
+    return undefined;
+  }
+
+  const iconUrls = new Set(matches.map((match) => match.iconUrl).filter(Boolean));
+  return iconUrls.size === 1 ? matches[0] : undefined;
+}
+
+function modPresentationNameKey(value: string, stripVariants: boolean): string {
+  const tokens = humanizeModName(value)
+    .toLowerCase()
+    .replace(/\.[a-z0-9]{2,5}$/i, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+
+  const normalized = stripVariants
+    ? tokens.filter((token) => !isModVariantToken(token))
+    : tokens;
+  return normalized.join(" ");
+}
+
+function isModVariantToken(token: string): boolean {
+  return /^(?:v?\d+(?:\.\d+)*|\d+x|x\d+|\d+(?:m|h)|other|minute|minutes|hour|hours|min|mins|hr|hrs)$/i.test(
+    token
+  );
+}
+
+function dependencyVersion(value?: string): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const match = value.match(/(?:^|[-#@])v?(\d+(?:\.\d+){1,3}(?:[-+][a-z0-9.-]+)?)$/i);
+  return match?.[1];
+}
+
+function runtimeDisplayOwner(runtimeId: string): string {
+  const lower = runtimeId.toLowerCase();
+  if (lower.includes("bepinex")) return "BepInEx Team";
+  if (lower.includes("ue4ss")) return "UE4SS Team";
+  if (lower.includes("reframework")) return "REFramework";
+  return "Runtime provider";
+}
+
+function adapterDisplayName(adapterId: InstalledModRecord["adapterId"]): string {
+  const labels: Record<InstalledModRecord["adapterId"], string> = {
+    bepinex: "BepInEx",
+    ue4ss: "UE4SS",
+    reframework: "REFramework",
+    "re-engine-native": "RE Engine",
+    "unreal-pak": "Unreal Pak",
+    "loose-files": "Loose files",
+    "script-files": "Script mod"
+  };
+  return labels[adapterId];
+}
+
 function dependencyNames(dependencies: { name: string }[]): string {
   return dependencies
     .slice(0, 3)
@@ -3844,6 +4298,7 @@ function DropZone({
 
 interface ModCardProps {
   mod: InstalledModRecord;
+  presentation: StoredModPresentation;
   onConfigure(): void;
   onEnable(): void;
   onDisable(): void;
@@ -4165,80 +4620,64 @@ function isTruthyConfigValue(value: string): boolean {
   return value.trim().toLowerCase() === "true";
 }
 
-function ModCard({ mod, onConfigure, onEnable, onDisable, onRemove }: ModCardProps) {
+function ModCard({
+  mod,
+  presentation,
+  onConfigure,
+  onEnable,
+  onDisable,
+  onRemove
+}: ModCardProps) {
   const configFiles = mod.configFiles ?? [];
   const dependencies = mod.dependencies ?? [];
   const modName = displayModName(mod);
   const isRuntime = Boolean(mod.runtimeId);
-  const [showExtraDetails, setShowExtraDetails] = useState(false);
 
   return (
-    <article className={`mod-card ${mod.enabled ? "enabled" : "disabled"}${isRuntime ? " runtime" : ""}`}>
-      <div className="mod-card-header">
-        <div className="mod-card-title">
-          <strong title={mod.archiveName}>{modName}</strong>
+    <article className={`mod-card vault-mod-row ${mod.enabled ? "enabled" : "disabled"}${isRuntime ? " runtime" : ""}`}>
+      <ModArtwork mod={mod} name={modName} presentation={presentation} />
+      <div className="vault-mod-identity">
+        <strong title={mod.archiveName}>{modName}</strong>
+        <div className="vault-mod-byline">
+          <span>{presentation.owner ?? "Local package"}</span>
+          {presentation.version ? <span>v{presentation.version}</span> : null}
+          <span>{presentation.providerLabel ?? adapterDisplayName(mod.adapterId)}</span>
         </div>
-        <div className="mod-card-controls">
-          <label className="details-toggle" title="Show extra details">
-            <input
-              aria-label="Show extra details"
-              checked={showExtraDetails}
-              onChange={(event) => setShowExtraDetails(event.target.checked)}
-              type="checkbox"
-            />
-          </label>
-          <small>{isRuntime ? "System Runtime" : mod.enabled ? "Enabled" : "Disabled"}</small>
-        </div>
+        <small title={mod.summary}>
+          {isRuntime
+            ? mod.externallyManaged ? "Detected runtime" : "Managed runtime"
+            : dependencies.length > 0
+              ? `${dependencies.length} dependenc${dependencies.length === 1 ? "y" : "ies"} satisfied`
+              : `${mod.filesWritten.length} managed file${mod.filesWritten.length === 1 ? "" : "s"}`}
+        </small>
       </div>
-
-      {showExtraDetails ? (
-        <div className="mod-details">
-          <span>{mod.summary}</span>
-          <div className="mod-meta">
-            <span>{mod.adapterId}</span>
-            <span>{mod.filesWritten.length} file(s)</span>
-            {isRuntime ? (
-              <span>{mod.externallyManaged ? "Detected in game folder" : "Managed by UniLoader"}</span>
-            ) : null}
-          </div>
-        </div>
-      ) : null}
-
-      {dependencies.length > 0 ? (
-        <div className="dependency-chips">
-          {dependencies.slice(0, 4).map((dependency) => (
-            <span key={dependency.id}>{dependency.name}</span>
-          ))}
-        </div>
-      ) : null}
-
-      <div className="mod-actions">
-        {configFiles.length > 0 ? (
-          <button className="secondary-button compact-button" onClick={onConfigure}>
-            <Settings2 size={15} />
-            Configure
-          </button>
-        ) : null}
+      <label
+        className="vault-mod-toggle"
+        title={isRuntime ? "Required runtimes remain enabled" : `${mod.enabled ? "Disable" : "Enable"} ${modName}`}
+      >
+        <span>{mod.enabled ? "ON" : "OFF"}</span>
+        <input
+          aria-label={`${mod.enabled ? "Disable" : "Enable"} ${modName}`}
+          checked={mod.enabled}
+          disabled={isRuntime}
+          onChange={(event) => event.currentTarget.checked ? onEnable() : onDisable()}
+          type="checkbox"
+        />
+        <i><b /></i>
+      </label>
+      <div className="vault-mod-actions">
         {isRuntime ? (
-          <span className="runtime-protected" title="Required runtimes are protected so installed mods keep working.">
-            <ShieldCheck size={15} />
-            Protected
+          <span className="vault-mod-protected" title="Required runtimes are protected so installed mods keep working.">
+            <ShieldCheck size={17} />
           </span>
-        ) : mod.enabled ? (
-          <button className="secondary-button compact-button" onClick={onDisable}>
-            <PowerOff size={15} />
-            Disable
-          </button>
         ) : (
-          <button className="secondary-button compact-button" onClick={onEnable}>
-            <Power size={15} />
-            Enable
+          <button aria-label={`Remove ${modName}`} className="vault-mod-remove" onClick={onRemove} title="Remove mod" type="button">
+            <X size={18} />
           </button>
         )}
-        {!isRuntime ? (
-          <button className="danger-button compact-button" onClick={onRemove}>
-            <Trash2 size={15} />
-            Remove
+        {configFiles.length > 0 ? (
+          <button aria-label={`Configure ${modName}`} className="vault-mod-config" onClick={onConfigure} title="Configure mod" type="button">
+            <Settings2 size={18} />
           </button>
         ) : null}
       </div>

@@ -1,5 +1,6 @@
 use chrono::Utc;
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, Response};
+use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -28,6 +29,9 @@ const MAX_CONFIG_READ_BYTES: u64 = 512 * 1024;
 const MAX_CONFIG_SCAN_DEPTH: usize = 5;
 const MAX_PROFILE_CONFIG_FILES: usize = 500;
 const MAX_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_DOWNLOAD_ATTEMPTS: usize = 3;
+const DOWNLOAD_RETRY_BASE_DELAY_MS: u64 = 350;
+const DOWNLOAD_RETRY_MAX_DELAY_SECS: u64 = 5;
 const MAX_ARCHIVE_ENTRIES: usize = 10_000;
 const MAX_ARCHIVE_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_EXPANDED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -3191,9 +3195,11 @@ async fn install_nexus_nxm_link(
     app: AppHandle,
     nxm_url: String,
 ) -> Result<NexusNxmInstallResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    reveal_main_window(&app);
+    let install_app = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let _operation = lock_mutations()?;
-        let root = store_root(&app)?;
+        let root = store_root(&install_app)?;
         let settings = read_app_settings(&root)?;
         let api_key = settings.nexus_api_key().ok_or_else(|| {
             "Your Nexus API key is missing. Add it in Settings and try the download again."
@@ -3243,7 +3249,9 @@ async fn install_nexus_nxm_link(
         })
     })
     .await
-    .map_err(error_to_string)?
+    .map_err(error_to_string)?;
+    reveal_main_window(&app);
+    result
 }
 
 #[tauri::command]
@@ -3877,6 +3885,7 @@ fn reveal_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
+        let _ = window.set_focus();
     }
 }
 
@@ -5919,11 +5928,26 @@ fn install_archive_impl_with_metadata(
     options: InstallOptions<'_>,
 ) -> Result<InstallResult, String> {
     let InstallOptions {
-        metadata,
+        mut metadata,
         resolve_dependencies,
         visited_dependencies,
         dependency_depth,
     } = options;
+
+    let supplied_runtime = metadata
+        .runtime_id
+        .clone()
+        .or_else(|| runtime_supplied_by_plan(profile, plan));
+    let mut effective_plan = plan.clone();
+    if let Some(runtime) = supplied_runtime {
+        metadata.runtime_id.get_or_insert_with(|| runtime.clone());
+        effective_plan.dependencies.retain(|dependency| {
+            runtime_id_for_dependency(profile, dependency)
+                .map(|required| !required.eq_ignore_ascii_case(&runtime))
+                .unwrap_or(true)
+        });
+    }
+    let plan = &effective_plan;
 
     if dependency_depth > MAX_DEPENDENCY_DEPTH {
         return Err("Dependency chain is too deep to install safely.".to_string());
@@ -9443,6 +9467,56 @@ fn runtime_installed(profile: &GameProfile, runtime: &str) -> bool {
         .any(|rule| runtime_detection_rule_matches(profile, &entries, rule))
 }
 
+fn runtime_supplied_by_plan(profile: &GameProfile, plan: &InstallPlan) -> Option<String> {
+    let mut entries = Vec::new();
+    let mut seen_entries = HashSet::new();
+
+    for mapping in plan
+        .mappings
+        .iter()
+        .filter(|mapping| mapping.target_root.eq_ignore_ascii_case("game"))
+    {
+        let relative_path = normalize_archive_path(&mapping.target_relative_path);
+        let segments = relative_path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        if segments.is_empty() {
+            continue;
+        }
+
+        for depth in 1..segments.len() {
+            let directory = segments[..depth].join("/");
+            if seen_entries.insert((directory.to_ascii_lowercase(), true)) {
+                entries.push(ProbeEntry {
+                    relative_path: directory.clone(),
+                    name: basename(&directory),
+                    is_directory: true,
+                    depth,
+                });
+            }
+        }
+
+        if seen_entries.insert((relative_path.to_ascii_lowercase(), false)) {
+            entries.push(ProbeEntry {
+                relative_path: relative_path.clone(),
+                name: basename(&relative_path),
+                is_directory: false,
+                depth: segments.len(),
+            });
+        }
+    }
+
+    profile_runtime_ids(profile).into_iter().find(|runtime| {
+        runtime_definition_by_id(runtime).is_some_and(|definition| {
+            definition
+                .detection_rules
+                .iter()
+                .any(|rule| runtime_detection_rule_matches(profile, &entries, rule))
+        })
+    })
+}
+
 fn runtime_detection_rule_matches(
     profile: &GameProfile,
     entries: &[ProbeEntry],
@@ -9933,17 +10007,7 @@ fn download_url_to_file(client: &Client, url: &str, destination: &Path) -> Resul
         fs::remove_file(&temp_path).map_err(error_to_string)?;
     }
 
-    let mut response = client
-        .get(url)
-        .send()
-        .map_err(|error| format!("Download request failed: {}", error.without_url()))?
-        .error_for_status()
-        .map_err(|error| {
-            error
-                .status()
-                .map(|status| format!("Download server returned HTTP {}.", status.as_u16()))
-                .unwrap_or_else(|| "The download server rejected the request.".to_string())
-        })?;
+    let mut response = request_download_with_retry(client, url)?;
 
     let archive_extension = destination
         .extension()
@@ -10004,6 +10068,63 @@ fn download_url_to_file(client: &Client, url: &str, destination: &Path) -> Resul
     let result = replace_file_from_path(&temp_path, destination);
     let _ = fs::remove_file(&temp_path);
     result
+}
+
+fn request_download_with_retry(client: &Client, url: &str) -> Result<Response, String> {
+    for attempt in 0..MAX_DOWNLOAD_ATTEMPTS {
+        match client.get(url).send() {
+            Ok(response) => {
+                let status = response.status();
+                if status.is_success() {
+                    return Ok(response);
+                }
+
+                let should_retry =
+                    is_transient_download_status(status) && attempt + 1 < MAX_DOWNLOAD_ATTEMPTS;
+                if should_retry {
+                    let delay = download_retry_delay(&response, attempt);
+                    drop(response);
+                    std::thread::sleep(delay);
+                    continue;
+                }
+
+                return Err(format!(
+                    "Download server returned HTTP {}.",
+                    status.as_u16()
+                ));
+            }
+            Err(error) => {
+                let should_retry = (error.is_connect() || error.is_timeout())
+                    && attempt + 1 < MAX_DOWNLOAD_ATTEMPTS;
+                if should_retry {
+                    std::thread::sleep(default_download_retry_delay(attempt));
+                    continue;
+                }
+
+                return Err(format!("Download request failed: {}", error.without_url()));
+            }
+        }
+    }
+
+    Err("The download server did not respond after several attempts.".to_string())
+}
+
+fn is_transient_download_status(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+fn download_retry_delay(response: &Response, attempt: usize) -> Duration {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|seconds| Duration::from_secs(seconds.min(DOWNLOAD_RETRY_MAX_DELAY_SECS)))
+        .unwrap_or_else(|| default_download_retry_delay(attempt))
+}
+
+fn default_download_retry_delay(attempt: usize) -> Duration {
+    Duration::from_millis(DOWNLOAD_RETRY_BASE_DELAY_MS * (attempt as u64 + 1))
 }
 
 fn validate_downloaded_archive(path: &Path, extension: &str) -> Result<(), String> {
@@ -13558,6 +13679,46 @@ mod tests {
     }
 
     #[test]
+    fn download_requests_retry_transient_server_errors() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for status_line in ["502 Bad Gateway", "200 OK"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 {status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let client = Client::builder().build().unwrap();
+        let response = request_download_with_retry(&client, &format!("http://{address}/mod.zip"))
+            .expect("a transient provider failure should be retried");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn download_retry_statuses_exclude_permanent_client_errors() {
+        assert!(is_transient_download_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_transient_download_status(StatusCode::BAD_GATEWAY));
+        assert!(is_transient_download_status(
+            StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert!(!is_transient_download_status(StatusCode::BAD_REQUEST));
+        assert!(!is_transient_download_status(StatusCode::FORBIDDEN));
+        assert!(!is_transient_download_status(StatusCode::NOT_FOUND));
+    }
+
+    #[test]
     fn downloaded_archive_validation_accepts_archives_and_rejects_web_payloads() {
         let root = temp_game_dir("downloaded-archive-validation");
         fs::create_dir_all(&root).unwrap();
@@ -14653,6 +14814,145 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "live provider smoke test"]
+    fn live_thunderstore_install_resolves_runtime_and_rejects_duplicate() {
+        let root = temp_game_dir("live-thunderstore-valheim");
+        let store_root = root.join("store");
+        let game_root = root.join("game");
+        fs::create_dir_all(&store_root).unwrap();
+        fs::create_dir_all(&game_root).unwrap();
+        let mut profile = test_profile("valheim", "Valheim", "unity-mono", "bepinex");
+        profile.game_path = game_root.to_string_lossy().to_string();
+
+        let result = install_thunderstore_discovered_mod(
+            &store_root,
+            &profile,
+            "thunderstore:denikson/BepInExPack_Valheim",
+            None,
+            Some("valheim"),
+        )
+        .expect("Thunderstore BepInEx install should succeed");
+        assert!(!result.files_written.is_empty());
+        assert!(runtime_installed(&profile, "bepinex"));
+
+        let store = read_store::<InstalledModRecord>(&installed_mods_path(&store_root)).unwrap();
+        assert!(store.items.iter().any(|item| {
+            item.profile_id == profile.id
+                && item.package_id.as_deref() == Some("thunderstore:denikson/BepInExPack_Valheim")
+        }));
+
+        let duplicate = install_thunderstore_discovered_mod(
+            &store_root,
+            &profile,
+            "thunderstore:denikson/BepInExPack_Valheim",
+            None,
+            Some("valheim"),
+        )
+        .expect_err("installing the same Thunderstore package twice should fail");
+        assert!(duplicate.contains("already installed"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_archives_supply_their_own_dependency_across_registered_loaders() {
+        let cases = vec![
+            (
+                test_profile("valheim", "Valheim", "unity-mono", "bepinex"),
+                "bepinex",
+                vec!["BepInEx/core/BepInEx.dll"],
+            ),
+            (
+                test_profile(
+                    "unity-il2cpp-test",
+                    "Unity IL2CPP Test",
+                    "unity-il2cpp",
+                    "bepinex-il2cpp",
+                ),
+                "bepinex-il2cpp",
+                vec![
+                    "BepInEx/core/BepInEx.dll",
+                    "BepInEx/interop/Assembly-CSharp.dll",
+                ],
+            ),
+            (
+                test_profile("windrose", "Windrose", "unreal", "ue4ss"),
+                "ue4ss",
+                vec!["UE4SS.dll"],
+            ),
+            (
+                test_profile(
+                    "mhwilds",
+                    "Monster Hunter Wilds",
+                    "re-engine",
+                    "reframework",
+                ),
+                "reframework",
+                vec!["dinput8.dll", "reframework/autorun/runtime.lua"],
+            ),
+        ];
+
+        for (profile, runtime, targets) in cases {
+            let plan = InstallPlan {
+                adapter_id: profile.loader.clone(),
+                adapter_name: runtime.to_string(),
+                confidence: 1.0,
+                summary: "runtime fixture".to_string(),
+                mappings: targets
+                    .iter()
+                    .map(|target| mapping(target, "game", target, "runtime fixture"))
+                    .collect(),
+                dependencies: vec![known_runtime_dependency(&profile, runtime)],
+                warnings: Vec::new(),
+                requires_confirmation: false,
+            };
+
+            assert_eq!(
+                runtime_supplied_by_plan(&profile, &plan).as_deref(),
+                Some(runtime)
+            );
+        }
+
+        let ordinary_mods = vec![
+            (
+                test_profile("valheim", "Valheim", "unity-mono", "bepinex"),
+                vec!["BepInEx/plugins/CoolMod.dll"],
+            ),
+            (
+                test_profile("windrose", "Windrose", "unreal", "ue4ss"),
+                vec!["UE4SS/Mods/CoolMod/Scripts/main.lua"],
+            ),
+            (
+                test_profile(
+                    "mhwilds",
+                    "Monster Hunter Wilds",
+                    "re-engine",
+                    "reframework",
+                ),
+                vec!["reframework/autorun/cool_mod.lua"],
+            ),
+        ];
+
+        for (profile, targets) in ordinary_mods {
+            let plan = InstallPlan {
+                adapter_id: profile.loader.clone(),
+                adapter_name: profile.loader.clone(),
+                confidence: 1.0,
+                summary: "ordinary mod fixture".to_string(),
+                mappings: targets
+                    .iter()
+                    .map(|target| mapping(target, "game", target, "ordinary mod fixture"))
+                    .collect(),
+                dependencies: Vec::new(),
+                warnings: Vec::new(),
+                requires_confirmation: false,
+            };
+
+            assert!(runtime_supplied_by_plan(&profile, &plan).is_none());
+        }
     }
 
     #[test]

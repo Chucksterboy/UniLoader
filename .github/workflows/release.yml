@@ -47,12 +47,14 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          args: --features custom-protocol
           tagName: ${{ github.ref_name }}
           releaseName: "UniLoader ${{ github.ref_name }}"
           releaseBody: |
-            UniLoader Windows release with broader game and loader detection, Steam profile
-            scanning, redesigned profiles and mod discovery, improved Nexus and Thunderstore
-            flows, universal archive handling, and reliability fixes.
+            UniLoader's Vault Gallery update introduces an image-first library and discovery
+            experience, clearer Steam profiles, streamlined mod installation, install result
+            sounds, improved Nexus and Thunderstore handoffs, and reliability fixes across
+            loader detection, archives, dependencies, and window behavior.
           releaseDraft: false
           prerelease: false
 

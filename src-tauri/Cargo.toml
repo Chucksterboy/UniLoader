@@ -1,6 +1,6 @@
 [package]
 name = "uniloader"
-version = "0.9.1"
+version = "0.9.2"
 description = "UniLoader cross-game mod manager"
 authors = ["UniLoader"]
 edition = "2021"
@@ -8,6 +8,10 @@ edition = "2021"
 [lib]
 name = "uniloader_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = []
+custom-protocol = ["tauri/custom-protocol"]
 
 [[bin]]
 name = "uniloader"
