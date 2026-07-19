@@ -15860,14 +15860,16 @@ mod tests {
 
         let game_root = temp_game_dir("running-game-probe");
         fs::create_dir_all(&game_root).unwrap();
-        let system_ping = PathBuf::from(std::env::var("WINDIR").unwrap())
-            .join("System32")
-            .join("ping.exe");
         let probe_executable = game_root.join("UniLoaderGameProbe.exe");
-        fs::copy(system_ping, &probe_executable).unwrap();
+        fs::copy(std::env::current_exe().unwrap(), &probe_executable).unwrap();
 
         let mut child = Command::new(&probe_executable)
-            .args(["127.0.0.1", "-n", "6"])
+            .args([
+                "--exact",
+                "tests::running_game_probe_child_process",
+                "--nocapture",
+            ])
+            .env("UNILOADER_PROCESS_PROBE_CHILD", "1")
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -15896,6 +15898,13 @@ mod tests {
         assert!(stopped, "the stopped game process remained visible");
 
         let _ = fs::remove_dir_all(game_root);
+    }
+
+    #[test]
+    fn running_game_probe_child_process() {
+        if std::env::var_os("UNILOADER_PROCESS_PROBE_CHILD").is_some() {
+            std::thread::sleep(Duration::from_secs(10));
+        }
     }
 
     fn online_mod_fixture(name: &str, description: &str) -> OnlineModRecord {
