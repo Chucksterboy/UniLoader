@@ -45,8 +45,8 @@ export const desktopApi: DesktopApi = {
   scanSteamGames: () => invoke<SteamGameRecord[]>("scan_steam_games"),
   createSteamProfile: (game: SteamGameRecord) =>
     invoke<GameProfile>("create_steam_profile", { game }),
-  launchProfileGame: (profileId: string) =>
-    invoke<void>("launch_profile_game", { profileId }),
+  launchProfileGame: (profileId: string, modsEnabled: boolean) =>
+    invoke<void>("launch_profile_game", { profileId, modsEnabled }),
   setAllProfileModsEnabled: (profileId: string, enabled: boolean) =>
     invoke<ProfileModToggleResult>("set_all_profile_mods_enabled", { profileId, enabled }),
   listProfiles: () => invoke<GameProfile[]>("list_profiles"),

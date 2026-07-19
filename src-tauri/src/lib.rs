@@ -49,6 +49,7 @@ const NEXUS_DISCOVERY_PAGE_SIZE: usize = 40;
 const NEXUS_PENDING_DOWNLOAD_TTL_MINUTES: i64 = 30;
 const MAX_DISCOVERY_PAGE_SIZE: usize = 50;
 const MAX_PROVIDER_CANDIDATES: usize = 16;
+const PROFILE_LAUNCH_SUSPENSION_VERSION: u32 = 1;
 const PROFILE_RUNTIME_SAMPLE_SIZE: usize = 40;
 const PROFILE_RUNTIME_MAX_DEPENDENCY_DEPTH: usize = 5;
 const PROFILE_RUNTIME_MIN_SUPPORT: usize = 2;
@@ -766,6 +767,30 @@ pub struct ProfileModToggleResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SuspendedLaunchFile {
+    destination: String,
+    snapshot_relative_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SuspendedLaunchMod {
+    mod_id: String,
+    #[serde(default)]
+    staged_files: Vec<SuspendedLaunchFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileLaunchSuspension {
+    version: u32,
+    profile_id: String,
+    #[serde(default)]
+    mods: Vec<SuspendedLaunchMod>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProfileActionResult {
     profile_id: String,
     name: String,
@@ -1341,7 +1366,12 @@ fn ensure_verified_steam_profile(profile: &GameProfile) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn launch_profile_game(app: AppHandle, profile_id: String) -> Result<(), String> {
+fn launch_profile_game(
+    app: AppHandle,
+    profile_id: String,
+    mods_enabled: bool,
+) -> Result<(), String> {
+    let _operation = lock_mutations()?;
     let root = store_root(&app)?;
     let profile = get_profile(&root, &profile_id)?;
     let steam_app_id = profile
@@ -1353,6 +1383,7 @@ fn launch_profile_game(app: AppHandle, profile_id: String) -> Result<(), String>
             "This profile does not have a Steam App ID yet. Add it through Steam scan to launch it from UniLoader.".to_string()
         })?;
 
+    prepare_profile_mod_launch(&root, &profile, mods_enabled)?;
     open_url_in_shell(&format!("steam://run/{steam_app_id}"))
 }
 
@@ -6803,16 +6834,7 @@ fn is_external_mod_manager_listing(record: &OnlineModRecord) -> bool {
 }
 
 fn online_mod_matches_query(record: &OnlineModRecord, query: &str) -> bool {
-    format!(
-        "{} {} {} {} {}",
-        record.name,
-        record.owner,
-        record.description,
-        record.provider_label,
-        record.categories.join(" ")
-    )
-    .to_lowercase()
-    .contains(query)
+    record.name.to_lowercase().contains(query)
 }
 
 fn sort_online_mods(records: &mut [OnlineModRecord], sort: &str) {
@@ -10773,6 +10795,339 @@ fn rollback_profile_migration(
     }
 }
 
+fn prepare_profile_mod_launch(
+    store_root: &Path,
+    profile: &GameProfile,
+    mods_enabled: bool,
+) -> Result<usize, String> {
+    if mods_enabled {
+        resume_profile_mod_files(store_root, profile)
+    } else {
+        suspend_profile_mod_files(store_root, profile)
+    }
+}
+
+fn suspend_profile_mod_files(store_root: &Path, profile: &GameProfile) -> Result<usize, String> {
+    let store = read_store::<InstalledModRecord>(&installed_mods_path(store_root))
+        .map_err(error_to_string)?;
+    let mut suspension = read_profile_launch_suspension(store_root, &profile.id)?;
+    let original_suspension = suspension.clone();
+    let mut suspended_records = Vec::<(InstalledModRecord, SuspendedLaunchMod)>::new();
+
+    for record in store.items.iter().filter(|record| {
+        record.profile_id == profile.id && record.enabled && record.runtime_id.is_none()
+    }) {
+        let has_active_files = record
+            .files_written
+            .iter()
+            .any(|file_path| Path::new(file_path).is_file());
+        if !has_active_files {
+            continue;
+        }
+
+        let suspended = if let Some(existing) = suspension
+            .mods
+            .iter()
+            .find(|item| item.mod_id == record.id)
+            .cloned()
+        {
+            existing
+        } else {
+            let staged_files = if installed_record_can_redeploy(record) {
+                Vec::new()
+            } else {
+                match stage_launch_mod_files(store_root, profile, record) {
+                    Ok(files) => files,
+                    Err(error) => {
+                        rollback_launch_suspension(store_root, profile, &suspended_records);
+                        cleanup_new_launch_snapshots(store_root, &original_suspension, &suspension);
+                        return Err(format!(
+                            "Could not prepare a clean launch for {}: {error}",
+                            display_record_name(record)
+                        ));
+                    }
+                }
+            };
+            let suspended = SuspendedLaunchMod {
+                mod_id: record.id.clone(),
+                staged_files,
+            };
+            suspension.mods.push(suspended.clone());
+            suspended
+        };
+
+        if let Err(error) = deactivate_mod_files(store_root, profile, record) {
+            rollback_launch_suspension(store_root, profile, &suspended_records);
+            cleanup_new_launch_snapshots(store_root, &original_suspension, &suspension);
+            return Err(format!(
+                "Could not prepare a clean launch because {} could not be suspended: {error}",
+                display_record_name(record)
+            ));
+        }
+        suspended_records.push((record.clone(), suspended));
+    }
+
+    if let Err(error) = write_profile_launch_suspension(store_root, &suspension) {
+        rollback_launch_suspension(store_root, profile, &suspended_records);
+        cleanup_new_launch_snapshots(store_root, &original_suspension, &suspension);
+        return Err(error);
+    }
+
+    Ok(suspended_records.len())
+}
+
+fn resume_profile_mod_files(store_root: &Path, profile: &GameProfile) -> Result<usize, String> {
+    let suspension = read_profile_launch_suspension(store_root, &profile.id)?;
+    if suspension.mods.is_empty() {
+        return Ok(0);
+    }
+
+    let store = read_store::<InstalledModRecord>(&installed_mods_path(store_root))
+        .map_err(error_to_string)?;
+    let mut restored_records = Vec::<InstalledModRecord>::new();
+
+    for suspended in &suspension.mods {
+        let Some(record) = store.items.iter().find(|record| {
+            record.id == suspended.mod_id
+                && record.profile_id == profile.id
+                && record.enabled
+                && record.runtime_id.is_none()
+        }) else {
+            continue;
+        };
+
+        if let Err(error) = restore_suspended_launch_mod(store_root, profile, record, suspended) {
+            for restored in restored_records.iter().rev() {
+                let _ = deactivate_mod_files(store_root, profile, restored);
+            }
+            return Err(format!(
+                "Could not restore {} for this launch: {error}",
+                display_record_name(record)
+            ));
+        }
+        restored_records.push(record.clone());
+    }
+
+    if let Err(error) = clear_profile_launch_suspension(store_root, &profile.id) {
+        for restored in restored_records.iter().rev() {
+            let _ = deactivate_mod_files(store_root, profile, restored);
+        }
+        return Err(error);
+    }
+
+    Ok(restored_records.len())
+}
+
+fn installed_record_can_redeploy(record: &InstalledModRecord) -> bool {
+    record.plan.is_some() && Path::new(&record.archive_path).exists()
+}
+
+fn stage_launch_mod_files(
+    store_root: &Path,
+    profile: &GameProfile,
+    record: &InstalledModRecord,
+) -> Result<Vec<SuspendedLaunchFile>, String> {
+    let suspension_root = profile_launch_suspension_dir(store_root, &profile.id);
+    let files_root = suspension_root.join("files");
+    fs::create_dir_all(&files_root).map_err(error_to_string)?;
+    let mut staged = Vec::new();
+
+    let result = (|| -> Result<(), String> {
+        for destination in &record.files_written {
+            let destination_path = Path::new(destination);
+            if !destination_path.exists() {
+                continue;
+            }
+            if !destination_path.is_file()
+                || fs::symlink_metadata(destination_path)
+                    .map_err(error_to_string)?
+                    .file_type()
+                    .is_symlink()
+                || !path_is_inside(destination_path, Path::new(&profile.game_path))
+            {
+                return Err(format!(
+                    "UniLoader will not stage an unsafe mod path: {}",
+                    destination_path.to_string_lossy()
+                ));
+            }
+
+            let snapshot_relative_path = format!("files/{}.bin", Uuid::new_v4());
+            let snapshot_path = safe_join(&suspension_root, &snapshot_relative_path)?;
+            fs::copy(destination_path, &snapshot_path).map_err(|error| {
+                format!(
+                    "Could not stage {} for a clean launch: {error}",
+                    destination_path.to_string_lossy()
+                )
+            })?;
+            staged.push(SuspendedLaunchFile {
+                destination: destination.clone(),
+                snapshot_relative_path,
+            });
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        remove_staged_launch_files(store_root, &profile.id, &staged);
+        return Err(error);
+    }
+
+    Ok(staged)
+}
+
+fn restore_suspended_launch_mod(
+    store_root: &Path,
+    profile: &GameProfile,
+    record: &InstalledModRecord,
+    suspended: &SuspendedLaunchMod,
+) -> Result<(), String> {
+    if suspended.staged_files.is_empty() {
+        let plan = record.plan.clone().ok_or_else(|| {
+            "The managed source and install plan are no longer available.".to_string()
+        })?;
+        if !Path::new(&record.archive_path).exists() {
+            return Err("The managed mod source is no longer available.".to_string());
+        }
+        let mut restored = record.clone();
+        let install_id = restored.id.clone();
+        let archive_path = restored.archive_path.clone();
+        deploy_mod_files(
+            store_root,
+            profile,
+            &install_id,
+            &archive_path,
+            &plan,
+            &mut restored,
+        )?;
+        return Ok(());
+    }
+
+    let suspension_root = profile_launch_suspension_dir(store_root, &profile.id);
+    for staged in &suspended.staged_files {
+        let snapshot_path = safe_join(&suspension_root, &staged.snapshot_relative_path)?;
+        if !snapshot_path.is_file() {
+            return Err(format!(
+                "A staged mod file is missing: {}",
+                snapshot_path.to_string_lossy()
+            ));
+        }
+        let destination = PathBuf::from(&staged.destination);
+        if !launch_destination_is_inside_game(&destination, Path::new(&profile.game_path)) {
+            return Err(format!(
+                "A staged destination is outside the game folder: {}",
+                destination.to_string_lossy()
+            ));
+        }
+        replace_file_from_path(&snapshot_path, &destination)?;
+    }
+    Ok(())
+}
+
+fn launch_destination_is_inside_game(destination: &Path, game_path: &Path) -> bool {
+    if destination.exists() {
+        return path_is_inside(destination, game_path);
+    }
+    destination
+        .parent()
+        .is_some_and(|parent| path_is_inside(parent, game_path))
+}
+
+fn rollback_launch_suspension(
+    store_root: &Path,
+    profile: &GameProfile,
+    suspended_records: &[(InstalledModRecord, SuspendedLaunchMod)],
+) {
+    for (record, suspended) in suspended_records.iter().rev() {
+        let _ = restore_suspended_launch_mod(store_root, profile, record, suspended);
+    }
+}
+
+fn cleanup_new_launch_snapshots(
+    store_root: &Path,
+    original: &ProfileLaunchSuspension,
+    current: &ProfileLaunchSuspension,
+) {
+    let original_paths = original
+        .mods
+        .iter()
+        .flat_map(|item| item.staged_files.iter())
+        .map(|file| file.snapshot_relative_path.as_str())
+        .collect::<HashSet<_>>();
+    let new_files = current
+        .mods
+        .iter()
+        .flat_map(|item| item.staged_files.iter())
+        .filter(|file| !original_paths.contains(file.snapshot_relative_path.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    remove_staged_launch_files(store_root, &current.profile_id, &new_files);
+}
+
+fn remove_staged_launch_files(
+    store_root: &Path,
+    profile_id: &str,
+    staged_files: &[SuspendedLaunchFile],
+) {
+    let suspension_root = profile_launch_suspension_dir(store_root, profile_id);
+    for staged in staged_files {
+        if let Ok(path) = safe_join(&suspension_root, &staged.snapshot_relative_path) {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn read_profile_launch_suspension(
+    store_root: &Path,
+    profile_id: &str,
+) -> Result<ProfileLaunchSuspension, String> {
+    let path = profile_launch_suspension_manifest_path(store_root, profile_id);
+    if !path.exists() {
+        return Ok(ProfileLaunchSuspension {
+            version: PROFILE_LAUNCH_SUSPENSION_VERSION,
+            profile_id: profile_id.to_string(),
+            mods: Vec::new(),
+        });
+    }
+
+    let content = fs::read_to_string(&path).map_err(error_to_string)?;
+    let suspension = parse_json_allow_bom::<ProfileLaunchSuspension>(&content)
+        .map_err(|error| format!("Could not read the clean-launch state: {error}"))?;
+    if suspension.version != PROFILE_LAUNCH_SUSPENSION_VERSION
+        || suspension.profile_id != profile_id
+    {
+        return Err("The saved clean-launch state is not valid for this profile.".to_string());
+    }
+    Ok(suspension)
+}
+
+fn write_profile_launch_suspension(
+    store_root: &Path,
+    suspension: &ProfileLaunchSuspension,
+) -> Result<(), String> {
+    if suspension.mods.is_empty() {
+        return Ok(());
+    }
+    let path = profile_launch_suspension_manifest_path(store_root, &suspension.profile_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(error_to_string)?;
+    }
+    let content = serde_json::to_string_pretty(suspension).map_err(error_to_string)?;
+    atomic_write(&path, format!("{content}\n").as_bytes()).map_err(error_to_string)
+}
+
+fn clear_profile_launch_suspension(store_root: &Path, profile_id: &str) -> Result<(), String> {
+    let suspension_root = profile_launch_suspension_dir(store_root, profile_id);
+    if !suspension_root.exists() {
+        return Ok(());
+    }
+    let cleared =
+        suspension_root.with_file_name(format!("launch-suspension-cleared-{}", Uuid::new_v4()));
+    fs::rename(&suspension_root, &cleared)
+        .map_err(|error| format!("Could not finish restoring the selected mods: {error}"))?;
+    let _ = fs::remove_dir_all(cleared);
+    Ok(())
+}
+
 fn deactivate_mod_files(
     store_root: &Path,
     profile: &GameProfile,
@@ -13262,6 +13617,14 @@ fn profile_package_dir(root: &Path, profile_id: &str, install_id: &str) -> PathB
         .join(install_id)
 }
 
+fn profile_launch_suspension_dir(root: &Path, profile_id: &str) -> PathBuf {
+    profile_dir(root, profile_id).join("launch-suspension")
+}
+
+fn profile_launch_suspension_manifest_path(root: &Path, profile_id: &str) -> PathBuf {
+    profile_launch_suspension_dir(root, profile_id).join("manifest.json")
+}
+
 fn ensure_store<T>(path: &Path) -> io::Result<()>
 where
     T: Serialize + DeserializeOwned,
@@ -14017,6 +14380,109 @@ mod tests {
             "Server Mod Browser",
             "Browse and inspect server-side mods from inside the game."
         )));
+    }
+
+    #[test]
+    fn discovery_search_matches_only_the_mod_name() {
+        let title_match = online_mod_fixture(
+            "Increase Drop Rates",
+            "Adjusts resource rewards throughout the game.",
+        );
+        let detail_only_match = online_mod_fixture(
+            "More Animal Resources",
+            "Includes configurable drop rate controls.",
+        );
+
+        assert!(online_mod_matches_query(&title_match, "drop rate"));
+        assert!(!online_mod_matches_query(&detail_only_match, "drop rate"));
+    }
+
+    #[test]
+    fn clean_launch_preserves_individual_mod_choices() {
+        let store_root = temp_game_dir("clean-launch-store");
+        let game_root = store_root.join("game");
+        fs::create_dir_all(game_root.join("Mods")).unwrap();
+        let enabled_file = game_root.join("Mods/enabled.dll");
+        let disabled_file = game_root.join("Mods/disabled.dll");
+        let runtime_file = game_root.join("runtime.dll");
+        fs::write(&enabled_file, b"enabled mod").unwrap();
+        fs::write(&disabled_file, b"disabled sentinel").unwrap();
+        fs::write(&runtime_file, b"runtime").unwrap();
+
+        let profile = GameProfile {
+            id: "profile-clean-launch".to_string(),
+            name: "Test Game".to_string(),
+            game_path: game_root.to_string_lossy().to_string(),
+            game_id: Some("test-game".to_string()),
+            steam_app_id: Some("123".to_string()),
+            engine: "unity-mono".to_string(),
+            loader: "bepinex".to_string(),
+            created_at: now_string(),
+            updated_at: now_string(),
+        };
+        let record =
+            |id: &str, file: &Path, enabled: bool, runtime_id: Option<&str>| InstalledModRecord {
+                id: id.to_string(),
+                profile_id: profile.id.clone(),
+                archive_path: store_root
+                    .join(format!("missing-{id}.zip"))
+                    .to_string_lossy()
+                    .to_string(),
+                archive_name: format!("{id}.zip"),
+                display_name: Some(id.to_string()),
+                package_id: None,
+                dependency_string: None,
+                adapter_id: "test-adapter".to_string(),
+                summary: String::new(),
+                installed_at: now_string(),
+                files_written: vec![file.to_string_lossy().to_string()],
+                backups_written: Vec::new(),
+                written_file_hashes: HashMap::new(),
+                dependencies: Vec::new(),
+                config_files: Vec::new(),
+                runtime_id: runtime_id.map(str::to_string),
+                externally_managed: true,
+                enabled,
+                last_status: (if enabled { "installed" } else { "disabled" }).to_string(),
+                plan: None,
+            };
+        write_store(
+            &installed_mods_path(&store_root),
+            &StoreFile {
+                version: 1,
+                items: vec![
+                    record("enabled-mod", &enabled_file, true, None),
+                    record("disabled-mod", &disabled_file, false, None),
+                    record("runtime", &runtime_file, true, Some("bepinex")),
+                ],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            prepare_profile_mod_launch(&store_root, &profile, false).unwrap(),
+            1
+        );
+        assert!(!enabled_file.exists());
+        assert!(disabled_file.exists());
+        assert!(runtime_file.exists());
+
+        let suspended_store =
+            read_store::<InstalledModRecord>(&installed_mods_path(&store_root)).unwrap();
+        assert!(suspended_store.items[0].enabled);
+        assert!(!suspended_store.items[1].enabled);
+        assert!(suspended_store.items[2].enabled);
+
+        assert_eq!(
+            prepare_profile_mod_launch(&store_root, &profile, true).unwrap(),
+            1
+        );
+        assert_eq!(fs::read(&enabled_file).unwrap(), b"enabled mod");
+        assert!(disabled_file.exists());
+        assert!(runtime_file.exists());
+        assert!(!profile_launch_suspension_dir(&store_root, &profile.id).exists());
+
+        let _ = fs::remove_dir_all(store_root);
     }
 
     #[test]

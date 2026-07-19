@@ -406,7 +406,7 @@ export interface DesktopApi {
   downloadUpdateInstaller(url: string, fileName?: string): Promise<string>;
   scanSteamGames(): Promise<SteamGameRecord[]>;
   createSteamProfile(game: SteamGameRecord): Promise<GameProfile>;
-  launchProfileGame(profileId: string): Promise<void>;
+  launchProfileGame(profileId: string, modsEnabled: boolean): Promise<void>;
   setAllProfileModsEnabled(profileId: string, enabled: boolean): Promise<ProfileModToggleResult>;
   listProfiles(): Promise<GameProfile[]>;
   profileFolderExists(profileId: string): Promise<boolean>;

@@ -56,9 +56,10 @@ jobs:
             sounds, improved Nexus and Thunderstore handoffs, and reliability fixes across
             loader detection, archives, dependencies, and window behavior.
 
-            v0.9.3 also fixes Discovery pagination beyond page two, centers the Discovery
-            workspace at fullscreen sizes, adds navigation above and below results, and replaces
-            the oversized page-loading panel with a compact loading state.
+            v0.9.4 adds title-only Discovery search, a clean-launch Mods ON/OFF mode that
+            preserves every individual library choice, and responsive profile controls that stay
+            readable at the application's minimum window size. It also includes the Discovery
+            pagination, fullscreen centering, and compact page-loading fixes from v0.9.3.
           releaseDraft: false
           prerelease: false
 

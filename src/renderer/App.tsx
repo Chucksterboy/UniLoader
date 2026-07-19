@@ -137,6 +137,7 @@ const startupSplashPulseMs = 2700;
 const startupSplashFadeMs = 420;
 const startupSplashMaximumMs = 8000;
 const modPresentationStorageKey = "uniloader.mod-presentations.v2";
+const profileLaunchModeStorageKey = "uniloader.profile-launch-modes.v1";
 
 interface StoredModPresentation {
   description?: string;
@@ -149,6 +150,7 @@ interface StoredModPresentation {
 }
 
 type StoredModPresentations = Record<string, StoredModPresentation>;
+type StoredProfileLaunchModes = Record<string, boolean>;
 
 export function App() {
   const [activeView, setActiveView] = useState<ViewMode>("manager");
@@ -191,7 +193,9 @@ export function App() {
   const [isScanningSteamGames, setIsScanningSteamGames] = useState(false);
   const [isCreatingSteamProfile, setIsCreatingSteamProfile] = useState(false);
   const [isLaunchingGame, setIsLaunchingGame] = useState(false);
-  const [isTogglingAllMods, setIsTogglingAllMods] = useState(false);
+  const [profileLaunchModes, setProfileLaunchModes] = useState<StoredProfileLaunchModes>(() =>
+    loadStoredProfileLaunchModes()
+  );
   const [steamGames, setSteamGames] = useState<SteamGameRecord[]>([]);
   const [selectedSteamGameAppId, setSelectedSteamGameAppId] = useState("");
   const [profileCreatorOpen, setProfileCreatorOpen] = useState(false);
@@ -340,10 +344,10 @@ export function App() {
       `${game.name} ${game.installDir}`.toLowerCase().includes(query)
     );
   }, [steamGameSearch, steamGames]);
-  const enabledProfileModCount = installedMods.filter((mod) => mod.enabled).length;
-  const allProfileModsEnabled =
-    installedMods.length > 0 && enabledProfileModCount === installedMods.length;
-  const profileModToggleLabel = allProfileModsEnabled ? "ON" : "OFF";
+  const selectedProfileLaunchModsEnabled = selectedProfile
+    ? profileLaunchModes[selectedProfile.id] ?? true
+    : true;
+  const profileModToggleLabel = selectedProfileLaunchModsEnabled ? "ON" : "OFF";
   const displayedOnlineMods =
     discoverLoadedProfileId === discoverProfileId ? onlineMods : [];
   const selectedPlan = analysis?.recommendedPlan;
@@ -913,6 +917,12 @@ export function App() {
       const result = await api.removeProfile(profile.id);
       const nextProfiles = profiles.filter((item) => item.id !== profile.id);
       setProfiles(nextProfiles);
+      setProfileLaunchModes((current) => {
+        const next = { ...current };
+        delete next[profile.id];
+        saveStoredProfileLaunchModes(next);
+        return next;
+      });
 
       if (selectedProfileId === profile.id) {
         const nextSelectedProfileId = nextProfiles[0]?.id ?? "";
@@ -1141,14 +1151,17 @@ export function App() {
 
     setError("");
     setIsLaunchingGame(true);
-    setStatus("Launching game");
+    const launchWithMods = selectedProfileLaunchModsEnabled;
+    setStatus(launchWithMods ? "Launching with mods" : "Launching without mods");
     try {
-      await api.launchProfileGame(selectedProfile.id);
+      await api.launchProfileGame(selectedProfile.id, launchWithMods);
       setStatus("Game launched");
       setNotice({
         kind: "success",
         title: "Launch requested",
-        detail: `Steam is launching ${selectedProfile.name}.`
+        detail: launchWithMods
+          ? `Steam is launching ${selectedProfile.name} with the enabled library mods.`
+          : `Steam is launching ${selectedProfile.name} without user mods.`
       });
     } catch (caughtError) {
       setError(String(caughtError));
@@ -1163,50 +1176,17 @@ export function App() {
     }
   }
 
-  async function setAllModsEnabled(enabled: boolean) {
+  function setProfileLaunchModsEnabled(enabled: boolean) {
     if (!selectedProfile) {
-      setNotice({
-        kind: "warning",
-        title: "Select a profile",
-        detail: "Choose a profile before changing installed mods."
-      });
       return;
     }
 
-    if (installedMods.length === 0) {
-      setNotice({
-        kind: "warning",
-        title: "No mods installed",
-        detail: "Install at least one mod before using the all-mods switch."
-      });
-      return;
-    }
-
-    setError("");
-    setIsTogglingAllMods(true);
-    setStatus(enabled ? "Enabling all mods" : "Disabling all mods");
-    try {
-      const result = await api.setAllProfileModsEnabled(selectedProfile.id, enabled);
-      setInstalledMods(result.installedMods);
-      setStatus(enabled ? "All mods enabled" : "All mods disabled");
-      setNotice({
-        kind: result.warnings.length > 0 ? "warning" : "success",
-        title: enabled ? "All mods enabled" : "All mods disabled",
-        detail:
-          result.warnings[0] ??
-          `${result.changedMods} mod${result.changedMods === 1 ? "" : "s"} ${enabled ? "enabled" : "disabled"}.`
-      });
-    } catch (caughtError) {
-      setError(String(caughtError));
-      setStatus("Mod toggle failed");
-      setNotice({
-        kind: "error",
-        title: "Mod toggle failed",
-        detail: String(caughtError)
-      });
-    } finally {
-      setIsTogglingAllMods(false);
-    }
+    setProfileLaunchModes((current) => {
+      const next = { ...current, [selectedProfile.id]: enabled };
+      saveStoredProfileLaunchModes(next);
+      return next;
+    });
+    setStatus(enabled ? "Mods enabled for launch" : "Clean launch selected");
   }
 
   async function exportProfileBundle(profileId: string) {
@@ -2016,13 +1996,17 @@ export function App() {
           </div>
           <div className="profile-command-actions vault-hero-actions">
             <label
-              className={isTogglingAllMods ? "master-mod-toggle busy" : "master-mod-toggle"}
-              title="Enable or disable every installed mod in this profile"
+              className="master-mod-toggle"
+              title={
+                selectedProfileLaunchModsEnabled
+                  ? "Launch with the individual mod choices from the library"
+                  : "Launch without user mods while preserving the library choices"
+              }
             >
               <input
-                checked={allProfileModsEnabled}
-                disabled={!selectedProfile || installedMods.length === 0 || isTogglingAllMods}
-                onChange={(event) => void setAllModsEnabled(event.currentTarget.checked)}
+                checked={selectedProfileLaunchModsEnabled}
+                disabled={!selectedProfile || isLaunchingGame}
+                onChange={(event) => setProfileLaunchModsEnabled(event.currentTarget.checked)}
                 type="checkbox"
               />
               <span className="master-mod-track"><span /></span>
@@ -3970,6 +3954,35 @@ function saveStoredModPresentations(presentations: StoredModPresentations) {
     window.localStorage.setItem(modPresentationStorageKey, JSON.stringify(presentations));
   } catch {
     // Artwork metadata is optional; installs must keep working if storage is unavailable.
+  }
+}
+
+function loadStoredProfileLaunchModes(): StoredProfileLaunchModes {
+  try {
+    const raw = window.localStorage.getItem(profileLaunchModeStorageKey);
+    if (!raw) {
+      return {};
+    }
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+
+    return Object.fromEntries(
+      Object.entries(parsed).filter((entry): entry is [string, boolean] =>
+        typeof entry[1] === "boolean"
+      )
+    );
+  } catch {
+    return {};
+  }
+}
+
+function saveStoredProfileLaunchModes(modes: StoredProfileLaunchModes) {
+  try {
+    window.localStorage.setItem(profileLaunchModeStorageKey, JSON.stringify(modes));
+  } catch {
+    // Launch preferences can safely fall back to ON when browser storage is unavailable.
   }
 }
 
