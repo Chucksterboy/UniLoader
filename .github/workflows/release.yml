@@ -51,15 +51,13 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "UniLoader ${{ github.ref_name }}"
           releaseBody: |
-            UniLoader v0.9.8 fixes profile bundles that disappeared from the Import dialog after
-            being sent to another PC. The picker now shows transferred files even when a browser,
-            messenger, or duplicate download changes the filename or extension; UniLoader validates
-            the bundle contents before importing it.
+            UniLoader v0.9.9 improves Steam game artwork resilience across the entire profile library.
+            Profile cards still prefer Steam's portrait artwork, but now fall back to the game's wide
+            hero or header artwork when Steam does not publish a portrait for that App ID.
 
-            Windows icon assets are regenerated from the current gold shield. UniLoader now refreshes
-            the Windows shell icon cache once per app version, and NSIS updates recreate existing
-            desktop and Start menu shortcuts so the desktop, taskbar, and system tray stop retaining
-            older UniLoader artwork after an in-place update.
+            Games such as RuneScape: Dragonwilds now retain real artwork in both the profile rail and
+            active-game banner instead of dropping to an initials placeholder. The fallback applies
+            automatically to current and future verified Steam profiles with incomplete artwork sets.
           releaseDraft: false
           prerelease: false
 

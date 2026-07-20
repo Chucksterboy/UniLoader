@@ -1,6 +1,6 @@
 {
   "name": "uniloader",
-  "version": "0.9.8",
+  "version": "0.9.9",
   "private": true,
   "description": "UniLoader cross-game mod manager prototype with per-game adapters and dependency planning.",
   "scripts": {

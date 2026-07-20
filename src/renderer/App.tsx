@@ -2972,12 +2972,7 @@ function steamArtworkUrls(
   }
 
   if (variant === "hero") {
-    return [
-      `https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_hero.jpg`,
-      `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_hero.jpg`,
-      `https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/header.jpg`,
-      `https://cdn.cloudflare.steamstatic.com/steam/apps/${steamAppId}/header.jpg`
-    ];
+    return steamWideArtworkUrls(steamAppId);
   }
 
   return [
@@ -2985,7 +2980,17 @@ function steamArtworkUrls(
     `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_600x900_2x.jpg`,
     `https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_600x900.jpg`,
     `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_600x900.jpg`,
-    `https://cdn.cloudflare.steamstatic.com/steam/apps/${steamAppId}/capsule_231x87.jpg`
+    `https://cdn.cloudflare.steamstatic.com/steam/apps/${steamAppId}/capsule_231x87.jpg`,
+    ...steamWideArtworkUrls(steamAppId)
+  ];
+}
+
+function steamWideArtworkUrls(steamAppId: string): string[] {
+  return [
+    `https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_hero.jpg`,
+    `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/library_hero.jpg`,
+    `https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/${steamAppId}/header.jpg`,
+    `https://cdn.cloudflare.steamstatic.com/steam/apps/${steamAppId}/header.jpg`
   ];
 }
 
