@@ -51,13 +51,14 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "UniLoader ${{ github.ref_name }}"
           releaseBody: |
-            UniLoader v0.9.9 improves Steam game artwork resilience across the entire profile library.
-            Profile cards still prefer Steam's portrait artwork, but now fall back to the game's wide
-            hero or header artwork when Steam does not publish a portrait for that App ID.
+            UniLoader v0.9.10 improves safe installation and artwork recovery for current and future games.
 
-            Games such as RuneScape: Dragonwilds now retain real artwork in both the profile rail and
-            active-game banner instead of dropping to an initials placeholder. The fallback applies
-            automatically to current and future verified Steam profiles with incomplete artwork sets.
+            - Preserves provider artwork on new Nexus Mods and Thunderstore installs.
+            - Recovers artwork and provider identities for older locally imported mods during Refresh.
+            - Recognizes installed runtimes across provider requirement links without prompting for duplicates.
+            - Makes learned install routes safer and repairs invalid cached routes automatically.
+            - Hardens profile storage against overlapping reads and writes.
+            - Includes the latest profile, discovery, and responsive interface fixes.
           releaseDraft: false
           prerelease: false
 

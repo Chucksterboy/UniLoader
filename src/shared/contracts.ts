@@ -209,6 +209,7 @@ export interface InstalledModRecord {
   displayName?: string;
   packageId?: string;
   dependencyString?: string;
+  iconUrl?: string;
   adapterId: AdapterId;
   summary: string;
   installedAt: string;

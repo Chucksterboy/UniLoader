@@ -2681,7 +2681,8 @@ function ProfileCreatorDialog({
                   onClick={() => onSelectSteamGame(game.appId)}
                   type="button"
                 >
-                  <span>
+                  <SteamGameArtwork game={game} />
+                  <span className="steam-creator-game-copy">
                     <strong>{game.name}</strong>
                     <small title={game.installDir}>{game.installDir}</small>
                   </span>
@@ -2910,7 +2911,7 @@ function ProfileArtwork({ profile }: { profile: GameProfile }) {
             <b>{initials}</b>
           </span>
         }
-        profile={profile}
+        steamAppId={profile.steamAppId}
         variant="poster"
       />
     </span>
@@ -2923,7 +2924,7 @@ function GameHeroArtwork({ profile }: { profile?: GameProfile }) {
       {profile ? (
         <SteamArtworkImage
           fallback={<div className="vault-hero-fallback"><Gamepad2 size={54} /></div>}
-          profile={profile}
+          steamAppId={profile.steamAppId}
           variant="hero"
         />
       ) : (
@@ -2935,13 +2936,13 @@ function GameHeroArtwork({ profile }: { profile?: GameProfile }) {
 
 interface SteamArtworkImageProps {
   fallback: ReactNode;
-  profile: GameProfile;
+  steamAppId?: string;
   variant: "hero" | "poster";
 }
 
-function SteamArtworkImage({ fallback, profile, variant }: SteamArtworkImageProps) {
+function SteamArtworkImage({ fallback, steamAppId: rawSteamAppId, variant }: SteamArtworkImageProps) {
   const [imageSourceIndex, setImageSourceIndex] = useState(0);
-  const steamAppId = profile.steamAppId?.trim();
+  const steamAppId = rawSteamAppId?.trim();
   const imageUrls = steamArtworkUrls(steamAppId, variant);
   const imageUrl = imageUrls[imageSourceIndex];
 
@@ -2960,6 +2961,31 @@ function SteamArtworkImage({ fallback, profile, variant }: SteamArtworkImageProp
     />
   ) : (
     <>{fallback}</>
+  );
+}
+
+function SteamGameArtwork({ game }: { game: SteamGameRecord }) {
+  const initials =
+    game.name
+      .split(/\s+/)
+      .filter(Boolean)
+      .slice(0, 2)
+      .map((word) => word[0]?.toUpperCase())
+      .join("") || "G";
+
+  return (
+    <span className="steam-creator-game-artwork" aria-hidden="true">
+      <SteamArtworkImage
+        fallback={
+          <span className="steam-creator-game-fallback">
+            <Gamepad2 size={18} />
+            <b>{initials}</b>
+          </span>
+        }
+        steamAppId={game.appId}
+        variant="poster"
+      />
+    </span>
   );
 }
 
@@ -4327,28 +4353,38 @@ function getStoredModPresentation(
   mod: InstalledModRecord,
   presentations: StoredModPresentations
 ): StoredModPresentation {
+  const persistedIconUrl = mod.iconUrl?.trim() || undefined;
   const packageKey = mod.packageId?.trim().toLowerCase();
-  const stored = packageKey ? presentations[packageKey] : undefined;
-  if (stored) {
-    return stored;
-  }
-
-  const nameMatch = findStoredPresentationByName(mod, presentations);
-  if (nameMatch) {
-    return nameMatch;
-  }
 
   if (mod.runtimeId) {
     return {
+      iconUrl: persistedIconUrl,
       owner: runtimeDisplayOwner(mod.runtimeId),
       providerLabel: "System runtime",
       version: dependencyVersion(mod.dependencyString)
     };
   }
 
+  const stored = packageKey ? presentations[packageKey] : undefined;
+  if (stored) {
+    return {
+      ...stored,
+      iconUrl: persistedIconUrl ?? stored.iconUrl
+    };
+  }
+
+  const nameMatch = findStoredPresentationByName(mod, presentations);
+  if (nameMatch) {
+    return {
+      ...nameMatch,
+      iconUrl: persistedIconUrl ?? nameMatch.iconUrl
+    };
+  }
+
   if (packageKey?.startsWith("thunderstore:")) {
     const reference = packageKey.slice("thunderstore:".length);
     return {
+      iconUrl: persistedIconUrl,
       owner: humanizeModName(reference.split("/")[0] ?? "Thunderstore"),
       providerLabel: "Thunderstore",
       version: dependencyVersion(mod.dependencyString)
@@ -4357,12 +4393,14 @@ function getStoredModPresentation(
 
   if (packageKey?.startsWith("nexus:")) {
     return {
+      iconUrl: persistedIconUrl,
       providerLabel: "Nexus Mods",
       version: dependencyVersion(mod.dependencyString)
     };
   }
 
   return {
+    iconUrl: persistedIconUrl,
     providerLabel: adapterDisplayName(mod.adapterId),
     version: dependencyVersion(mod.dependencyString)
   };
