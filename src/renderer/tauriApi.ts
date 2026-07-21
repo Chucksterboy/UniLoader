@@ -43,6 +43,8 @@ export const desktopApi: DesktopApi = {
   closeWindow: () => getCurrentWindow().close(),
   downloadUpdateInstaller: (url: string, fileName?: string) =>
     invoke<string>("download_update_installer", { url, fileName }),
+  getCachedSteamArtwork: (steamAppId, variant) =>
+    invoke<string | null>("get_cached_steam_artwork", { steamAppId, variant }),
   scanSteamGames: () => invoke<SteamGameRecord[]>("scan_steam_games"),
   createSteamProfile: (game: SteamGameRecord) =>
     invoke<GameProfile>("create_steam_profile", { game }),

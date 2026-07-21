@@ -4724,6 +4724,18 @@ body {
   transition: transform 240ms ease, filter 240ms ease;
 }
 
+.steam-artwork-image {
+  opacity: 1;
+}
+
+.profile-artwork > .steam-artwork-image,
+.steam-creator-game-artwork > .steam-artwork-image,
+.vault-hero-artwork > .steam-artwork-image {
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+}
+
 .profile:hover .profile-artwork img,
 .profile.active .profile-artwork img {
   transform: scale(1.025);

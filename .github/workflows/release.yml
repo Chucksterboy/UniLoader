@@ -51,13 +51,12 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "UniLoader ${{ github.ref_name }}"
           releaseBody: |
-            UniLoader v0.9.12 keeps managed runtimes current and makes Nexus browser handoffs unobtrusive.
+            UniLoader v0.9.13 keeps game artwork available instantly while moving between Library and Discover.
 
-            - Refresh checks provider-backed runtimes for newer versions and installs verified updates automatically.
-            - Runtime updates preserve user configuration files and never downgrade semantic versions.
-            - Updates are postponed while the game is running or Mods OFF clean-launch mode is active.
-            - Runtime replacement is transactional, hash-verified, and restores the previous installation on failure.
-            - Nexus NXM downloads install in the background without forcing focus or emitting a synthetic Left Alt press.
+            - Profile posters and active-game banners are cached locally after their first successful load.
+            - Cached artwork is reused across tab changes and application restarts without repeated Steam requests.
+            - A rendering-state issue that could leave valid cached artwork invisible after navigation is fixed.
+            - Mod and discovery artwork remain network-backed and are not added to the persistent game-art cache.
           releaseDraft: false
           prerelease: false
 

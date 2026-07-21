@@ -86,6 +86,43 @@ const installSoundUrls = {
 } as const;
 const installSoundVolume = 0.72;
 
+type SteamArtworkVariant = "hero" | "poster";
+
+const gameArtworkSourceCache = new Map<string, string>();
+const gameArtworkRequestCache = new Map<string, Promise<string | null>>();
+
+function gameArtworkCacheKey(steamAppId: string, variant: SteamArtworkVariant): string {
+  return `${steamAppId}:${variant}`;
+}
+
+function loadCachedGameArtwork(
+  steamAppId: string,
+  variant: SteamArtworkVariant
+): Promise<string | null> {
+  const cacheKey = gameArtworkCacheKey(steamAppId, variant);
+  const rememberedSource = gameArtworkSourceCache.get(cacheKey);
+  if (rememberedSource) {
+    return Promise.resolve(rememberedSource);
+  }
+
+  const existingRequest = gameArtworkRequestCache.get(cacheKey);
+  if (existingRequest) {
+    return existingRequest;
+  }
+
+  const request = desktopApi
+    .getCachedSteamArtwork(steamAppId, variant)
+    .then((source) => {
+      if (source) {
+        gameArtworkSourceCache.set(cacheKey, source);
+      }
+      return source;
+    })
+    .finally(() => gameArtworkRequestCache.delete(cacheKey));
+  gameArtworkRequestCache.set(cacheKey, request);
+  return request;
+}
+
 type ViewMode = "manager" | "discover" | "transfer" | "settings";
 type ModSortMode = "newest" | "oldest";
 type OnlineSortMode = "downloads" | "newest" | "oldest";
@@ -1261,6 +1298,8 @@ export function App() {
     setStatus("Creating Steam profile");
     try {
       const profile = await api.createSteamProfile(game);
+      void loadCachedGameArtwork(game.appId, "poster").catch(() => undefined);
+      void loadCachedGameArtwork(game.appId, "hero").catch(() => undefined);
       setProfiles((current) => [...current, profile]);
       selectProfile(profile.id);
       setAnalysis(null);
@@ -3007,6 +3046,7 @@ function ProfileArtwork({ profile }: { profile: GameProfile }) {
   return (
     <span className="profile-artwork" aria-hidden="true">
       <SteamArtworkImage
+        cacheLocally
         fallback={
           <span className="profile-artwork-fallback">
             <Gamepad2 size={19} />
@@ -3025,7 +3065,9 @@ function GameHeroArtwork({ profile }: { profile?: GameProfile }) {
     <div className="vault-hero-artwork" aria-hidden="true">
       {profile ? (
         <SteamArtworkImage
+          cacheLocally
           fallback={<div className="vault-hero-fallback"><Gamepad2 size={54} /></div>}
+          key={`${profile.steamAppId ?? profile.id}:hero`}
           steamAppId={profile.steamAppId}
           variant="hero"
         />
@@ -3037,32 +3079,98 @@ function GameHeroArtwork({ profile }: { profile?: GameProfile }) {
 }
 
 interface SteamArtworkImageProps {
+  cacheLocally?: boolean;
   fallback: ReactNode;
   steamAppId?: string;
-  variant: "hero" | "poster";
+  variant: SteamArtworkVariant;
 }
 
-function SteamArtworkImage({ fallback, steamAppId: rawSteamAppId, variant }: SteamArtworkImageProps) {
+function SteamArtworkImage({
+  cacheLocally = false,
+  fallback,
+  steamAppId: rawSteamAppId,
+  variant
+}: SteamArtworkImageProps) {
   const [imageSourceIndex, setImageSourceIndex] = useState(0);
   const steamAppId = rawSteamAppId?.trim();
+  const cacheKey = steamAppId && cacheLocally
+    ? gameArtworkCacheKey(steamAppId, variant)
+    : undefined;
+  const rememberedSource = cacheKey ? gameArtworkSourceCache.get(cacheKey) : undefined;
+  const [cachedImageSource, setCachedImageSource] = useState<string | undefined>(rememberedSource);
+  const [cacheLookupComplete, setCacheLookupComplete] = useState(
+    !cacheKey || Boolean(rememberedSource)
+  );
   const imageUrls = steamArtworkUrls(steamAppId, variant);
-  const imageUrl = imageUrls[imageSourceIndex];
+  const imageUrl = cachedImageSource ?? (cacheLookupComplete ? imageUrls[imageSourceIndex] : undefined);
 
   useEffect(() => {
     setImageSourceIndex(0);
-  }, [steamAppId, variant]);
 
-  return imageUrl ? (
-    <img
-      alt=""
-      decoding="async"
-      draggable={false}
-      loading={variant === "poster" ? "lazy" : "eager"}
-      onError={() => setImageSourceIndex((current) => current + 1)}
-      src={imageUrl}
-    />
-  ) : (
-    <>{fallback}</>
+    if (!cacheKey || !steamAppId) {
+      setCachedImageSource(undefined);
+      setCacheLookupComplete(true);
+      return;
+    }
+
+    const remembered = gameArtworkSourceCache.get(cacheKey);
+    if (remembered) {
+      setCachedImageSource(remembered);
+      setCacheLookupComplete(true);
+      return;
+    }
+
+    let cancelled = false;
+    setCachedImageSource(undefined);
+    setCacheLookupComplete(false);
+    void loadCachedGameArtwork(steamAppId, variant)
+      .then((source) => {
+        if (!cancelled) {
+          setCachedImageSource(source ?? undefined);
+          setCacheLookupComplete(true);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setCacheLookupComplete(true);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [cacheKey, steamAppId, variant]);
+
+  return (
+    <>
+      {fallback}
+      {imageUrl ? (
+        <img
+          alt=""
+          className="steam-artwork-image"
+          decoding="async"
+          draggable={false}
+          loading={cacheLocally || variant === "hero" ? "eager" : "lazy"}
+          onError={() => {
+            if (cachedImageSource) {
+              if (cacheKey) {
+                gameArtworkSourceCache.delete(cacheKey);
+              }
+              setCachedImageSource(undefined);
+              setCacheLookupComplete(true);
+              return;
+            }
+            setImageSourceIndex((current) => current + 1);
+          }}
+          onLoad={() => {
+            if (cacheKey) {
+              gameArtworkSourceCache.set(cacheKey, imageUrl);
+            }
+          }}
+          src={imageUrl}
+        />
+      ) : null}
+    </>
   );
 }
 

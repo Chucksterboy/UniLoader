@@ -1,3 +1,5 @@
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use chrono::Utc;
 use reqwest::blocking::{Client, Response};
 use reqwest::StatusCode;
@@ -30,6 +32,7 @@ const MAX_CONFIG_READ_BYTES: u64 = 512 * 1024;
 const MAX_CONFIG_SCAN_DEPTH: usize = 5;
 const MAX_PROFILE_CONFIG_FILES: usize = 500;
 const MAX_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_STEAM_ARTWORK_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_DOWNLOAD_ATTEMPTS: usize = 3;
 const DOWNLOAD_RETRY_BASE_DELAY_MS: u64 = 350;
 const DOWNLOAD_RETRY_MAX_DELAY_SECS: u64 = 5;
@@ -1462,6 +1465,141 @@ async fn scan_steam_games() -> Result<Vec<SteamGameRecord>, String> {
     tauri::async_runtime::spawn_blocking(scan_steam_games_impl)
         .await
         .map_err(error_to_string)
+}
+
+#[tauri::command]
+async fn get_cached_steam_artwork(
+    app: AppHandle,
+    steam_app_id: String,
+    variant: String,
+) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = store_root(&app)?;
+        cached_steam_artwork_data_url(&root, &steam_app_id, &variant)
+    })
+    .await
+    .map_err(error_to_string)?
+}
+
+fn cached_steam_artwork_data_url(
+    store_root: &Path,
+    steam_app_id: &str,
+    variant: &str,
+) -> Result<Option<String>, String> {
+    let steam_app_id = steam_app_id.trim();
+    if steam_app_id.is_empty()
+        || !steam_app_id
+            .chars()
+            .all(|character| character.is_ascii_digit())
+    {
+        return Ok(None);
+    }
+    if !matches!(variant, "hero" | "poster") {
+        return Err("Unsupported Steam artwork variant.".to_string());
+    }
+
+    let cache_path = steam_artwork_cache_path(store_root, steam_app_id, variant);
+    if let Some(data_url) = read_cached_steam_artwork(&cache_path)? {
+        return Ok(Some(data_url));
+    }
+
+    let client = Client::builder()
+        .user_agent(format!("UniLoader/{}", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(error_to_string)?;
+
+    for source_url in steam_artwork_source_urls(steam_app_id, variant) {
+        let Ok(mut response) = client.get(&source_url).send() else {
+            continue;
+        };
+        if !response.status().is_success()
+            || response
+                .content_length()
+                .is_some_and(|size| size == 0 || size > MAX_STEAM_ARTWORK_BYTES)
+        {
+            continue;
+        }
+
+        let mut bytes = Vec::new();
+        if copy_with_limit(&mut response, &mut bytes, MAX_STEAM_ARTWORK_BYTES).is_err() {
+            continue;
+        }
+        let Some(mime_type) = steam_artwork_mime_type(&bytes) else {
+            continue;
+        };
+
+        atomic_write(&cache_path, &bytes).map_err(error_to_string)?;
+        return Ok(Some(steam_artwork_data_url(mime_type, &bytes)));
+    }
+
+    Ok(None)
+}
+
+fn steam_artwork_cache_path(store_root: &Path, steam_app_id: &str, variant: &str) -> PathBuf {
+    store_root
+        .join("cache")
+        .join("steam-artwork")
+        .join(steam_app_id)
+        .join(format!("{variant}.image"))
+}
+
+fn read_cached_steam_artwork(path: &Path) -> Result<Option<String>, String> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+
+    let bytes = fs::read(path).map_err(error_to_string)?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_STEAM_ARTWORK_BYTES {
+        let _ = fs::remove_file(path);
+        return Ok(None);
+    }
+    let Some(mime_type) = steam_artwork_mime_type(&bytes) else {
+        let _ = fs::remove_file(path);
+        return Ok(None);
+    };
+
+    Ok(Some(steam_artwork_data_url(mime_type, &bytes)))
+}
+
+fn steam_artwork_mime_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+fn steam_artwork_data_url(mime_type: &str, bytes: &[u8]) -> String {
+    format!("data:{mime_type};base64,{}", BASE64_STANDARD.encode(bytes))
+}
+
+fn steam_artwork_source_urls(steam_app_id: &str, variant: &str) -> Vec<String> {
+    let wide = [
+        format!("https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/{steam_app_id}/library_hero.jpg"),
+        format!("https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/{steam_app_id}/library_hero.jpg"),
+        format!("https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/{steam_app_id}/header.jpg"),
+        format!("https://cdn.cloudflare.steamstatic.com/steam/apps/{steam_app_id}/header.jpg"),
+    ];
+    if variant == "hero" {
+        return wide.into_iter().collect();
+    }
+
+    [
+        format!("https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/{steam_app_id}/library_600x900.jpg"),
+        format!("https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/{steam_app_id}/library_600x900.jpg"),
+        format!("https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/{steam_app_id}/library_600x900_2x.jpg"),
+        format!("https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/{steam_app_id}/library_600x900_2x.jpg"),
+        format!("https://cdn.cloudflare.steamstatic.com/steam/apps/{steam_app_id}/capsule_231x87.jpg"),
+    ]
+    .into_iter()
+    .chain(wide)
+    .collect()
 }
 
 #[tauri::command]
@@ -4944,6 +5082,7 @@ pub fn run() {
             get_app_settings,
             update_app_settings,
             save_nexus_api_key,
+            get_cached_steam_artwork,
             scan_steam_games,
             create_steam_profile,
             launch_profile_game,
@@ -18325,6 +18464,40 @@ mod tests {
         assert!(validate_downloaded_archive(&valid_rar, "rar").is_ok());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn steam_artwork_cache_accepts_images_and_discards_invalid_payloads() {
+        let root = temp_game_dir("steam-artwork-cache");
+        let poster_path = steam_artwork_cache_path(&root, "3041230", "poster");
+        fs::create_dir_all(poster_path.parent().unwrap()).unwrap();
+        fs::write(&poster_path, [0xff, 0xd8, 0xff, 0x00]).unwrap();
+
+        let data_url = read_cached_steam_artwork(&poster_path).unwrap().unwrap();
+        assert_eq!(data_url, "data:image/jpeg;base64,/9j/AA==");
+
+        fs::write(&poster_path, b"<html>not artwork</html>").unwrap();
+        assert!(read_cached_steam_artwork(&poster_path).unwrap().is_none());
+        assert!(!poster_path.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn steam_artwork_detection_supports_the_expected_web_formats() {
+        assert_eq!(
+            steam_artwork_mime_type(&[0xff, 0xd8, 0xff, 0x00]),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            steam_artwork_mime_type(b"\x89PNG\r\n\x1a\nrest"),
+            Some("image/png")
+        );
+        assert_eq!(
+            steam_artwork_mime_type(b"RIFF0000WEBPrest"),
+            Some("image/webp")
+        );
+        assert_eq!(steam_artwork_mime_type(b"not an image"), None);
     }
 
     fn assert_supported_import_deploys(

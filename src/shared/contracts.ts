@@ -428,6 +428,10 @@ export interface DesktopApi {
   toggleMaximizeWindow(): Promise<void>;
   closeWindow(): Promise<void>;
   downloadUpdateInstaller(url: string, fileName?: string): Promise<string>;
+  getCachedSteamArtwork(
+    steamAppId: string,
+    variant: "hero" | "poster"
+  ): Promise<string | null>;
   scanSteamGames(): Promise<SteamGameRecord[]>;
   createSteamProfile(game: SteamGameRecord): Promise<GameProfile>;
   launchProfileGame(profileId: string, modsEnabled: boolean): Promise<void>;
