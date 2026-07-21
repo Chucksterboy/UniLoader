@@ -24,7 +24,24 @@
     ],
     "detectionRules": [
       {
-        "all": ["file:BepInEx/core/BepInEx.dll"]
+        "any": [
+          "file:BepInEx/core/BepInEx.dll",
+          "file:BepInEx/core/BepInEx.Unity.Mono.dll"
+        ]
+      },
+      {
+        "all": [
+          "file-name:BepInEx.Unity.Mono.dll",
+          "file-name:doorstop_config.ini",
+          "file-name:winhttp.dll"
+        ]
+      },
+      {
+        "all": [
+          "file-name:BepInEx.dll",
+          "file-name:doorstop_config.ini",
+          "file-name:winhttp.dll"
+        ]
       },
       {
         "all": ["dir:BepInEx", "file-name:doorstop_config.ini", "file-name:winhttp.dll"]
@@ -55,6 +72,21 @@
       }
     ],
     "detectionRules": [
+      {
+        "all": [
+          "file-name:BepInEx.Unity.IL2CPP.dll",
+          "file-name:doorstop_config.ini",
+          "file-name:winhttp.dll"
+        ]
+      },
+      {
+        "all": [
+          "file-name:BepInEx.dll",
+          "file-name:doorstop_config.ini",
+          "file-name:winhttp.dll",
+          "profile-engine:unity-il2cpp"
+        ]
+      },
       {
         "all": ["file:BepInEx/core/BepInEx.dll", "dir-prefix:BepInEx/interop"]
       },

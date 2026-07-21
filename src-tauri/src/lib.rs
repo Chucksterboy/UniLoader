@@ -981,6 +981,15 @@ pub struct ModFileHealth {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RuntimeUpdateResult {
+    runtime_id: String,
+    name: String,
+    previous_version: Option<String>,
+    installed_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProfileRefreshResult {
     profile: GameProfile,
     detection: GameDetectionResult,
@@ -988,6 +997,10 @@ pub struct ProfileRefreshResult {
     mod_file_health: Vec<ModFileHealth>,
     missing_dependencies: Vec<DependencySpec>,
     adopted_native_script_mods: usize,
+    #[serde(default)]
+    runtime_updates: Vec<RuntimeUpdateResult>,
+    #[serde(default)]
+    runtime_update_notes: Vec<String>,
     warnings: Vec<String>,
 }
 
@@ -2147,7 +2160,27 @@ fn refresh_profile_sync(
     let runtime_inference = enrich_profile_with_provider_runtime(&mut profile);
     profile.updated_at = now_string();
 
-    let bootstrap_warnings = install_profile_bootstrap_dependencies(&root, &profile);
+    let launch_suspension = read_profile_launch_suspension(&root, &profile.id)?;
+    let mut bootstrap_warnings = Vec::new();
+    let mut runtime_refresh = RuntimeRefreshOutcome::default();
+    if !launch_suspension.mods.is_empty() {
+        runtime_refresh.notes.push(
+            "Runtime updates are postponed while Mods OFF clean-launch mode is active.".to_string(),
+        );
+    } else {
+        match game_process_running(Path::new(&profile.game_path)) {
+            Ok(true) => runtime_refresh.notes.push(
+                "Runtime updates are postponed until the game is closed.".to_string(),
+            ),
+            Ok(false) => {
+                bootstrap_warnings = install_profile_bootstrap_dependencies(&root, &profile);
+                runtime_refresh = refresh_profile_runtime_updates(&root, &profile);
+            }
+            Err(error) => runtime_refresh.warnings.push(format!(
+                "Runtime updates were skipped because UniLoader could not verify whether the game is running: {error}"
+            )),
+        }
+    }
     let route_outcome = ensure_profile_route_knowledge(&root, &profile, false);
     for route in &route_outcome.expected_routes {
         push_unique_route(&mut detection.expected_mod_folders, route);
@@ -2157,6 +2190,7 @@ fn refresh_profile_sync(
     }
     apply_profile_identity_to_detection(&profile, &mut detection, runtime_inference.as_ref());
     let mut setup_warnings = bootstrap_warnings.clone();
+    setup_warnings.extend(runtime_refresh.warnings.clone());
     setup_warnings.extend(route_outcome.warnings.clone());
     apply_profile_setup_outcome(&mut profile, setup_warnings);
     profiles.items[profile_index] = profile.clone();
@@ -2171,7 +2205,6 @@ fn refresh_profile_sync(
     ensure_visible_runtime_records(&root, &profile, &mut installed_store)?;
     let settings = read_app_settings(&root).ok();
     backfill_installed_mod_artwork(&root, &profile, settings.as_ref(), &mut installed_store);
-    let launch_suspension = read_profile_launch_suspension(&root, &profile.id)?;
     let mut mod_file_health = Vec::new();
     let mut missing_dependencies = Vec::new();
     let mut dependency_keys = HashSet::new();
@@ -2224,6 +2257,7 @@ fn refresh_profile_sync(
     let mut warnings =
         profile_refresh_warnings(&detection, &mod_file_health, &missing_dependencies);
     warnings.extend(bootstrap_warnings);
+    warnings.extend(runtime_refresh.warnings.clone());
     warnings.extend(route_outcome.warnings);
 
     Ok(ProfileRefreshResult {
@@ -2233,6 +2267,8 @@ fn refresh_profile_sync(
         mod_file_health,
         missing_dependencies,
         adopted_native_script_mods,
+        runtime_updates: runtime_refresh.updates,
+        runtime_update_notes: runtime_refresh.notes,
         warnings,
     })
 }
@@ -2270,6 +2306,32 @@ fn bootstrap_profile_dependencies_sync(
     let mut profile = get_profile(&root, &profile_id)?;
     ensure_verified_steam_profile(&profile)?;
     repair_profile_identity_from_steam_app_id(&root, &mut profile)?;
+    let launch_suspension = read_profile_launch_suspension(&root, &profile.id)?;
+    let mutation_block = if !launch_suspension.mods.is_empty() {
+        Some(
+            "Dependency installation is postponed while Mods OFF clean-launch mode is active."
+                .to_string(),
+        )
+    } else {
+        match game_process_running(Path::new(&profile.game_path)) {
+            Ok(true) => Some("Dependency installation is postponed until the game is closed.".to_string()),
+            Ok(false) => None,
+            Err(error) => Some(format!(
+                "Dependency installation was skipped because UniLoader could not verify whether the game is running: {error}"
+            )),
+        }
+    };
+    if let Some(message) = mutation_block {
+        return Ok(ProfileDependencyBootstrapResult {
+            profile_id,
+            installed_dependencies: Vec::new(),
+            skipped_dependencies: profile_bootstrap_dependencies(&profile)
+                .into_iter()
+                .map(|dependency| dependency.name)
+                .collect(),
+            warnings: vec![message],
+        });
+    }
     let mut visited_dependencies = HashSet::new();
     let mut installed_dependencies = Vec::new();
     let mut skipped_dependencies = Vec::new();
@@ -3036,6 +3098,581 @@ fn install_profile_bootstrap_dependencies(root: &Path, profile: &GameProfile) ->
     warnings
 }
 
+#[derive(Debug, Default)]
+struct RuntimeRefreshOutcome {
+    updates: Vec<RuntimeUpdateResult>,
+    notes: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeStaleCleanup {
+    transaction_root: Option<PathBuf>,
+    rollback_entries: Vec<DeploymentRollbackEntry>,
+    warnings: Vec<String>,
+}
+
+impl RuntimeStaleCleanup {
+    fn commit(self) {
+        if let Some(root) = self.transaction_root {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    fn rollback(&self) {
+        for entry in self.rollback_entries.iter().rev() {
+            if let Some(backup) = &entry.immediate_backup {
+                let _ = replace_file_from_path(backup, &entry.destination);
+            }
+        }
+        if let Some(root) = &self.transaction_root {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+}
+
+fn refresh_profile_runtime_updates(root: &Path, profile: &GameProfile) -> RuntimeRefreshOutcome {
+    let mut outcome = RuntimeRefreshOutcome::default();
+    let installed_mods_file = installed_mods_path(root);
+    let mut store = match read_store::<InstalledModRecord>(&installed_mods_file) {
+        Ok(store) => store,
+        Err(error) => {
+            outcome
+                .warnings
+                .push(format!("Could not inspect installed runtimes: {error}"));
+            return outcome;
+        }
+    };
+
+    match ensure_visible_runtime_records(root, profile, &mut store) {
+        Ok(changed) if changed > 0 => {
+            if let Err(error) = write_store(&installed_mods_file, &store) {
+                outcome.warnings.push(format!(
+                    "Could not save detected runtime records before checking for updates: {error}"
+                ));
+                return outcome;
+            }
+        }
+        Ok(_) => {}
+        Err(error) => {
+            outcome
+                .warnings
+                .push(format!("Could not prepare runtime update records: {error}"));
+            return outcome;
+        }
+    }
+
+    let mut seen_runtimes = HashSet::new();
+    for runtime in profile_runtime_ids(profile) {
+        let runtime_key = runtime.to_ascii_lowercase();
+        if !seen_runtimes.insert(runtime_key) || !runtime_installed(profile, &runtime) {
+            continue;
+        }
+
+        let Some(record) = store
+            .items
+            .iter()
+            .find(|record| {
+                record.profile_id == profile.id
+                    && record.enabled
+                    && record.last_status != "removed"
+                    && runtime_record_matches(record, &runtime)
+            })
+            .cloned()
+        else {
+            continue;
+        };
+        let dependency = known_runtime_dependency(profile, &runtime);
+        let release = match resolve_latest_runtime_release(&dependency) {
+            Ok(release) => release,
+            Err(error) => {
+                outcome.notes.push(format!(
+                    "Could not check {} for updates: {}",
+                    format_loader(&runtime),
+                    error
+                ));
+                continue;
+            }
+        };
+
+        if !runtime_update_required(record.package_version.as_deref(), &release.version) {
+            continue;
+        }
+
+        match update_runtime_release(root, profile, &runtime, &dependency, &record, &release) {
+            Ok((update, mut warnings)) => {
+                outcome.updates.push(update);
+                outcome.warnings.append(&mut warnings);
+                if let Ok(updated_store) = read_store::<InstalledModRecord>(&installed_mods_file) {
+                    store = updated_store;
+                }
+            }
+            Err(error) => outcome.warnings.push(format!(
+                "Could not update {} automatically; the previous runtime was restored: {}",
+                format_loader(&runtime),
+                error
+            )),
+        }
+    }
+
+    outcome
+}
+
+fn resolve_latest_runtime_release(
+    dependency: &DependencySpec,
+) -> Result<ReleaseDependencyRef, String> {
+    let capability = dependency_provider_definition(&dependency.provider).ok_or_else(|| {
+        format!(
+            "provider '{}' is not registered in this UniLoader build",
+            dependency.provider
+        )
+    })?;
+    match capability.resolver.as_str() {
+        "github-release" => resolve_github_release_dependency(dependency),
+        "bepinbuilds" => resolve_bepinbuilds_dependency(dependency),
+        "thunderstore" => {
+            let mut package_ref = parse_thunderstore_ref(dependency)?;
+            package_ref.version = None;
+            let package = fetch_thunderstore_package_version(&package_ref)?;
+            Ok(ReleaseDependencyRef {
+                source_key: thunderstore_package_id(&package_ref),
+                display_name: package.full_name,
+                download_url: package.download_url,
+                version: package.version_number,
+            })
+        }
+        resolver => Err(format!(
+            "provider '{}' uses unsupported update resolver '{}'",
+            capability.display_name, resolver
+        )),
+    }
+}
+
+fn runtime_update_required(installed: Option<&str>, latest: &str) -> bool {
+    let Some(installed) = installed.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+    let latest = latest.trim();
+    if installed
+        .trim_start_matches(['v', 'V'])
+        .eq_ignore_ascii_case(latest.trim_start_matches(['v', 'V']))
+    {
+        return false;
+    }
+
+    match (
+        Version::parse(installed.trim_start_matches(['v', 'V'])),
+        Version::parse(latest.trim_start_matches(['v', 'V'])),
+    ) {
+        (Ok(installed), Ok(latest)) => installed < latest,
+        _ => true,
+    }
+}
+
+fn update_runtime_release(
+    root: &Path,
+    profile: &GameProfile,
+    runtime: &str,
+    dependency: &DependencySpec,
+    record: &InstalledModRecord,
+    release: &ReleaseDependencyRef,
+) -> Result<(RuntimeUpdateResult, Vec<String>), String> {
+    let archive_path = download_release_archive(root, dependency, release)?;
+    update_runtime_from_archive(
+        root,
+        profile,
+        runtime,
+        dependency,
+        record,
+        release,
+        &archive_path,
+    )
+}
+
+fn update_runtime_from_archive(
+    root: &Path,
+    profile: &GameProfile,
+    runtime: &str,
+    dependency: &DependencySpec,
+    record: &InstalledModRecord,
+    release: &ReleaseDependencyRef,
+    archive_path: &Path,
+) -> Result<(RuntimeUpdateResult, Vec<String>), String> {
+    let scanned = scan_zip_archive(archive_path)?;
+    let analysis = analyze_scanned_archive(scanned, profile);
+    let mut plan = analysis.recommended_plan.ok_or_else(|| {
+        format!(
+            "the latest {} package does not contain a verified automatic install layout",
+            format_loader(runtime)
+        )
+    })?;
+    if plan.adapter_id == "loose-files" || plan.requires_confirmation {
+        return Err(format!(
+            "the latest {} package requires an unverified install layout",
+            format_loader(runtime)
+        ));
+    }
+    if runtime_supplied_by_plan(profile, &plan)
+        .as_deref()
+        .is_none_or(|provided| !provided.eq_ignore_ascii_case(runtime))
+    {
+        return Err(format!(
+            "the downloaded package did not verify as {}",
+            format_loader(runtime)
+        ));
+    }
+    plan.dependencies.retain(|item| {
+        runtime_id_for_dependency(profile, item)
+            .map(|required| !required.eq_ignore_ascii_case(runtime))
+            .unwrap_or(true)
+    });
+    let (plan, preserved_configs) = runtime_update_plan_preserving_configs(root, profile, plan)?;
+    if plan.mappings.is_empty() {
+        return Err("the runtime update did not contain any replaceable files".to_string());
+    }
+
+    let checkpoint =
+        read_store::<InstalledModRecord>(&installed_mods_path(root)).map_err(error_to_string)?;
+    let mut visited_dependencies = HashSet::new();
+    if let Err(error) =
+        install_dependencies_for_plan(root, profile, &plan, &mut visited_dependencies, 0)
+    {
+        let _ = rollback_install_graph(root, profile, &checkpoint);
+        return Err(error);
+    }
+
+    let managed_source =
+        match materialize_runtime_update_source(root, profile, record, archive_path) {
+            Ok(path) => path,
+            Err(error) => {
+                let _ = rollback_install_graph(root, profile, &checkpoint);
+                return Err(format!("could not stage the runtime update: {error}"));
+            }
+        };
+    let deployment = match deploy_plan_transaction(
+        root,
+        profile,
+        &record.id,
+        &managed_source,
+        &plan,
+        Some(&record.id),
+    ) {
+        Ok(deployment) => deployment,
+        Err(error) => {
+            cleanup_runtime_update_source(&managed_source);
+            let _ = rollback_install_graph(root, profile, &checkpoint);
+            return Err(error);
+        }
+    };
+    let stale_cleanup = match cleanup_stale_runtime_files(root, profile, record, &deployment) {
+        Ok(cleanup) => cleanup,
+        Err(error) => {
+            deployment.rollback();
+            cleanup_runtime_update_source(&managed_source);
+            let _ = rollback_install_graph(root, profile, &checkpoint);
+            return Err(error);
+        }
+    };
+
+    let finalize = (|| -> Result<InstalledModRecord, String> {
+        verify_runtime_update_deployment(profile, runtime, &deployment)?;
+        let installed_mods_file = installed_mods_path(root);
+        let mut store =
+            read_store::<InstalledModRecord>(&installed_mods_file).map_err(error_to_string)?;
+        let index = store
+            .items
+            .iter()
+            .position(|item| item.id == record.id && item.profile_id == profile.id)
+            .ok_or_else(|| {
+                "the installed runtime record disappeared during the update".to_string()
+            })?;
+        let previous_record = store.items[index].clone();
+        let mut config_files = previous_record.config_files.clone();
+        let mut seen_configs = config_files
+            .iter()
+            .map(|path| normalize_filesystem_identity(path))
+            .collect::<HashSet<_>>();
+        for path in preserved_configs.iter().map(PathBuf::from).chain(
+            config_files_from_paths(&deployment.files_written)
+                .into_iter()
+                .map(PathBuf::from),
+        ) {
+            push_unique_config_path(&mut config_files, &mut seen_configs, &path);
+        }
+        let dependencies = plan
+            .dependencies
+            .iter()
+            .map(|item| refresh_dependency_status(root, profile, item))
+            .collect::<Vec<_>>();
+        let updated_record = InstalledModRecord {
+            id: previous_record.id.clone(),
+            profile_id: profile.id.clone(),
+            archive_path: managed_source.to_string_lossy().to_string(),
+            archive_name: release.display_name.clone(),
+            display_name: Some(format_loader(runtime).to_string()),
+            package_id: Some(release.source_key.clone()),
+            dependency_string: Some(format!("{}@{}", release.source_key, release.version)),
+            package_provider: Some(dependency.provider.clone()),
+            package_version: Some(release.version.clone()),
+            source_archive_sha256: Some(sha256_file(&managed_source)?),
+            icon_url: previous_record.icon_url.clone(),
+            adapter_id: plan.adapter_id.clone(),
+            summary: format!(
+                "System runtime required by {} mods.",
+                profile_game_label(profile)
+            ),
+            installed_at: now_string(),
+            files_written: deployment.files_written.clone(),
+            backups_written: deployment.backups_written.clone(),
+            written_file_hashes: deployment.written_file_hashes.clone(),
+            dependencies,
+            config_files,
+            runtime_id: Some(runtime.to_string()),
+            externally_managed: false,
+            enabled: true,
+            last_status: "installed".to_string(),
+            plan: Some(plan.clone()),
+        };
+
+        write_receipt(root, profile, &updated_record)
+            .map_err(|error| format!("could not save the updated runtime receipt: {error}"))?;
+        store.items[index] = updated_record.clone();
+        if let Err(error) = write_store(&installed_mods_file, &store) {
+            let _ = write_receipt(root, profile, &previous_record);
+            return Err(format!(
+                "could not save the updated runtime record: {error}"
+            ));
+        }
+        Ok(updated_record)
+    })();
+
+    match finalize {
+        Ok(updated_record) => {
+            let warnings = stale_cleanup.warnings.clone();
+            stale_cleanup.commit();
+            deployment.commit();
+            remove_replaced_runtime_source(root, profile, record, &updated_record);
+            Ok((
+                RuntimeUpdateResult {
+                    runtime_id: runtime.to_string(),
+                    name: format_loader(runtime).to_string(),
+                    previous_version: record.package_version.clone(),
+                    installed_version: release.version.clone(),
+                },
+                warnings,
+            ))
+        }
+        Err(error) => {
+            stale_cleanup.rollback();
+            deployment.rollback();
+            cleanup_runtime_update_source(&managed_source);
+            let rollback_error = rollback_install_graph(root, profile, &checkpoint).err();
+            if let Some(rollback_error) = rollback_error {
+                Err(format!(
+                    "{error} The dependency rollback also reported: {rollback_error}"
+                ))
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn runtime_update_plan_preserving_configs(
+    root: &Path,
+    profile: &GameProfile,
+    mut plan: InstallPlan,
+) -> Result<(InstallPlan, Vec<String>), String> {
+    let game_root = Path::new(&profile.game_path);
+    let profile_root = profile_dir(root, &profile.id);
+    let mut preserved = Vec::new();
+    plan.mappings.retain(|mapping| {
+        let target_root = if mapping.target_root.eq_ignore_ascii_case("game") {
+            game_root
+        } else {
+            profile_root.as_path()
+        };
+        let Ok(destination) = safe_join(target_root, &mapping.target_relative_path) else {
+            return true;
+        };
+        if destination.is_file() && is_user_editable_config_file(&destination) {
+            preserved.push(destination.to_string_lossy().to_string());
+            false
+        } else {
+            true
+        }
+    });
+    for mapping in &plan.mappings {
+        let target_root = if mapping.target_root.eq_ignore_ascii_case("game") {
+            game_root
+        } else {
+            profile_root.as_path()
+        };
+        let destination = safe_join(target_root, &mapping.target_relative_path)?;
+        validate_deployment_containment(target_root, &destination)?;
+    }
+    Ok((plan, preserved))
+}
+
+fn materialize_runtime_update_source(
+    root: &Path,
+    profile: &GameProfile,
+    record: &InstalledModRecord,
+    source: &Path,
+) -> Result<PathBuf, String> {
+    if !source.is_file() {
+        return Err("runtime updates must be supplied as a verified archive".to_string());
+    }
+    let package_root = profile_package_dir(root, &profile.id, &record.id);
+    fs::create_dir_all(&package_root).map_err(error_to_string)?;
+    let file_name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(sanitize_file_segment)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "runtime.zip".to_string());
+    let destination = package_root.join(format!("runtime-update-{}-{}", Uuid::new_v4(), file_name));
+    fs::copy(source, &destination).map_err(error_to_string)?;
+    Ok(destination)
+}
+
+fn cleanup_runtime_update_source(path: &Path) {
+    if path.is_dir() {
+        let _ = fs::remove_dir_all(path);
+    } else {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn remove_replaced_runtime_source(
+    root: &Path,
+    profile: &GameProfile,
+    previous: &InstalledModRecord,
+    updated: &InstalledModRecord,
+) {
+    if previous.externally_managed || previous.archive_path == updated.archive_path {
+        return;
+    }
+    let previous_path = Path::new(&previous.archive_path);
+    let package_root = profile_package_dir(root, &profile.id, &previous.id);
+    if validate_deployment_containment(&package_root, previous_path).is_ok() {
+        cleanup_runtime_update_source(previous_path);
+    }
+}
+
+fn cleanup_stale_runtime_files(
+    root: &Path,
+    profile: &GameProfile,
+    previous: &InstalledModRecord,
+    deployment: &DeploymentOutcome,
+) -> Result<RuntimeStaleCleanup, String> {
+    if previous.externally_managed {
+        return Ok(RuntimeStaleCleanup::default());
+    }
+    let current_paths = deployment
+        .files_written
+        .iter()
+        .map(|path| normalize_filesystem_identity(path))
+        .collect::<HashSet<_>>();
+    let game_root = Path::new(&profile.game_path);
+    let transaction_root = profile_dir(root, &profile.id)
+        .join("transactions")
+        .join(format!("runtime-stale-{}", Uuid::new_v4()));
+    let rollback_root = transaction_root.join("rollback");
+    let backup_root = profile_backup_dir(root, &profile.id, &previous.id);
+    let mut cleanup = RuntimeStaleCleanup::default();
+
+    for stale in &previous.files_written {
+        if current_paths.contains(&normalize_filesystem_identity(stale)) {
+            continue;
+        }
+        let destination = PathBuf::from(stale);
+        if !destination.is_file() || is_user_editable_config_file(&destination) {
+            continue;
+        }
+        let Ok(relative) = destination.strip_prefix(game_root) else {
+            cleanup.warnings.push(format!(
+                "UniLoader left an obsolete runtime file outside the game folder untouched: {}",
+                destination.to_string_lossy()
+            ));
+            continue;
+        };
+        validate_managed_record_path(root, profile, &destination)?;
+        let Some(expected_hash) = previous.written_file_hashes.get(stale) else {
+            cleanup.warnings.push(format!(
+                "UniLoader left modified or unverified obsolete runtime file {} untouched.",
+                destination.to_string_lossy()
+            ));
+            continue;
+        };
+        if sha256_file(&destination)? != *expected_hash {
+            cleanup.warnings.push(format!(
+                "UniLoader left user-modified obsolete runtime file {} untouched.",
+                destination.to_string_lossy()
+            ));
+            continue;
+        }
+
+        if cleanup.transaction_root.is_none() {
+            fs::create_dir_all(&rollback_root).map_err(error_to_string)?;
+            cleanup.transaction_root = Some(transaction_root.clone());
+        }
+        let immediate_backup =
+            rollback_root.join(format!("{}.bin", cleanup.rollback_entries.len()));
+        fs::copy(&destination, &immediate_backup).map_err(error_to_string)?;
+        cleanup.rollback_entries.push(DeploymentRollbackEntry {
+            destination: destination.clone(),
+            immediate_backup: Some(immediate_backup),
+        });
+
+        let original_backup = safe_join(&backup_root, &to_portable_path(relative))?;
+        let change_result = if original_backup.is_file() {
+            replace_file_from_path(&original_backup, &destination)
+        } else {
+            fs::remove_file(&destination).map_err(error_to_string)
+        };
+        if let Err(error) = change_result {
+            cleanup.rollback();
+            return Err(format!(
+                "could not retire obsolete runtime file {}: {}",
+                destination.to_string_lossy(),
+                error
+            ));
+        }
+    }
+
+    Ok(cleanup)
+}
+
+fn verify_runtime_update_deployment(
+    profile: &GameProfile,
+    runtime: &str,
+    deployment: &DeploymentOutcome,
+) -> Result<(), String> {
+    for (path, expected_hash) in &deployment.written_file_hashes {
+        let path = Path::new(path);
+        if !path.is_file() {
+            return Err(format!(
+                "updated runtime file was not written: {}",
+                path.to_string_lossy()
+            ));
+        }
+        if sha256_file(path)? != *expected_hash {
+            return Err(format!(
+                "updated runtime file failed its integrity check: {}",
+                path.to_string_lossy()
+            ));
+        }
+    }
+    if !runtime_installed(profile, runtime) {
+        return Err(format!(
+            "{} was not detected after deployment",
+            format_loader(runtime)
+        ));
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 fn read_bundle_manifest(zip: &mut ZipArchive<File>) -> Result<ProfileBundleManifest, String> {
     let manifest_file = zip
@@ -3642,7 +4279,6 @@ async fn install_nexus_nxm_link(
     app: AppHandle,
     nxm_url: String,
 ) -> Result<NexusNxmInstallResult, String> {
-    reveal_main_window(&app);
     let install_app = app.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         let _operation = lock_mutations()?;
@@ -3697,7 +4333,6 @@ async fn install_nexus_nxm_link(
     })
     .await
     .map_err(error_to_string)?;
-    reveal_main_window(&app);
     result
 }
 
@@ -4254,8 +4889,10 @@ pub fn run() {
 
     #[cfg(windows)]
     {
-        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            reveal_main_window(app);
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if !contains_nxm_handoff_argument(&args) {
+                reveal_main_window(app);
+            }
         }));
     }
 
@@ -4355,6 +4992,16 @@ fn reveal_main_window(app: &AppHandle) {
         let _ = window.unminimize();
         let _ = window.set_focus();
     }
+}
+
+fn contains_nxm_handoff_argument(args: &[String]) -> bool {
+    args.iter().any(|argument| {
+        argument
+            .trim()
+            .trim_matches(['"', '\''])
+            .to_ascii_lowercase()
+            .starts_with("nxm://")
+    })
 }
 
 #[cfg(windows)]
@@ -5132,8 +5779,16 @@ fn score_loaders(
         }
 
         if !entry.is_directory
-            && (lower_path == "bepinex/core/bepinex.dll"
-                || lower_path.ends_with("/bepinex/core/bepinex.dll"))
+            && [
+                "bepinex/core/bepinex.dll",
+                "bepinex/core/bepinex.core.dll",
+                "bepinex/core/bepinex.unity.mono.dll",
+                "bepinex/core/bepinex.unity.il2cpp.dll",
+            ]
+            .iter()
+            .any(|signature| {
+                lower_path == *signature || lower_path.ends_with(&format!("/{signature}"))
+            })
         {
             add_score(
                 scores,
@@ -14665,7 +15320,14 @@ fn runtime_signature_file_matches(runtime: &str, path: &str) -> bool {
     let normalized = normalize_archive_path(path).to_lowercase();
     let name = basename(&normalized).to_lowercase();
     match runtime {
-        "bepinex" | "bepinex-il2cpp" => normalized.ends_with("bepinex/core/bepinex.dll"),
+        "bepinex" => {
+            normalized.ends_with("bepinex/core/bepinex.dll")
+                || normalized.ends_with("bepinex/core/bepinex.unity.mono.dll")
+        }
+        "bepinex-il2cpp" => {
+            normalized.ends_with("bepinex/core/bepinex.dll")
+                || normalized.ends_with("bepinex/core/bepinex.unity.il2cpp.dll")
+        }
         "ue4ss" => matches!(name.as_str(), "ue4ss.dll" | "ue4ss-settings.ini"),
         "reframework" => matches!(name.as_str(), "dinput8.dll" | "reframework_revision.txt"),
         _ => false,
@@ -19003,6 +19665,75 @@ mod tests {
     }
 
     #[test]
+    fn modern_bepinex_six_layouts_are_detected_and_verified() {
+        let mono_root = temp_game_dir("modern-bepinex-six-mono");
+        touch(&mono_root, "GameWrapper/Project/UnityPlayer.dll");
+        touch(
+            &mono_root,
+            "GameWrapper/Project/Project_Data/Managed/Assembly-CSharp.dll",
+        );
+        touch(
+            &mono_root,
+            "GameWrapper/Project/BepInEx/core/BepInEx.Core.dll",
+        );
+        touch(
+            &mono_root,
+            "GameWrapper/Project/BepInEx/core/BepInEx.Unity.Mono.dll",
+        );
+        touch(&mono_root, "GameWrapper/Project/doorstop_config.ini");
+        touch(&mono_root, "GameWrapper/Project/winhttp.dll");
+
+        let mono_detection = detect_game_setup_impl(&mono_root).unwrap();
+        assert_eq!(mono_detection.engine, "unity-mono");
+        assert_eq!(mono_detection.loader, "bepinex");
+        assert!(mono_detection.loader_installed);
+        let mut mono_profile = test_profile("modern-mono", "Modern Mono", "unity-mono", "bepinex");
+        mono_profile.game_path = mono_root.to_string_lossy().to_string();
+        assert!(runtime_installed(&mono_profile, "bepinex"));
+
+        let il2cpp_root = temp_game_dir("modern-bepinex-six-il2cpp");
+        touch(&il2cpp_root, "GameWrapper/Project/UnityPlayer.dll");
+        touch(&il2cpp_root, "GameWrapper/Project/GameAssembly.dll");
+        touch(
+            &il2cpp_root,
+            "GameWrapper/Project/Project_Data/il2cpp_data/Metadata/global-metadata.dat",
+        );
+        touch(
+            &il2cpp_root,
+            "GameWrapper/Project/BepInEx/core/BepInEx.Core.dll",
+        );
+        touch(
+            &il2cpp_root,
+            "GameWrapper/Project/BepInEx/core/BepInEx.Unity.IL2CPP.dll",
+        );
+        touch(&il2cpp_root, "GameWrapper/Project/doorstop_config.ini");
+        touch(&il2cpp_root, "GameWrapper/Project/winhttp.dll");
+
+        let il2cpp_detection = detect_game_setup_impl(&il2cpp_root).unwrap();
+        assert_eq!(il2cpp_detection.engine, "unity-il2cpp");
+        assert_eq!(il2cpp_detection.loader, "bepinex-il2cpp");
+        assert!(il2cpp_detection.loader_installed);
+        let mut il2cpp_profile = test_profile(
+            "modern-il2cpp",
+            "Modern IL2CPP",
+            "unity-il2cpp",
+            "bepinex-il2cpp",
+        );
+        il2cpp_profile.game_path = il2cpp_root.to_string_lossy().to_string();
+        assert!(runtime_installed(&il2cpp_profile, "bepinex-il2cpp"));
+        assert!(
+            detected_runtime_signature_files(&il2cpp_profile, "bepinex-il2cpp")
+                .iter()
+                .any(|path| path
+                    .to_ascii_lowercase()
+                    .ends_with("bepinex.unity.il2cpp.dll"))
+        );
+
+        let _ = fs::remove_dir_all(mono_root);
+        let _ = fs::remove_dir_all(il2cpp_root);
+    }
+
+    #[test]
     fn nested_re_engine_and_reframework_layout_is_detected() {
         let root = temp_game_dir("nested-re-engine");
         touch(&root, "GameWrapper/Project/re_chunk_000.pak");
@@ -20859,6 +21590,234 @@ mod tests {
             vec!["Installed dependency Runtime 1.0.0.".to_string()],
         );
         assert_eq!(profile.setup_status, "ready");
+    }
+
+    #[test]
+    fn nxm_handoffs_do_not_raise_the_existing_window() {
+        assert!(contains_nxm_handoff_argument(&[
+            "uniloader.exe".to_string(),
+            "nxm://valheim/mods/1/files/2?key=test".to_string(),
+        ]));
+        assert!(contains_nxm_handoff_argument(&[
+            "uniloader.exe".to_string(),
+            "\"NXM://windrose/mods/3/files/4?key=test\"".to_string(),
+        ]));
+        assert!(!contains_nxm_handoff_argument(&[
+            "uniloader.exe".to_string(),
+            "--show".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn runtime_update_version_checks_do_not_downgrade() {
+        assert!(!runtime_update_required(Some("v1.2.3"), "1.2.3"));
+        assert!(!runtime_update_required(Some("2.0.0"), "v1.9.9"));
+        assert!(runtime_update_required(Some("1.2.3"), "v1.3.0"));
+        assert!(runtime_update_required(None, "1.0.0"));
+        assert!(!runtime_update_required(Some("nightly-42"), "nightly-42"));
+        assert!(runtime_update_required(Some("nightly-41"), "nightly-42"));
+    }
+
+    #[test]
+    fn runtime_update_preserves_configs_and_retires_verified_old_files() {
+        let root = temp_game_dir("runtime-update-success");
+        let fixture = managed_bepinex_fixture(&root);
+        let archive = root.join("downloads/BepInEx-2.0.0.zip");
+        write_bepinex_update_archive(&archive);
+        let dependency = known_runtime_dependency(&fixture.profile, "bepinex");
+        let release = test_runtime_release("2.0.0");
+
+        let (update, warnings) = update_runtime_from_archive(
+            &root,
+            &fixture.profile,
+            "bepinex",
+            &dependency,
+            &fixture.record,
+            &release,
+            &archive,
+        )
+        .unwrap();
+
+        assert_eq!(update.previous_version.as_deref(), Some("1.0.0"));
+        assert_eq!(update.installed_version, "2.0.0");
+        assert!(warnings.is_empty());
+        assert_eq!(fs::read(&fixture.runtime_dll).unwrap(), b"new runtime");
+        assert_eq!(fs::read(&fixture.config).unwrap(), b"user setting = true");
+        assert!(!fixture.obsolete.is_file());
+        let store = read_store::<InstalledModRecord>(&installed_mods_path(&root)).unwrap();
+        let updated = store
+            .items
+            .iter()
+            .find(|record| record.id == fixture.record.id)
+            .unwrap();
+        assert_eq!(updated.package_version.as_deref(), Some("2.0.0"));
+        assert!(updated
+            .config_files
+            .contains(&fixture.config.to_string_lossy().to_string()));
+        assert!(!Path::new(&fixture.record.archive_path).exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_update_rolls_back_when_receipt_persistence_fails() {
+        let root = temp_game_dir("runtime-update-rollback");
+        let fixture = managed_bepinex_fixture(&root);
+        fs::write(
+            profile_dir(&root, &fixture.profile.id).join("receipts"),
+            b"blocked",
+        )
+        .unwrap();
+        let archive = root.join("downloads/BepInEx-2.0.0.zip");
+        write_bepinex_update_archive(&archive);
+        let dependency = known_runtime_dependency(&fixture.profile, "bepinex");
+        let release = test_runtime_release("2.0.0");
+
+        let error = update_runtime_from_archive(
+            &root,
+            &fixture.profile,
+            "bepinex",
+            &dependency,
+            &fixture.record,
+            &release,
+            &archive,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("receipt"));
+        assert_eq!(fs::read(&fixture.runtime_dll).unwrap(), b"old runtime");
+        assert_eq!(fs::read(&fixture.config).unwrap(), b"user setting = true");
+        assert_eq!(fs::read(&fixture.obsolete).unwrap(), b"obsolete runtime");
+        assert!(!fixture.game_root.join("doorstop_config.ini").exists());
+        let store = read_store::<InstalledModRecord>(&installed_mods_path(&root)).unwrap();
+        let restored = store
+            .items
+            .iter()
+            .find(|record| record.id == fixture.record.id)
+            .unwrap();
+        assert_eq!(restored.package_version.as_deref(), Some("1.0.0"));
+        assert!(Path::new(&fixture.record.archive_path).is_file());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    struct ManagedRuntimeFixture {
+        profile: GameProfile,
+        record: InstalledModRecord,
+        game_root: PathBuf,
+        runtime_dll: PathBuf,
+        config: PathBuf,
+        obsolete: PathBuf,
+    }
+
+    fn managed_bepinex_fixture(root: &Path) -> ManagedRuntimeFixture {
+        let game_root = root.join("game");
+        let runtime_dll = game_root.join("BepInEx/core/BepInEx.dll");
+        let config = game_root.join("BepInEx/config/BepInEx.cfg");
+        let obsolete = game_root.join("BepInEx/core/OldRuntime.dll");
+        let bootstrap = game_root.join("winhttp.dll");
+        for path in [&runtime_dll, &config, &obsolete, &bootstrap] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        fs::write(&runtime_dll, b"old runtime").unwrap();
+        fs::write(&config, b"user setting = true").unwrap();
+        fs::write(&obsolete, b"obsolete runtime").unwrap();
+        fs::write(&bootstrap, b"old bootstrap").unwrap();
+
+        let mut profile = test_profile("runtime-test", "Runtime Test", "unity-mono", "bepinex");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        let record_id = "runtime-bepinex".to_string();
+        let old_source =
+            profile_package_dir(root, &profile.id, &record_id).join("BepInEx-1.0.0.zip");
+        fs::create_dir_all(old_source.parent().unwrap()).unwrap();
+        fs::write(&old_source, b"old archive").unwrap();
+
+        let files_written = [&runtime_dll, &config, &obsolete, &bootstrap]
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        let written_file_hashes = files_written
+            .iter()
+            .map(|path| (path.clone(), sha256_file(Path::new(path)).unwrap()))
+            .collect::<HashMap<_, _>>();
+        let old_plan = InstallPlan {
+            adapter_id: "bepinex".to_string(),
+            adapter_name: "BepInEx / Thunderstore".to_string(),
+            confidence: 1.0,
+            summary: "Managed test runtime".to_string(),
+            mappings: Vec::new(),
+            dependencies: Vec::new(),
+            warnings: Vec::new(),
+            requires_confirmation: false,
+        };
+        let record = InstalledModRecord {
+            id: record_id,
+            profile_id: profile.id.clone(),
+            archive_path: old_source.to_string_lossy().to_string(),
+            archive_name: "BepInEx-1.0.0.zip".to_string(),
+            display_name: Some("BepInEx".to_string()),
+            package_id: Some("github:BepInEx/BepInEx".to_string()),
+            dependency_string: Some("github:BepInEx/BepInEx@1.0.0".to_string()),
+            package_provider: Some("github-release".to_string()),
+            package_version: Some("1.0.0".to_string()),
+            source_archive_sha256: Some(sha256_file(&old_source).unwrap()),
+            icon_url: None,
+            adapter_id: "bepinex".to_string(),
+            summary: "Managed test runtime".to_string(),
+            installed_at: now_string(),
+            files_written,
+            backups_written: Vec::new(),
+            written_file_hashes,
+            dependencies: Vec::new(),
+            config_files: vec![config.to_string_lossy().to_string()],
+            runtime_id: Some("bepinex".to_string()),
+            externally_managed: false,
+            enabled: true,
+            last_status: "installed".to_string(),
+            plan: Some(old_plan),
+        };
+        write_store(
+            &installed_mods_path(root),
+            &StoreFile {
+                version: 1,
+                items: vec![record.clone()],
+            },
+        )
+        .unwrap();
+
+        ManagedRuntimeFixture {
+            profile,
+            record,
+            game_root,
+            runtime_dll,
+            config,
+            obsolete,
+        }
+    }
+
+    fn write_bepinex_update_archive(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let output = File::create(path).unwrap();
+        let mut zip = ZipWriter::new(output);
+        add_bytes_to_zip(&mut zip, "BepInEx/core/BepInEx.dll", b"new runtime").unwrap();
+        add_bytes_to_zip(
+            &mut zip,
+            "BepInEx/config/BepInEx.cfg",
+            b"provider default = false",
+        )
+        .unwrap();
+        add_bytes_to_zip(&mut zip, "winhttp.dll", b"new bootstrap").unwrap();
+        add_bytes_to_zip(&mut zip, "doorstop_config.ini", b"enabled=true").unwrap();
+        zip.finish().unwrap();
+    }
+
+    fn test_runtime_release(version: &str) -> ReleaseDependencyRef {
+        ReleaseDependencyRef {
+            source_key: "github:BepInEx/BepInEx".to_string(),
+            display_name: format!("BepInEx {version}"),
+            download_url: "https://example.invalid/BepInEx.zip".to_string(),
+            version: version.to_string(),
+        }
     }
 
     fn test_profile(game_id: &str, name: &str, engine: &str, loader: &str) -> GameProfile {

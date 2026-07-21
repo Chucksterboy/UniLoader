@@ -51,14 +51,13 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "UniLoader ${{ github.ref_name }}"
           releaseBody: |
-            UniLoader v0.9.11 strengthens cross-game installation safety and clean-game launching.
+            UniLoader v0.9.12 keeps managed runtimes current and makes Nexus browser handoffs unobtrusive.
 
-            - Adds an extensible, validated runtime and dependency-provider registry.
-            - Uses stronger route evidence, canonical deployment containment, and archive hashes.
-            - Improves dependency identity, version selection, conflict handling, and profile setup status.
-            - Makes Mods OFF immediately restore the pre-UniLoader game state, including managed runtimes.
-            - Cleans all UniLoader-owned mods, dependencies, and runtimes when a profile is removed.
-            - Preserves components and original files that existed before UniLoader.
+            - Refresh checks provider-backed runtimes for newer versions and installs verified updates automatically.
+            - Runtime updates preserve user configuration files and never downgrade semantic versions.
+            - Updates are postponed while the game is running or Mods OFF clean-launch mode is active.
+            - Runtime replacement is transactional, hash-verified, and restores the previous installation on failure.
+            - Nexus NXM downloads install in the background without forcing focus or emitting a synthetic Left Alt press.
           releaseDraft: false
           prerelease: false
 

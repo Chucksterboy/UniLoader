@@ -371,6 +371,13 @@ export interface ModFileHealth {
   suspendedFiles: string[];
 }
 
+export interface RuntimeUpdateResult {
+  runtimeId: string;
+  name: string;
+  previousVersion?: string;
+  installedVersion: string;
+}
+
 export interface ProfileRefreshResult {
   profile: GameProfile;
   detection: GameDetectionResult;
@@ -378,6 +385,8 @@ export interface ProfileRefreshResult {
   modFileHealth: ModFileHealth[];
   missingDependencies: DependencySpec[];
   adoptedNativeScriptMods: number;
+  runtimeUpdates?: RuntimeUpdateResult[];
+  runtimeUpdateNotes?: string[];
   warnings: string[];
 }
 

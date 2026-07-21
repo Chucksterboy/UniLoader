@@ -995,6 +995,7 @@ export function App() {
       setAnalysis(null);
       const hasWarnings = result.warnings.length > 0 || repairWarnings.length > 0;
       const wasRepaired = repairDetail.length > 0 && result.missingDependencies.length === 0;
+      const updatedRuntime = (result.runtimeUpdates?.length ?? 0) > 0;
       setStatus(hasWarnings ? "Needs attention" : "Ready");
       setNotice({
         kind: hasWarnings ? "warning" : "success",
@@ -1002,7 +1003,9 @@ export function App() {
           ? "Refresh found issues"
           : wasRepaired
             ? "Dependencies repaired"
-            : "Profile refreshed",
+            : updatedRuntime
+              ? "Runtime updated"
+              : "Profile refreshed",
         detail: [refreshSummary(result), repairDetail, repairWarnings[0]]
           .filter(Boolean)
           .join(" ")
@@ -4346,6 +4349,16 @@ function refreshSummary(result: ProfileRefreshResult): string {
       }.`
     );
   }
+
+  for (const update of result.runtimeUpdates ?? []) {
+    parts.push(
+      update.previousVersion
+        ? `Updated ${update.name} from ${update.previousVersion} to ${update.installedVersion}.`
+        : `Updated ${update.name} to ${update.installedVersion}.`
+    );
+  }
+
+  parts.push(...(result.runtimeUpdateNotes ?? []));
 
   if (missingFileCount > 0) {
     parts.push(`${missingFileCount} expected installed file(s) are missing.`);
