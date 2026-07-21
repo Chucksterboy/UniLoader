@@ -1,0 +1,74 @@
+[
+  {
+    "id": "thunderstore",
+    "displayName": "Thunderstore",
+    "resolver": "thunderstore",
+    "directInstall": true,
+    "dependencyResolution": true,
+    "browserHandoff": false
+  },
+  {
+    "id": "github-release",
+    "displayName": "GitHub Releases",
+    "resolver": "github-release",
+    "directInstall": true,
+    "dependencyResolution": true,
+    "browserHandoff": false
+  },
+  {
+    "id": "bepinbuilds",
+    "displayName": "BepInEx Builds",
+    "resolver": "bepinbuilds",
+    "directInstall": true,
+    "dependencyResolution": true,
+    "browserHandoff": false
+  },
+  {
+    "id": "nexus",
+    "displayName": "Nexus Mods",
+    "resolver": "nexus-handoff",
+    "directInstall": false,
+    "dependencyResolution": false,
+    "browserHandoff": true
+  },
+  {
+    "id": "curseforge",
+    "displayName": "CurseForge",
+    "resolver": "browser-handoff",
+    "directInstall": false,
+    "dependencyResolution": false,
+    "browserHandoff": true
+  },
+  {
+    "id": "overwolf",
+    "displayName": "Overwolf",
+    "resolver": "browser-handoff",
+    "directInstall": false,
+    "dependencyResolution": false,
+    "browserHandoff": true
+  },
+  {
+    "id": "modio",
+    "displayName": "Mod.io",
+    "resolver": "browser-handoff",
+    "directInstall": false,
+    "dependencyResolution": false,
+    "browserHandoff": true
+  },
+  {
+    "id": "manual",
+    "displayName": "Manual source",
+    "resolver": "manual",
+    "directInstall": false,
+    "dependencyResolution": false,
+    "browserHandoff": false
+  },
+  {
+    "id": "known-runtime",
+    "displayName": "Runtime registry",
+    "resolver": "registry",
+    "directInstall": false,
+    "dependencyResolution": false,
+    "browserHandoff": false
+  }
+]

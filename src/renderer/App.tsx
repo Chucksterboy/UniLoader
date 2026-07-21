@@ -96,6 +96,7 @@ type StartupSplashPhase = "intro" | "exiting" | "hidden";
 type GameLaunchState = "idle" | "requesting" | "waiting" | "running";
 
 interface PendingDependencyPrompt {
+  profileId: string;
   mod: OnlineModRecord;
   file?: OnlineModFileOption;
   preflight: InstallPreflightResult;
@@ -197,6 +198,7 @@ export function App() {
   const [isTransferringProfile, setIsTransferringProfile] = useState(false);
   const [isScanningSteamGames, setIsScanningSteamGames] = useState(false);
   const [isCreatingSteamProfile, setIsCreatingSteamProfile] = useState(false);
+  const [isChangingProfileLaunchMode, setIsChangingProfileLaunchMode] = useState(false);
   const [gameLaunchState, setGameLaunchState] = useState<GameLaunchState>("idle");
   const [profileLaunchModes, setProfileLaunchModes] = useState<StoredProfileLaunchModes>(() =>
     loadStoredProfileLaunchModes()
@@ -213,6 +215,8 @@ export function App() {
   const [profilePendingRemoval, setProfilePendingRemoval] = useState<GameProfile | null>(null);
   const [pendingDependencyPrompt, setPendingDependencyPrompt] =
     useState<PendingDependencyPrompt | null>(null);
+  const selectedProfileIdRef = useRef("");
+  const discoverProfileIdRef = useRef("");
   const [error, setErrorState] = useState<string>("");
   const [errorMotionId, setErrorMotionId] = useState(0);
   const noticeSequence = useRef(0);
@@ -376,6 +380,14 @@ export function App() {
     void bootstrap();
     void getVersion().then(setAppVersion).catch(() => setAppVersion("unknown"));
   }, []);
+
+  useEffect(() => {
+    selectedProfileIdRef.current = selectedProfileId;
+  }, [selectedProfileId]);
+
+  useEffect(() => {
+    discoverProfileIdRef.current = discoverProfileId;
+  }, [discoverProfileId]);
 
   useEffect(() => {
     const players = {
@@ -577,15 +589,18 @@ export function App() {
       return;
     }
 
-    setDiscoverProfileId((current) =>
-      current && discoveryProfiles.some((profile) => profile.id === current)
-        ? current
+    const next =
+      discoverProfileId && discoveryProfiles.some((profile) => profile.id === discoverProfileId)
+        ? discoverProfileId
         : selectedProfile?.steamAppId
           ? selectedProfileId
-          : discoveryProfiles[0]?.id || ""
-    );
+          : discoveryProfiles[0]?.id || "";
+    if (next !== discoverProfileId) {
+      selectDiscoverProfile(next);
+    }
   }, [
     activeView,
+    discoverProfileId,
     discoveryProfiles,
     selectedProfile?.steamAppId,
     selectedProfileId
@@ -664,7 +679,9 @@ export function App() {
         api.getAppSettings()
       ]);
       setProfiles(loadedProfiles);
-      setSelectedProfileId((current) => current || loadedProfiles[0]?.id || "");
+      if (!selectedProfileIdRef.current) {
+        selectProfile(loadedProfiles[0]?.id || "");
+      }
       setAppSettings(loadedSettings);
     } catch (caughtError) {
       setError(String(caughtError));
@@ -673,10 +690,33 @@ export function App() {
     }
   }
 
+  function selectProfile(profileId: string) {
+    if (selectedProfileIdRef.current !== profileId) {
+      installedModsRequestSequence.current += 1;
+      selectedProfileIdRef.current = profileId;
+      setInstalledMods([]);
+    }
+    setSelectedProfileId(profileId);
+  }
+
+  function selectDiscoverProfile(profileId: string) {
+    if (discoverProfileIdRef.current !== profileId) {
+      discoveryRequestSequence.current += 1;
+      discoverInstalledModsRequestSequence.current += 1;
+      discoverProfileIdRef.current = profileId;
+      setIsDiscoveringMods(false);
+      setIsLoadingDiscoverInstalledMods(false);
+    }
+    setDiscoverProfileId(profileId);
+  }
+
   async function refreshInstalledMods(profileId: string) {
     const requestId = ++installedModsRequestSequence.current;
     const mods = await api.listInstalledMods(profileId);
-    if (requestId === installedModsRequestSequence.current) {
+    if (
+      requestId === installedModsRequestSequence.current &&
+      selectedProfileIdRef.current === profileId
+    ) {
       setInstalledMods(mods);
     }
   }
@@ -686,18 +726,27 @@ export function App() {
     setIsLoadingDiscoverInstalledMods(true);
     try {
       const mods = await api.listInstalledMods(profileId);
-      if (requestId === discoverInstalledModsRequestSequence.current) {
+      if (
+        requestId === discoverInstalledModsRequestSequence.current &&
+        discoverProfileIdRef.current === profileId
+      ) {
         setDiscoverInstalledMods(mods);
         setDiscoverInstalledModsProfileId(profileId);
       }
     } catch (caughtError) {
-      if (requestId === discoverInstalledModsRequestSequence.current) {
+      if (
+        requestId === discoverInstalledModsRequestSequence.current &&
+        discoverProfileIdRef.current === profileId
+      ) {
         setDiscoverInstalledMods([]);
         setDiscoverInstalledModsProfileId(profileId);
       }
       throw caughtError;
     } finally {
-      if (requestId === discoverInstalledModsRequestSequence.current) {
+      if (
+        requestId === discoverInstalledModsRequestSequence.current &&
+        discoverProfileIdRef.current === profileId
+      ) {
         setIsLoadingDiscoverInstalledMods(false);
       }
     }
@@ -726,7 +775,7 @@ export function App() {
         const result = await api.installNexusNxmLink(nxmUrl);
         playInstallSound("success");
         setOnlineInstallCompletionId((current) => current + 1);
-        setSelectedProfileId(result.installResult.profileId);
+        selectProfile(result.installResult.profileId);
         setOnlineMods((current) =>
           current.map((item) =>
             item.id === result.modId ? { ...item, installed: true } : item
@@ -940,7 +989,7 @@ export function App() {
       setProfiles((current) =>
         current.map((profile) => (profile.id === result.profile.id ? result.profile : profile))
       );
-      setSelectedProfileId(result.profile.id);
+      selectProfile(result.profile.id);
       setDetection(result.detection);
       setInstalledMods(result.installedMods);
       setAnalysis(null);
@@ -1043,9 +1092,9 @@ export function App() {
         return next;
       });
 
-      if (selectedProfileId === profile.id) {
+      if (selectedProfileIdRef.current === profile.id) {
         const nextSelectedProfileId = nextProfiles[0]?.id ?? "";
-        setSelectedProfileId(nextSelectedProfileId);
+        selectProfile(nextSelectedProfileId);
         setInstalledMods([]);
         setAnalysis(null);
         setNotice(null);
@@ -1194,7 +1243,7 @@ export function App() {
     );
 
     if (existingProfile) {
-      setSelectedProfileId(existingProfile.id);
+      selectProfile(existingProfile.id);
       setProfileCreatorOpen(false);
       setNotice({
         kind: "warning",
@@ -1210,7 +1259,7 @@ export function App() {
     try {
       const profile = await api.createSteamProfile(game);
       setProfiles((current) => [...current, profile]);
-      setSelectedProfileId(profile.id);
+      selectProfile(profile.id);
       setAnalysis(null);
       setDetection(null);
       setSelectedSteamGameAppId("");
@@ -1299,17 +1348,43 @@ export function App() {
     }
   }
 
-  function setProfileLaunchModsEnabled(enabled: boolean) {
+  async function setProfileLaunchModsEnabled(enabled: boolean) {
     if (!selectedProfile) {
       return;
     }
 
-    setProfileLaunchModes((current) => {
-      const next = { ...current, [selectedProfile.id]: enabled };
-      saveStoredProfileLaunchModes(next);
-      return next;
-    });
-    setStatus(enabled ? "Mods enabled for launch" : "Clean launch selected");
+    const profile = selectedProfile;
+    setError("");
+    setIsChangingProfileLaunchMode(true);
+    setStatus(enabled ? "Restoring managed components" : "Preparing unmodded state");
+    try {
+      const result = await api.setProfileModLaunchMode(profile.id, enabled);
+      setProfileLaunchModes((current) => {
+        const next = { ...current, [profile.id]: enabled };
+        saveStoredProfileLaunchModes(next);
+        return next;
+      });
+      setStatus(enabled ? "Mods enabled for launch" : "Unmodded state ready");
+      setNotice({
+        kind: "success",
+        title: enabled ? "Managed components restored" : "Unmodded state ready",
+        detail: enabled
+          ? `Restored ${result.changedComponents} UniLoader-managed component${result.changedComponents === 1 ? "" : "s"}.`
+          : `Suspended ${result.changedComponents} UniLoader-managed component${result.changedComponents === 1 ? "" : "s"}, including applicable runtimes. Pre-existing game files were preserved.`
+      });
+    } catch (caughtError) {
+      setError(String(caughtError));
+      setStatus(enabled ? "Restore failed" : "Clean mode failed");
+      setNotice({
+        kind: "error",
+        title: enabled
+          ? "Could not restore managed components"
+          : "Could not prepare unmodded state",
+        detail: String(caughtError)
+      });
+    } finally {
+      setIsChangingProfileLaunchMode(false);
+    }
   }
 
   async function exportProfileBundle(profileId: string) {
@@ -1364,7 +1439,7 @@ export function App() {
         return;
       }
       setProfiles((current) => [...current, result.profile]);
-      setSelectedProfileId(result.profile.id);
+      selectProfile(result.profile.id);
       setInstalledMods(result.installedMods);
       setAnalysis(null);
       setDetection(null);
@@ -1407,23 +1482,35 @@ export function App() {
         sort,
         query
       );
-      if (requestId !== discoveryRequestSequence.current) {
+      if (
+        requestId !== discoveryRequestSequence.current ||
+        discoverProfileIdRef.current !== profileId
+      ) {
         return false;
       }
       rememberOnlineModPresentations(result.items);
       setOnlineMods(result.items);
       setOnlineModTotal(result.total);
       setDiscoverLoadedProfileId(profileId);
-      setStatus("Discovery ready");
+      const providerWarning = result.providerWarnings[0];
+      setStatus(providerWarning ? "Discovery ready with warnings" : "Discovery ready");
       const profile = profiles.find((item) => item.id === profileId);
       setNotice({
-        kind: "success",
-        title: "Discovery updated",
-        detail: `${profile?.name ?? "Selected profile"}: found ${result.total} online mod(s).`
+        kind: providerWarning ? "warning" : "success",
+        title: providerWarning ? "Discovery partially updated" : "Discovery updated",
+        detail: [
+          `${profile?.name ?? "Selected profile"}: found ${result.total} online mod(s).`,
+          providerWarning
+        ]
+          .filter(Boolean)
+          .join(" ")
       });
       return true;
     } catch (caughtError) {
-      if (requestId !== discoveryRequestSequence.current) {
+      if (
+        requestId !== discoveryRequestSequence.current ||
+        discoverProfileIdRef.current !== profileId
+      ) {
         return false;
       }
       setError(String(caughtError));
@@ -1435,25 +1522,31 @@ export function App() {
       });
       return false;
     } finally {
-      if (requestId === discoveryRequestSequence.current) {
+      if (
+        requestId === discoveryRequestSequence.current &&
+        discoverProfileIdRef.current === profileId
+      ) {
         setIsDiscoveringMods(false);
       }
     }
   }
 
   async function loadOnlineModFiles(mod: OnlineModRecord) {
-    if (!discoverProfileId) {
+    const profileId = discoverProfileIdRef.current;
+    if (!profileId) {
       throw new Error("Select a profile before loading mod files.");
     }
-    return api.listDiscoveredModFiles(discoverProfileId, mod);
+    return api.listDiscoveredModFiles(profileId, mod);
   }
 
   async function installOnlineMod(
     mod: OnlineModRecord,
     file?: OnlineModFileOption,
-    skipDependencyPrompt = false
+    skipDependencyPrompt = false,
+    requestedProfileId?: string
   ) {
-    if (!discoverProfileId) {
+    const targetProfileId = requestedProfileId ?? discoverProfileIdRef.current;
+    if (!targetProfileId) {
       setNotice({
         kind: "warning",
         title: "Select a profile",
@@ -1464,9 +1557,9 @@ export function App() {
 
     if (mod.provider === "nexus" && !skipDependencyPrompt) {
       try {
-        const preflight = await api.preflightDiscoveredModInstall(discoverProfileId, mod);
+        const preflight = await api.preflightDiscoveredModInstall(targetProfileId, mod);
         if (preflight.confirmationRequired) {
-          setPendingDependencyPrompt({ mod, file, preflight });
+          setPendingDependencyPrompt({ profileId: targetProfileId, mod, file, preflight });
           setStatus("Dependency confirmation needed");
           return;
         }
@@ -1486,7 +1579,7 @@ export function App() {
     if (file?.action === "browser") {
       try {
         const downloadPageUrl = await api.beginNexusBrowserDownload(
-          discoverProfileId,
+          targetProfileId,
           mod,
           file
         );
@@ -1528,14 +1621,16 @@ export function App() {
     setInstallingOnlineModId(mod.id);
     setStatus("Installing online mod");
     try {
-      const result = await api.installDiscoveredMod(discoverProfileId, mod, file);
+      const result = await api.installDiscoveredMod(targetProfileId, mod, file);
       playInstallSound("success");
       setOnlineInstallCompletionId((current) => current + 1);
-      setOnlineMods((current) =>
-        current.map((item) => (item.id === mod.id ? { ...item, installed: true } : item))
-      );
-      if (discoverProfileId === selectedProfileId) {
-        await refreshInstalledMods(discoverProfileId).catch(() => undefined);
+      if (discoverProfileIdRef.current === targetProfileId) {
+        setOnlineMods((current) =>
+          current.map((item) => (item.id === mod.id ? { ...item, installed: true } : item))
+        );
+      }
+      if (targetProfileId === selectedProfileIdRef.current) {
+        await refreshInstalledMods(targetProfileId).catch(() => undefined);
       }
       setStatus("Mod installed");
       setNotice({
@@ -1580,7 +1675,7 @@ export function App() {
     if (prompt.file?.action === "browser" && missingNexusDependency) {
       try {
         const downloadPageUrl = await api.beginNexusRequirementDownload(
-          discoverProfileId,
+          prompt.profileId,
           missingNexusDependency.id
         );
         await openExternalUrl(downloadPageUrl);
@@ -1603,7 +1698,7 @@ export function App() {
       return;
     }
 
-    await installOnlineMod(prompt.mod, prompt.file, true);
+    await installOnlineMod(prompt.mod, prompt.file, true, prompt.profileId);
   }
 
   function openNexusAuthSettings() {
@@ -1812,7 +1907,7 @@ export function App() {
   }
 
   async function removeDiscoverInstalledMod(mod: InstalledModRecord) {
-    const profileId = discoverProfileId;
+    const profileId = discoverProfileIdRef.current;
     if (!profileId || mod.runtimeId) {
       return;
     }
@@ -1823,7 +1918,7 @@ export function App() {
     try {
       const result = await api.removeMod(profileId, mod.id);
       const refreshes: Promise<void>[] = [refreshDiscoverInstalledMods(profileId)];
-      if (profileId === selectedProfileId) {
+      if (profileId === selectedProfileIdRef.current) {
         refreshes.push(refreshInstalledMods(profileId));
       }
       await Promise.all(refreshes);
@@ -1980,11 +2075,15 @@ export function App() {
             {profiles.map((profile) => {
               const isSelected = profile.id === selectedProfileId;
               const isExpanded = profile.id === expandedProfileId;
-              const profileStatus = profile.engine === "unknown"
-                ? "Game not identified"
-                : profile.loader === "none" && profile.engine !== "unreal"
-                  ? "Loader not detected"
-                  : "Ready";
+              const profileStatus = profile.setupStatus === "setting-up"
+                ? "Setting up"
+                : profile.setupStatus === "failed" || profile.setupStatus === "needs-action"
+                  ? "Needs attention"
+                  : profile.engine === "unknown"
+                    ? "Game not identified"
+                    : profile.loader === "none" && profile.engine !== "unreal"
+                      ? "Loader not detected"
+                      : "Ready";
               return (
                 <div
                   className={`profile${isSelected ? " active" : ""}${isExpanded ? " expanded" : ""}`}
@@ -1996,7 +2095,7 @@ export function App() {
                       className="profile-select"
                       onClick={() => {
                         if (!isSelected) {
-                          setSelectedProfileId(profile.id);
+                          selectProfile(profile.id);
                           setExpandedProfileId("");
                         }
                         setAnalysis(null);
@@ -2016,7 +2115,7 @@ export function App() {
                       className="profile-expand-button"
                       onClick={() => {
                         if (!isSelected) {
-                          setSelectedProfileId(profile.id);
+                          selectProfile(profile.id);
                           setAnalysis(null);
                           setNotice(null);
                         }
@@ -2186,8 +2285,8 @@ export function App() {
             >
               <input
                 checked={selectedProfileLaunchModsEnabled}
-                disabled={!selectedProfile || gameLaunchBusy}
-                onChange={(event) => setProfileLaunchModsEnabled(event.currentTarget.checked)}
+                disabled={!selectedProfile || gameLaunchBusy || isChangingProfileLaunchMode}
+                onChange={(event) => void setProfileLaunchModsEnabled(event.currentTarget.checked)}
                 type="checkbox"
               />
               <span className="master-mod-track"><span /></span>
@@ -2376,7 +2475,7 @@ export function App() {
             onOpenPage={(url) => void openExternalUrl(url)}
             onLoad={(page, sort, query) => loadOnlineMods(discoverProfileId, page, sort, query)}
             onRemoveInstalledMod={(mod) => void removeDiscoverInstalledMod(mod)}
-            onSelectProfile={setDiscoverProfileId}
+            onSelectProfile={selectDiscoverProfile}
           />
         ) : (
           <SettingsView
@@ -2818,8 +2917,8 @@ function ProfileRemovalDialog({
           <p className="eyebrow">Remove Profile</p>
           <h3>{profile.name}</h3>
           <p>
-            This removes the profile and UniLoader's local records. It does not delete files from
-            the game folder.
+            This removes every UniLoader-managed mod, dependency, and runtime, then restores any
+            game files they replaced. Components that existed before UniLoader are preserved.
           </p>
         </div>
         <div className="confirm-actions">

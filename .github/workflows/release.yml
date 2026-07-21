@@ -51,14 +51,14 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "UniLoader ${{ github.ref_name }}"
           releaseBody: |
-            UniLoader v0.9.10 improves safe installation and artwork recovery for current and future games.
+            UniLoader v0.9.11 strengthens cross-game installation safety and clean-game launching.
 
-            - Preserves provider artwork on new Nexus Mods and Thunderstore installs.
-            - Recovers artwork and provider identities for older locally imported mods during Refresh.
-            - Recognizes installed runtimes across provider requirement links without prompting for duplicates.
-            - Makes learned install routes safer and repairs invalid cached routes automatically.
-            - Hardens profile storage against overlapping reads and writes.
-            - Includes the latest profile, discovery, and responsive interface fixes.
+            - Adds an extensible, validated runtime and dependency-provider registry.
+            - Uses stronger route evidence, canonical deployment containment, and archive hashes.
+            - Improves dependency identity, version selection, conflict handling, and profile setup status.
+            - Makes Mods OFF immediately restore the pre-UniLoader game state, including managed runtimes.
+            - Cleans all UniLoader-owned mods, dependencies, and runtimes when a profile is removed.
+            - Preserves components and original files that existed before UniLoader.
           releaseDraft: false
           prerelease: false
 

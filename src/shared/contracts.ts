@@ -53,6 +53,9 @@ export interface GameProfile {
   steamAppId?: string;
   engine: GameEngine;
   loader: LoaderKind;
+  setupStatus: "setting-up" | "ready" | "needs-action" | "failed";
+  setupWarnings: string[];
+  setupUpdatedAt?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -209,6 +212,9 @@ export interface InstalledModRecord {
   displayName?: string;
   packageId?: string;
   dependencyString?: string;
+  packageProvider?: string;
+  packageVersion?: string;
+  sourceArchiveSha256?: string;
   iconUrl?: string;
   adapterId: AdapterId;
   summary: string;
@@ -317,6 +323,7 @@ export interface DiscoveryPage {
   page: number;
   pageSize: number;
   hasMore: boolean;
+  providerWarnings: string[];
 }
 
 export interface ModActionResult {
@@ -334,6 +341,12 @@ export interface ProfileModToggleResult {
   filesChanged: string[];
   warnings: string[];
   installedMods: InstalledModRecord[];
+}
+
+export interface ProfileLaunchModeResult {
+  profileId: string;
+  modsEnabled: boolean;
+  changedComponents: number;
 }
 
 export interface ProfileActionResult {
@@ -409,6 +422,10 @@ export interface DesktopApi {
   scanSteamGames(): Promise<SteamGameRecord[]>;
   createSteamProfile(game: SteamGameRecord): Promise<GameProfile>;
   launchProfileGame(profileId: string, modsEnabled: boolean): Promise<void>;
+  setProfileModLaunchMode(
+    profileId: string,
+    modsEnabled: boolean
+  ): Promise<ProfileLaunchModeResult>;
   profileGameRunning(profileId: string): Promise<boolean>;
   setAllProfileModsEnabled(profileId: string, enabled: boolean): Promise<ProfileModToggleResult>;
   listProfiles(): Promise<GameProfile[]>;

@@ -34,6 +34,16 @@ UniLoader can automatically resolve these loader/runtime dependencies:
 
 Source platforms such as Nexus Mods, CurseForge/Overwolf, Thunderstore, and Mod.io are not all equivalent. Thunderstore archives expose dependency metadata directly in the ZIP. Nexus and CurseForge integrations need their API/auth/download rules handled explicitly rather than scraped or bypassed.
 
+### Runtime Registry Extensions
+
+Bundled runtime definitions live in `src-tauri/src/runtime_definitions.json`. A local extension registry can add a runtime, or override a bundled runtime with the same `id`, without recompiling UniLoader:
+
+```text
+%APPDATA%\com.uniloader.desktop\registry\runtime-definitions.json
+```
+
+The extension file uses the same JSON array shape as the bundled registry. UniLoader validates runtime IDs, provider capabilities, detection marker types, and every relative detection path before accepting the registry. An invalid extension blocks startup with a specific registry error instead of silently falling back to unsafe or partial behavior. New provider resolvers still require an audited native implementation and an entry in `src-tauri/src/dependency_provider_definitions.json`; registry data cannot turn an unsupported provider into an automatic downloader.
+
 ## Run
 
 UniLoader now uses Tauri, so running from source requires Rust/Cargo plus the bundled Codex Node runtime or a local Node.js install.

@@ -24,6 +24,7 @@ import {
   ProfileExportResult,
   ProfileGameFolderUpdateResult,
   ProfileImportResult,
+  ProfileLaunchModeResult,
   ProfileModToggleResult,
   ProfileRefreshResult,
   SteamGameRecord,
@@ -47,6 +48,11 @@ export const desktopApi: DesktopApi = {
     invoke<GameProfile>("create_steam_profile", { game }),
   launchProfileGame: (profileId: string, modsEnabled: boolean) =>
     invoke<void>("launch_profile_game", { profileId, modsEnabled }),
+  setProfileModLaunchMode: (profileId: string, modsEnabled: boolean) =>
+    invoke<ProfileLaunchModeResult>("set_profile_mod_launch_mode", {
+      profileId,
+      modsEnabled
+    }),
   profileGameRunning: (profileId: string) =>
     invoke<boolean>("profile_game_running", { profileId }),
   setAllProfileModsEnabled: (profileId: string, enabled: boolean) =>
