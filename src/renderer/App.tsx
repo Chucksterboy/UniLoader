@@ -1614,7 +1614,8 @@ export function App() {
         page,
         discoverPageSize,
         sort,
-        query
+        query,
+        requestId
       );
       if (
         requestId !== discoveryRequestSequence.current ||

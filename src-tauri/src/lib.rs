@@ -57,6 +57,8 @@ const NEXUS_PENDING_DOWNLOAD_TTL_MINUTES: i64 = 30;
 const MAX_DISCOVERY_PAGE_SIZE: usize = 50;
 const DISCOVERY_PROVIDER_CACHE_MINUTES: u64 = 30;
 const DISCOVERY_PROVIDER_CACHE_MAX_RECORDS: usize = 2_500;
+const DISCOVERY_PROVIDER_CACHE_MAX_ENTRIES: usize = 64;
+const DISCOVERY_CANCELLED_ERROR: &str = "Discovery request was superseded.";
 const MAX_PROVIDER_CANDIDATES: usize = 16;
 const PROFILE_LAUNCH_SUSPENSION_VERSION: u32 = 1;
 const PROFILE_RUNTIME_SAMPLE_SIZE: usize = 40;
@@ -4240,16 +4242,29 @@ async fn discover_online_mods(
     page_size: usize,
     sort: String,
     query: String,
+    request_id: u64,
 ) -> Result<DiscoveryPage, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let root = store_root(&app)?;
-        let profile = get_profile(&root, &profile_id)?;
-        ensure_verified_steam_profile(&profile)?;
-        let settings = read_app_settings(&root)?;
-        discover_online_mods_for_profile(&root, &profile, &settings, page, page_size, &sort, &query)
-    })
+    operation::begin_discovery(&profile_id, request_id)?;
+    let operation_profile_id = profile_id.clone();
+    let task_app = app.clone();
+    operation::run_blocking(
+        app,
+        "discover_online_mods",
+        Some(operation_profile_id),
+        move || {
+            if !operation::discovery_is_current(&profile_id, request_id) {
+                return Err(DISCOVERY_CANCELLED_ERROR.to_string());
+            }
+            let root = store_root(&task_app)?;
+            let profile = get_profile(&root, &profile_id)?;
+            ensure_verified_steam_profile(&profile)?;
+            let settings = read_app_settings(&root)?;
+            discover_online_mods_for_profile(
+                &root, &profile, &settings, page, page_size, &sort, &query, request_id,
+            )
+        },
+    )
     .await
-    .map_err(error_to_string)?
 }
 
 #[tauri::command]
@@ -8650,6 +8665,7 @@ fn discover_online_mods_for_profile(
     page_size: usize,
     sort: &str,
     query: &str,
+    request_id: u64,
 ) -> Result<DiscoveryPage, String> {
     let page = page.max(1);
     let page_size = page_size.clamp(1, MAX_DISCOVERY_PAGE_SIZE);
@@ -8658,39 +8674,47 @@ fn discover_online_mods_for_profile(
     let mut results = Vec::new();
     let mut provider_errors = Vec::new();
     let mut provider_total = 0_usize;
+    let normalized_query = query.trim().to_lowercase();
+
+    ensure_discovery_is_current(&profile.id, request_id)?;
 
     if let Some(community) = thunderstore_community_for_profile(profile) {
         match discover_thunderstore_community_mods(store_root, profile, &community) {
-            Ok(records) => {
+            Ok(mut records) => {
+                records.retain(|record| !is_external_mod_manager_listing(record));
+                if !normalized_query.is_empty() {
+                    records.retain(|record| online_mod_matches_query(record, &normalized_query));
+                }
                 provider_total = provider_total.saturating_add(records.len());
                 results.extend(records);
             }
             Err(error) => provider_errors.push(format!("Thunderstore: {error}")),
         }
     }
+    ensure_discovery_is_current(&profile.id, request_id)?;
 
     if let Some(domain) = nexus_domain_for_profile(profile) {
         let cache_key = format!(
-            "nexus:{}:{}:{}",
+            "nexus:{}:{}:{}:{}",
             profile.id,
             domain.to_ascii_lowercase(),
-            sort.to_ascii_lowercase()
+            sort.to_ascii_lowercase(),
+            normalized_query
         );
-        let fetch_count = if query.trim().is_empty() {
-            needed
-        } else {
-            needed
-                .saturating_mul(5)
-                .clamp(200, DISCOVERY_PROVIDER_CACHE_MAX_RECORDS)
-        };
+        let fetch_count = needed.min(DISCOVERY_PROVIDER_CACHE_MAX_RECORDS);
         match discover_nexus_mods_for_profile(
             profile,
             &domain,
             settings.nexus_api_ready(),
             fetch_count,
             sort,
+            &normalized_query,
+            request_id,
         ) {
-            Ok((records, total)) => {
+            Ok((mut records, mut total)) => {
+                let fetched_count = records.len();
+                records.retain(|record| !is_external_mod_manager_listing(record));
+                total = total.saturating_sub(fetched_count.saturating_sub(records.len()));
                 remember_discovery_provider_snapshot(&cache_key, &records, total);
                 provider_total = provider_total.saturating_add(total);
                 results.extend(records);
@@ -8708,8 +8732,10 @@ fn discover_online_mods_for_profile(
             }
         }
     }
+    ensure_discovery_is_current(&profile.id, request_id)?;
 
     let mut seen_records = HashSet::new();
+    let before_deduplication = results.len();
     results.retain(|record| {
         seen_records.insert(format!(
             "{}:{}",
@@ -8717,16 +8743,7 @@ fn discover_online_mods_for_profile(
             record.id.to_ascii_lowercase()
         ))
     });
-
-    let unfiltered_result_count = results.len();
-    results.retain(|record| !is_external_mod_manager_listing(record));
-    provider_total = provider_total.saturating_sub(unfiltered_result_count - results.len());
-
-    let normalized_query = query.trim().to_lowercase();
-    if !normalized_query.is_empty() {
-        results.retain(|record| online_mod_matches_query(record, &normalized_query));
-        provider_total = results.len();
-    }
+    provider_total = provider_total.saturating_sub(before_deduplication - results.len());
     sort_online_mods(&mut results, sort);
     if results.is_empty() && !provider_errors.is_empty() {
         return Err(provider_errors.join(" "));
@@ -8752,6 +8769,20 @@ fn remember_discovery_provider_snapshot(key: &str, records: &[OnlineModRecord], 
     let Ok(mut cache) = cache.lock() else {
         return;
     };
+    let now = Instant::now();
+    cache.retain(|_, entry| {
+        now.duration_since(entry.fetched_at)
+            <= Duration::from_secs(DISCOVERY_PROVIDER_CACHE_MINUTES * 60)
+    });
+    if cache.len() >= DISCOVERY_PROVIDER_CACHE_MAX_ENTRIES && !cache.contains_key(key) {
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.fetched_at)
+            .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest);
+        }
+    }
     let incoming = records
         .iter()
         .take(DISCOVERY_PROVIDER_CACHE_MAX_RECORDS)
@@ -8789,6 +8820,14 @@ fn cached_discovery_provider_snapshot(key: &str) -> Option<(Vec<OnlineModRecord>
         return None;
     }
     Some((entry.records.clone(), entry.total))
+}
+
+fn ensure_discovery_is_current(profile_id: &str, request_id: u64) -> Result<(), String> {
+    if operation::discovery_is_current(profile_id, request_id) {
+        Ok(())
+    } else {
+        Err(DISCOVERY_CANCELLED_ERROR.to_string())
+    }
 }
 
 fn is_external_mod_manager_listing(record: &OnlineModRecord) -> bool {
@@ -11499,6 +11538,8 @@ fn discover_nexus_mods_for_profile(
     nexus_api_ready: bool,
     max_results: usize,
     sort: &str,
+    query: &str,
+    request_id: u64,
 ) -> Result<(Vec<OnlineModRecord>, usize), String> {
     let client = provider_client()?;
     let mut records = Vec::new();
@@ -11506,13 +11547,15 @@ fn discover_nexus_mods_for_profile(
     let mut total_count = usize::MAX;
 
     while offset < total_count && records.len() < max_results {
+        ensure_discovery_is_current(&profile.id, request_id)?;
         let remaining = max_results.saturating_sub(records.len());
         let page_size = nexus_discovery_batch_size(remaining);
         if page_size == 0 {
             break;
         }
 
-        let page = fetch_nexus_mod_page_sorted(&client, domain, offset, page_size, sort)?;
+        let page = fetch_nexus_mod_page_sorted(&client, domain, offset, page_size, sort, query)?;
+        ensure_discovery_is_current(&profile.id, request_id)?;
         total_count = page.total_count;
         let returned_count = page.nodes.len();
 
@@ -11542,8 +11585,9 @@ fn fetch_nexus_mod_page_sorted(
     offset: usize,
     count: usize,
     sort: &str,
+    query: &str,
 ) -> Result<NexusModPage, String> {
-    fetch_nexus_mod_page_with_sort(client, domain, offset, count, sort)
+    fetch_nexus_mod_page_with_sort(client, domain, offset, count, sort, query)
 }
 
 fn fetch_nexus_mod_page(
@@ -11552,7 +11596,7 @@ fn fetch_nexus_mod_page(
     offset: usize,
     count: usize,
 ) -> Result<NexusModPage, String> {
-    fetch_nexus_mod_page_with_sort(client, domain, offset, count, "downloads")
+    fetch_nexus_mod_page_with_sort(client, domain, offset, count, "downloads", "")
 }
 
 fn fetch_nexus_mod_page_with_sort(
@@ -11561,6 +11605,7 @@ fn fetch_nexus_mod_page_with_sort(
     offset: usize,
     count: usize,
     sort: &str,
+    query: &str,
 ) -> Result<NexusModPage, String> {
     const NEXUS_DISCOVERY_QUERY: &str = r#"
         query UniLoaderDiscoverMods(
@@ -11613,15 +11658,25 @@ fn fetch_nexus_mod_page_with_sort(
         "oldest" => serde_json::json!({ "createdAt": { "direction": "ASC" } }),
         _ => serde_json::json!({ "downloads": { "direction": "DESC" } }),
     };
+    let mut filter = serde_json::json!({
+        "op": "AND",
+        "gameDomainName": [{ "value": domain, "op": "EQUALS" }],
+        "adultContent": [{ "value": false, "op": "EQUALS" }],
+        "status": [{ "value": "published", "op": "EQUALS" }]
+    });
+    if !query.trim().is_empty() {
+        filter
+            .as_object_mut()
+            .expect("discovery filter is an object")
+            .insert(
+                "name".to_string(),
+                serde_json::json!([{ "value": query.trim(), "op": "WILDCARD" }]),
+            );
+    }
     let body = serde_json::json!({
         "query": NEXUS_DISCOVERY_QUERY,
         "variables": {
-            "filter": {
-                "op": "AND",
-                "gameDomainName": [{ "value": domain, "op": "EQUALS" }],
-                "adultContent": [{ "value": false, "op": "EQUALS" }],
-                "status": [{ "value": "published", "op": "EQUALS" }]
-            },
+            "filter": filter,
             "sort": [sort_value],
             "offset": offset,
             "count": count
