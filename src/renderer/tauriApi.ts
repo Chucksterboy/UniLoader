@@ -17,6 +17,7 @@ import {
   ModConfigFile,
   ModActionResult,
   NexusNxmInstallResult,
+  OnlineInstallSelection,
   OnlineModRecord,
   OnlineModFileOption,
   ProfileActionResult,
@@ -180,7 +181,8 @@ export const desktopApi: DesktopApi = {
   installDiscoveredMod: (
     profileId: string,
     mod: OnlineModRecord,
-    file?: OnlineModFileOption
+    file?: OnlineModFileOption,
+    selection?: OnlineInstallSelection
   ) =>
     invoke<InstallResult>("install_discovered_mod", {
       profileId,
@@ -188,19 +190,24 @@ export const desktopApi: DesktopApi = {
       modId: mod.id,
       version: file?.version ?? mod.version,
       providerGameId: mod.providerGameId,
-      selectedFileId: file?.id
+      selectedFileId: file?.id,
+      replaceInstalledModId: selection?.replaceInstalledModId,
+      installTargetId: selection?.installTargetId
     }),
   beginNexusBrowserDownload: (
     profileId: string,
     mod: OnlineModRecord,
-    file: OnlineModFileOption
+    file: OnlineModFileOption,
+    selection?: OnlineInstallSelection
   ) =>
     invoke<string>("begin_nexus_browser_download", {
       profileId,
       modId: mod.id,
       version: file.version ?? mod.version,
       providerGameId: mod.providerGameId,
-      selectedFileId: file.id
+      selectedFileId: file.id,
+      replaceInstalledModId: selection?.replaceInstalledModId,
+      installTargetId: selection?.installTargetId
     }),
   beginNexusRequirementDownload: (profileId: string, dependencyId: string) =>
     invoke<string>("begin_nexus_requirement_download", { profileId, dependencyId }),

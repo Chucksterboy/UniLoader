@@ -193,10 +193,19 @@ export interface InstallResult {
   warnings: string[];
 }
 
+export interface InstallTargetOption {
+  id: string;
+  label: string;
+  relativePath: string;
+  scope: string;
+  recommended: boolean;
+}
+
 export interface InstallPreflightResult {
   dependencies: DependencySpec[];
   missingDependencies: DependencySpec[];
   confirmationRequired: boolean;
+  installTargets: InstallTargetOption[];
 }
 
 export interface NexusNxmInstallResult {
@@ -214,6 +223,8 @@ export interface InstalledModRecord {
   dependencyString?: string;
   packageProvider?: string;
   packageVersion?: string;
+  providerFileId?: string;
+  providerVariant?: string;
   sourceArchiveSha256?: string;
   iconUrl?: string;
   adapterId: AdapterId;
@@ -290,6 +301,11 @@ export interface OnlineModFileOption {
   primary: boolean;
   action: OnlineModFileAction;
   downloadPageUrl?: string;
+}
+
+export interface OnlineInstallSelection {
+  replaceInstalledModId?: string;
+  installTargetId?: string;
 }
 
 export interface OnlineModRecord {
@@ -475,12 +491,14 @@ export interface DesktopApi {
   installDiscoveredMod(
     profileId: string,
     mod: OnlineModRecord,
-    file?: OnlineModFileOption
+    file?: OnlineModFileOption,
+    selection?: OnlineInstallSelection
   ): Promise<InstallResult>;
   beginNexusBrowserDownload(
     profileId: string,
     mod: OnlineModRecord,
-    file: OnlineModFileOption
+    file: OnlineModFileOption,
+    selection?: OnlineInstallSelection
   ): Promise<string>;
   beginNexusRequirementDownload(profileId: string, dependencyId: string): Promise<string>;
   installNexusNxmLink(nxmUrl: string): Promise<NexusNxmInstallResult>;

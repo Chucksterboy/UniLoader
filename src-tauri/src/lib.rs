@@ -74,6 +74,8 @@ const APP_UPDATE_REPOSITORY: &str = "Chucksterboy/UniLoader";
 const BEPINBUILDS_BASE: &str = "https://builds.bepinex.dev";
 const BEPINBUILDS_BEPINEX_BE: &str = "https://builds.bepinex.dev/projects/bepinex_be";
 const APP_ICON: tauri::image::Image<'static> = tauri::include_image!("./icons/icon.png");
+const TRAY_ICON: tauri::image::Image<'static> =
+    tauri::include_image!("./icons/tray-icon.png");
 const GAME_DEFINITIONS_JSON: &str = include_str!("game_definitions.json");
 const RUNTIME_DEFINITIONS_JSON: &str = include_str!("runtime_definitions.json");
 const DEPENDENCY_PROVIDER_DEFINITIONS_JSON: &str =
@@ -307,6 +309,17 @@ pub struct InstallPreflightResult {
     dependencies: Vec<DependencySpec>,
     missing_dependencies: Vec<DependencySpec>,
     confirmation_required: bool,
+    install_targets: Vec<InstallTargetOption>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallTargetOption {
+    id: String,
+    label: String,
+    relative_path: String,
+    scope: String,
+    recommended: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -486,6 +499,10 @@ struct PendingNexusDownload {
     file_id: u64,
     version: Option<String>,
     provider_game_id: String,
+    #[serde(default)]
+    replace_installed_mod_id: Option<String>,
+    #[serde(default)]
+    install_target_id: Option<String>,
     created_at: i64,
 }
 
@@ -4154,6 +4171,7 @@ async fn discover_online_mods(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn install_discovered_mod(
     app: AppHandle,
     profile_id: String,
@@ -4162,6 +4180,8 @@ async fn install_discovered_mod(
     version: Option<String>,
     provider_game_id: Option<String>,
     selected_file_id: Option<String>,
+    replace_installed_mod_id: Option<String>,
+    install_target_id: Option<String>,
 ) -> Result<InstallResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _operation = lock_mutations()?;
@@ -4170,31 +4190,104 @@ async fn install_discovered_mod(
         ensure_verified_steam_profile(&profile)?;
         let settings = read_app_settings(&root)?;
 
-        match provider.as_str() {
-            "thunderstore" => install_thunderstore_discovered_mod(
-                &root,
-                &profile,
-                &mod_id,
-                version.clone(),
-                provider_game_id.as_deref(),
-            ),
-            "nexus" => install_nexus_discovered_mod(
-                &root,
-                &profile,
-                &mod_id,
-                &settings,
-                version,
-                provider_game_id.as_deref(),
-                selected_file_id.as_deref(),
-            ),
-            _ => Err(format!(
-                "{} discovery install is not supported in this build.",
-                provider
-            )),
-        }
+        replace_installed_mod_transaction(
+            &root,
+            &profile,
+            replace_installed_mod_id.as_deref(),
+            &mod_id,
+            || match provider.as_str() {
+                "thunderstore" => install_thunderstore_discovered_mod(
+                    &root,
+                    &profile,
+                    &mod_id,
+                    version.clone(),
+                    provider_game_id.as_deref(),
+                    install_target_id.as_deref(),
+                ),
+                "nexus" => install_nexus_discovered_mod(
+                    &root,
+                    &profile,
+                    &mod_id,
+                    &settings,
+                    version,
+                    provider_game_id.as_deref(),
+                    selected_file_id.as_deref(),
+                    install_target_id.as_deref(),
+                ),
+                _ => Err(format!(
+                    "{} discovery install is not supported in this build.",
+                    provider
+                )),
+            },
+        )
     })
     .await
     .map_err(error_to_string)?
+}
+
+fn replace_installed_mod_transaction<F>(
+    store_root: &Path,
+    profile: &GameProfile,
+    replace_installed_mod_id: Option<&str>,
+    expected_package_id: &str,
+    install: F,
+) -> Result<InstallResult, String>
+where
+    F: FnOnce() -> Result<InstallResult, String>,
+{
+    let Some(replace_id) = replace_installed_mod_id.filter(|value| !value.trim().is_empty()) else {
+        return install();
+    };
+
+    let store_path = installed_mods_path(store_root);
+    let checkpoint = read_store::<InstalledModRecord>(&store_path).map_err(error_to_string)?;
+    let record = checkpoint
+        .items
+        .iter()
+        .find(|record| record.profile_id == profile.id && record.id == replace_id)
+        .cloned()
+        .ok_or_else(|| "The installed mod selected for update no longer exists.".to_string())?;
+    if record.runtime_id.is_some() || record.externally_managed {
+        return Err("Protected or externally managed components cannot be replaced by a provider update.".to_string());
+    }
+    if !record
+        .package_id
+        .as_deref()
+        .is_some_and(|package_id| package_id.eq_ignore_ascii_case(expected_package_id))
+    {
+        return Err("The selected update does not match the installed provider package. No files were changed.".to_string());
+    }
+
+    if record.enabled {
+        deactivate_mod_files(store_root, profile, &record)?;
+    }
+    let mut without_previous = checkpoint.clone();
+    without_previous.items.retain(|item| item.id != record.id);
+    if let Err(error) = write_store(&store_path, &without_previous) {
+        if record.enabled {
+            restore_deactivated_mods(store_root, profile, std::slice::from_ref(&record));
+        }
+        return Err(format!("Could not prepare the existing mod for update: {error}"));
+    }
+
+    match install() {
+        Ok(result) => {
+            cleanup_install_data(store_root, &profile.id, &record.id);
+            Ok(result)
+        }
+        Err(error) => {
+            let rollback = rollback_install_graph(store_root, profile, &checkpoint);
+            if rollback.is_ok() && record.enabled {
+                restore_deactivated_mods(store_root, profile, std::slice::from_ref(&record));
+            }
+            match rollback {
+                Ok(()) => Err(format!("{error} The previous version was restored.")),
+                Err(rollback_error) => Err(format!(
+                    "{error} UniLoader also could not fully restore the previous version: {rollback_error}"
+                )),
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -4233,26 +4326,101 @@ async fn preflight_discovered_mod_install(
         let root = store_root(&app)?;
         let profile = get_profile(&root, &profile_id)?;
         ensure_verified_steam_profile(&profile)?;
-        if provider != "nexus" {
-            return Ok(InstallPreflightResult {
-                dependencies: Vec::new(),
-                missing_dependencies: Vec::new(),
-                confirmation_required: false,
-            });
-        }
-
-        let (domain, nexus_mod_id) = parse_nexus_online_mod_id(&mod_id)?;
-        verified_discovery_provider_game(&profile, "nexus", Some(&domain), Some(&domain))?;
         let settings = read_app_settings(&root)?;
-        let client = provider_client()?;
-        let requirements = fetch_nexus_mod_requirements(
-            &client,
-            &profile,
-            &domain,
-            nexus_mod_id,
-            settings.nexus_api_key(),
-        )?;
-        let dependencies = nexus_requirement_dependencies(&profile, &domain, &requirements)
+        let (dependencies, install_targets) = match provider.as_str() {
+            "nexus" => {
+                let (domain, nexus_mod_id) = parse_nexus_online_mod_id(&mod_id)?;
+                verified_discovery_provider_game(
+                    &profile,
+                    "nexus",
+                    Some(&domain),
+                    Some(&domain),
+                )?;
+                let client = provider_client()?;
+                let requirements = fetch_nexus_mod_requirements(
+                    &client,
+                    &profile,
+                    &domain,
+                    nexus_mod_id,
+                    settings.nexus_api_key(),
+                )?;
+                let details = settings
+                    .nexus_api_key()
+                    .and_then(|api_key| {
+                        fetch_nexus_mod_details(&client, api_key, &domain, nexus_mod_id).ok()
+                    })
+                    .unwrap_or_default();
+                let mod_name = non_empty_string(details.name.trim())
+                    .unwrap_or_else(|| format!("Nexus mod {nexus_mod_id}"));
+                let document = ProviderRouteDocument {
+                    provider: "Nexus Mods".to_string(),
+                    mod_id: mod_id.clone(),
+                    mod_name: mod_name.clone(),
+                    text: [details.summary.as_str(), details.description.as_str()]
+                        .into_iter()
+                        .filter(|value| !value.trim().is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                };
+                let provided_runtime =
+                    runtime_id_for_provider_package(&profile, "nexus", None, &mod_name);
+                let mut dependencies =
+                    nexus_requirement_dependencies(&profile, &domain, &requirements);
+                append_unique_dependencies(
+                    &mut dependencies,
+                    description_runtime_dependencies(
+                        &profile,
+                        &document.text,
+                        provided_runtime.as_deref(),
+                    ),
+                );
+                (
+                    dependencies,
+                    provider_install_target_options(&root, &profile, &document),
+                )
+            }
+            "thunderstore" => {
+                verified_discovery_provider_game(&profile, "thunderstore", None, None)?;
+                let raw_id = mod_id
+                    .strip_prefix("thunderstore:")
+                    .ok_or_else(|| format!("Invalid Thunderstore mod id: {mod_id}"))?;
+                let package_ref = parse_thunderstore_token(raw_id, None).ok_or_else(|| {
+                    format!("Could not parse Thunderstore package reference from {mod_id}.")
+                })?;
+                let package_version = fetch_thunderstore_package_version(&package_ref)?;
+                let resolved_ref = ThunderstorePackageRef {
+                    namespace: package_ref.namespace.clone(),
+                    name: package_ref.name.clone(),
+                    version: Some(package_version.version_number.clone()),
+                };
+                let document = thunderstore_route_document(&resolved_ref, &package_version);
+                let provided_runtime = runtime_id_for_provider_package(
+                    &profile,
+                    "thunderstore",
+                    Some(&package_ref.namespace),
+                    &package_ref.name,
+                );
+                let mut dependencies = package_version
+                    .dependencies
+                    .iter()
+                    .map(|dependency| parse_thunderstore_dependency(dependency))
+                    .collect::<Vec<_>>();
+                append_unique_dependencies(
+                    &mut dependencies,
+                    description_runtime_dependencies(
+                        &profile,
+                        &document.text,
+                        provided_runtime.as_deref(),
+                    ),
+                );
+                (
+                    dependencies,
+                    provider_install_target_options(&root, &profile, &document),
+                )
+            }
+            _ => (Vec::new(), Vec::new()),
+        };
+        let dependencies = dependencies
             .into_iter()
             .map(|dependency| refresh_dependency_status(&root, &profile, &dependency))
             .collect::<Vec<_>>();
@@ -4269,6 +4437,7 @@ async fn preflight_discovered_mod_install(
             dependencies,
             missing_dependencies,
             confirmation_required,
+            install_targets,
         })
     })
     .await
@@ -4347,6 +4516,8 @@ async fn begin_nexus_requirement_download(
                 file_id: file.file_id,
                 version: file.version.clone(),
                 provider_game_id,
+                replace_installed_mod_id: None,
+                install_target_id: None,
                 created_at: now,
             },
             now,
@@ -4362,6 +4533,7 @@ async fn begin_nexus_requirement_download(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn begin_nexus_browser_download(
     app: AppHandle,
     profile_id: String,
@@ -4369,6 +4541,8 @@ async fn begin_nexus_browser_download(
     version: Option<String>,
     provider_game_id: Option<String>,
     selected_file_id: String,
+    replace_installed_mod_id: Option<String>,
+    install_target_id: Option<String>,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _operation = lock_mutations()?;
@@ -4398,6 +4572,8 @@ async fn begin_nexus_browser_download(
             file_id: file.file_id,
             version: version.or_else(|| file.version.clone()),
             provider_game_id: verified_provider_game_id,
+            replace_installed_mod_id,
+            install_target_id,
             created_at: now,
         };
         store_pending_nexus_download(&root, pending, now)?;
@@ -4447,20 +4623,29 @@ async fn install_nexus_nxm_link(
                 .to_string()
         })?;
         let mut visited_dependencies = HashSet::new();
-        let install_result = install_resolved_nexus_file(
+        let install_result = replace_installed_mod_transaction(
             &root,
             &profile,
-            &client,
-            api_key,
-            &account,
-            &nxm.domain,
-            nxm.mod_id,
-            &file,
-            &download_url,
-            pending.version,
-            provider_game_id,
-            &mut visited_dependencies,
-            0,
+            pending.replace_installed_mod_id.as_deref(),
+            &format!("nexus:{}/{}", nxm.domain, nxm.mod_id),
+            || {
+                install_resolved_nexus_file(
+                    &root,
+                    &profile,
+                    &client,
+                    api_key,
+                    &account,
+                    &nxm.domain,
+                    nxm.mod_id,
+                    &file,
+                    &download_url,
+                    pending.version.clone(),
+                    provider_game_id.clone(),
+                    pending.install_target_id.as_deref(),
+                    &mut visited_dependencies,
+                    0,
+                )
+            },
         )?;
         remove_pending_nexus_download(&root, &nxm)?;
 
@@ -5060,7 +5245,7 @@ pub fn run() {
             if let Some(window) = app.get_webview_window("main") {
                 window.set_icon(APP_ICON.clone())?;
             }
-            setup_tray(app, APP_ICON.clone())?;
+            setup_tray(app, TRAY_ICON.clone())?;
             refresh_windows_shell_icons_once(app.handle());
             Ok(())
         })
@@ -9885,6 +10070,140 @@ fn extract_install_route_candidates(
     candidates
 }
 
+fn provider_install_target_options(
+    store_root: &Path,
+    profile: &GameProfile,
+    document: &ProviderRouteDocument,
+) -> Vec<InstallTargetOption> {
+    let learned = read_profile_route_knowledge(store_root, &profile.id)
+        .ok()
+        .flatten();
+    let mut options = Vec::new();
+    let mut seen = HashSet::new();
+
+    for candidate in extract_install_route_candidates(profile, &document.text) {
+        if !validate_learned_route_shape(&candidate.adapter_id, &candidate.relative_path)
+            || !route_has_safe_internal_root(
+                profile,
+                &candidate.relative_path,
+                &candidate.adapter_id,
+            )
+            || !(route_adapter_compatible(profile, &candidate.adapter_id)
+                || profile.engine == "unknown")
+        {
+            continue;
+        }
+
+        let key = install_route_key(&candidate.adapter_id, &candidate.relative_path);
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        let route_exists = safe_join(Path::new(&profile.game_path), &candidate.relative_path)
+            .map(|path| path.is_dir())
+            .unwrap_or(false);
+        let route_is_learned = learned.as_ref().is_some_and(|knowledge| {
+            knowledge.routes.iter().any(|route| {
+                install_route_key(&route.adapter_id, &route.relative_path) == key
+                    && (route.trusted || route.package_verified || route.created)
+            })
+        });
+        if !route_exists && !route_is_learned {
+            continue;
+        }
+
+        let scope = preferred_install_target_scope(&candidate.scopes);
+        let label = format!(
+            "{} ({})",
+            install_target_scope_label(&scope),
+            candidate.relative_path.replace('/', "\\")
+        );
+        options.push(InstallTargetOption {
+            id: key,
+            label,
+            relative_path: candidate.relative_path,
+            recommended: matches!(scope.as_str(), "client" | "general"),
+            scope,
+        });
+    }
+
+    options.sort_by(|first, second| {
+        second
+            .recommended
+            .cmp(&first.recommended)
+            .then_with(|| first.label.to_lowercase().cmp(&second.label.to_lowercase()))
+    });
+    if !options.is_empty() && !options.iter().any(|option| option.recommended) {
+        options[0].recommended = true;
+    }
+    options
+}
+
+fn preferred_install_target_scope(scopes: &[String]) -> String {
+    for preferred in ["client", "hosted-server", "dedicated-server", "general"] {
+        if scopes.iter().any(|scope| scope == preferred) {
+            return preferred.to_string();
+        }
+    }
+    "general".to_string()
+}
+
+fn install_target_scope_label(scope: &str) -> &'static str {
+    match scope {
+        "client" => "Game Mods",
+        "hosted-server" => "Local Server Mods",
+        "dedicated-server" => "Dedicated Server Mods",
+        _ => "Game Mods",
+    }
+}
+
+fn apply_selected_install_target(
+    store_root: &Path,
+    profile: &GameProfile,
+    document: &ProviderRouteDocument,
+    plan: &mut InstallPlan,
+    selected_target_id: Option<&str>,
+) -> Result<(), String> {
+    let Some(selected_target_id) = selected_target_id.filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    let target = provider_install_target_options(store_root, profile, document)
+        .into_iter()
+        .find(|target| target.id == selected_target_id)
+        .ok_or_else(|| {
+            "The selected install target is no longer verified for this game. Refresh Discovery and try again."
+                .to_string()
+        })?;
+    let target_path = normalize_archive_path(&target.relative_path).to_lowercase();
+    let target_prefix = format!("{target_path}/");
+    let selected_mapping_count = plan
+        .mappings
+        .iter()
+        .filter(|mapping| {
+            if !mapping.target_root.eq_ignore_ascii_case("game") {
+                return false;
+            }
+            let mapping_path = normalize_archive_path(&mapping.target_relative_path).to_lowercase();
+            mapping_path == target_path || mapping_path.starts_with(&target_prefix)
+        })
+        .count();
+    if selected_mapping_count == 0 {
+        return Err(format!(
+            "The selected target '{}' does not match this package's verified install layout. No files were changed.",
+            target.label
+        ));
+    }
+
+    plan.mappings.retain(|mapping| {
+        if !mapping.target_root.eq_ignore_ascii_case("game") {
+            return true;
+        }
+        let mapping_path = normalize_archive_path(&mapping.target_relative_path).to_lowercase();
+        mapping_path == target_path || mapping_path.starts_with(&target_prefix)
+    });
+    Ok(())
+}
+
 fn provider_text_for_route_scan(text: &str) -> String {
     let decoded = decode_provider_html_entities(text);
     let characters = decoded.chars().collect::<Vec<_>>();
@@ -11878,6 +12197,7 @@ fn nexus_manager_download_page_url(domain: &str, mod_id: u64, file_id: u64) -> S
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn install_nexus_discovered_mod(
     store_root: &Path,
     profile: &GameProfile,
@@ -11886,6 +12206,7 @@ fn install_nexus_discovered_mod(
     version: Option<String>,
     supplied_provider_game_id: Option<&str>,
     selected_file_id: Option<&str>,
+    install_target_id: Option<&str>,
 ) -> Result<InstallResult, String> {
     let api_key = settings.nexus_api_key().ok_or_else(|| {
         "Add your Nexus API key in Settings before installing Nexus mods.".to_string()
@@ -11929,6 +12250,7 @@ fn install_nexus_discovered_mod(
         &download_url,
         version,
         provider_game_id,
+        install_target_id,
         &mut visited_dependencies,
         0,
     )
@@ -11947,6 +12269,7 @@ fn install_resolved_nexus_file(
     download_url: &str,
     version: Option<String>,
     provider_game_id: String,
+    install_target_id: Option<&str>,
     visited_dependencies: &mut HashSet<String>,
     dependency_depth: usize,
 ) -> Result<InstallResult, String> {
@@ -12022,6 +12345,14 @@ fn install_resolved_nexus_file(
     let mut plan = analysis
         .recommended_plan
         .ok_or_else(|| analysis.compatibility.reason.clone())?;
+
+    apply_selected_install_target(
+        store_root,
+        profile,
+        &provider_document,
+        &mut plan,
+        install_target_id,
+    )?;
 
     append_unique_dependencies(&mut plan.dependencies, dependencies);
     plan.warnings.extend(dependency_warnings);
@@ -12157,6 +12488,7 @@ fn install_nexus_requirement_dependencies(
             &download_url,
             dependency_file.version.clone(),
             dependency_domain.clone(),
+            None,
             visited_dependencies,
             dependency_depth,
         )?;
@@ -12616,6 +12948,7 @@ fn install_thunderstore_discovered_mod(
     mod_id: &str,
     version: Option<String>,
     supplied_provider_game_id: Option<&str>,
+    install_target_id: Option<&str>,
 ) -> Result<InstallResult, String> {
     let raw_id = mod_id
         .strip_prefix("thunderstore:")
@@ -12678,6 +13011,14 @@ fn install_thunderstore_discovered_mod(
     let mut plan = analysis
         .recommended_plan
         .ok_or_else(|| analysis.compatibility.reason.clone())?;
+
+    apply_selected_install_target(
+        store_root,
+        profile,
+        &provider_document,
+        &mut plan,
+        install_target_id,
+    )?;
 
     for dependency_string in &package_version.dependencies {
         let parsed = parse_thunderstore_dependency(dependency_string);
@@ -20476,6 +20817,7 @@ mod tests {
             "thunderstore:denikson/BepInExPack_Valheim",
             None,
             Some("valheim"),
+            None,
         )
         .expect("Thunderstore BepInEx install should succeed");
         assert!(!result.files_written.is_empty());
@@ -20493,6 +20835,7 @@ mod tests {
             "thunderstore:denikson/BepInExPack_Valheim",
             None,
             Some("valheim"),
+            None,
         )
         .expect_err("installing the same Thunderstore package twice should fail");
         assert!(duplicate.contains("already installed"));
@@ -21284,6 +21627,8 @@ mod tests {
                         file_id: 620,
                         version: None,
                         provider_game_id: "7597".to_string(),
+                        replace_installed_mod_id: None,
+                        install_target_id: None,
                         created_at: now - 20,
                     },
                     PendingNexusDownload {
@@ -21293,6 +21638,8 @@ mod tests {
                         file_id: 620,
                         version: None,
                         provider_game_id: "7597".to_string(),
+                        replace_installed_mod_id: None,
+                        install_target_id: None,
                         created_at: now - 10,
                     },
                 ],
@@ -21329,6 +21676,8 @@ mod tests {
             file_id: 620,
             version: None,
             provider_game_id: "7597".to_string(),
+            replace_installed_mod_id: None,
+            install_target_id: None,
             created_at,
         };
 

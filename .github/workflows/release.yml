@@ -51,12 +51,14 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "UniLoader ${{ github.ref_name }}"
           releaseBody: |
-            UniLoader v0.9.13 keeps game artwork available instantly while moving between Library and Discover.
+            UniLoader v0.9.14 improves library clarity, install feedback, and compact-window behavior.
 
-            - Profile posters and active-game banners are cached locally after their first successful load.
-            - Cached artwork is reused across tab changes and application restarts without repeated Steam requests.
-            - A rendering-state issue that could leave valid cached artwork invisible after navigation is fixed.
-            - Mod and discovery artwork remain network-backed and are not added to the persistent game-art cache.
+            - Installed mods now expand to show descriptions, requirement status, and distinct deployment targets.
+            - Equivalent install-route aliases are deduplicated while genuinely separate server targets remain visible.
+            - Dependency checks and recent session activity are shown above the Install Vault.
+            - Nexus handoffs report active installation state and installed discovery entries reconcile correctly.
+            - The Install Vault now preserves spacing, stacks compact controls, and scrolls instead of overlapping in small windows.
+            - A dedicated high-contrast tray icon stays clear and recognizable at Windows notification-area sizes.
           releaseDraft: false
           prerelease: false
 

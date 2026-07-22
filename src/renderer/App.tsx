@@ -54,6 +54,7 @@ import {
   InstalledModRecord,
   InstallPlan,
   InstallPreflightResult,
+  OnlineInstallSelection,
   ModConfigEntry,
   ModConfigFile,
   OnlineModFileOption,
@@ -136,7 +137,13 @@ interface PendingDependencyPrompt {
   profileId: string;
   mod: OnlineModRecord;
   file?: OnlineModFileOption;
+  selection?: OnlineInstallSelection;
   preflight: InstallPreflightResult;
+}
+
+interface PendingNexusInstall {
+  profileId: string;
+  modId: string;
 }
 
 interface Notice {
@@ -144,6 +151,13 @@ interface Notice {
   kind: NoticeKind;
   title: string;
   detail: string;
+}
+
+interface RecentActivity {
+  id: number;
+  kind: NoticeKind;
+  label: string;
+  time: string;
 }
 
 type NoticeInput = Omit<Notice, "motionId">;
@@ -218,6 +232,7 @@ export function App() {
   const [onlineModTotal, setOnlineModTotal] = useState(0);
   const [modSortMode, setModSortMode] = useState<ModSortMode>("newest");
   const [installedModQuery, setInstalledModQuery] = useState("");
+  const [expandedInstalledModId, setExpandedInstalledModId] = useState("");
   const [modPresentations, setModPresentations] = useState<StoredModPresentations>(() =>
     loadStoredModPresentations()
   );
@@ -246,6 +261,7 @@ export function App() {
   const [steamGameSearch, setSteamGameSearch] = useState("");
   const [status, setStatus] = useState<string>("Ready");
   const [notice, setNoticeState] = useState<Notice | null>(null);
+  const [recentActivities, setRecentActivities] = useState<RecentActivity[]>([]);
   const [nexusSettingsAttentionId, setNexusSettingsAttentionId] = useState(0);
   const [configModal, setConfigModal] = useState<ConfigModalState | null>(null);
   const [profilePendingRename, setProfilePendingRename] = useState<GameProfile | null>(null);
@@ -257,18 +273,35 @@ export function App() {
   const [error, setErrorState] = useState<string>("");
   const [errorMotionId, setErrorMotionId] = useState(0);
   const noticeSequence = useRef(0);
+  const recentActivitySequence = useRef(0);
   const errorSequence = useRef(0);
   const updateAnnouncementShown = useRef(false);
   const installedModsRequestSequence = useRef(0);
   const discoverInstalledModsRequestSequence = useRef(0);
   const discoveryRequestSequence = useRef(0);
   const processedNxmLinks = useRef(new Set<string>());
+  const pendingNexusInstallRef = useRef<PendingNexusInstall | null>(null);
+  const pendingNexusInstallTimeoutRef = useRef<number | null>(null);
   const installSoundPlayers = useRef<Record<InstallSoundKind, HTMLAudioElement> | null>(null);
   const gameLaunchStateRef = useRef<GameLaunchState>("idle");
   const gameLaunchDeadlineRef = useRef(0);
 
   function setNotice(nextNotice: NoticeInput | null) {
     setNoticeState(nextNotice ? { ...nextNotice, motionId: ++noticeSequence.current } : null);
+    if (nextNotice) {
+      const activity: RecentActivity = {
+        id: ++recentActivitySequence.current,
+        kind: nextNotice.kind,
+        label: nextNotice.title,
+        time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+      };
+      setRecentActivities((current) => {
+        if (current[0]?.label === activity.label && current[0]?.kind === activity.kind) {
+          return [{ ...activity, id: current[0].id }, ...current.slice(1)];
+        }
+        return [activity, ...current].slice(0, 5);
+      });
+    }
   }
 
   function setError(nextError: string) {
@@ -379,6 +412,39 @@ export function App() {
     },
     [installedModQuery, installedMods, modPresentations, modSortMode]
   );
+  const dependencyChecks = useMemo(() => {
+    const checks = new Map<string, { id: string; label: string; satisfied: boolean; version?: string }>();
+    for (const mod of installedMods) {
+      if (mod.runtimeId) {
+        checks.set(`runtime:${mod.runtimeId.toLowerCase()}`, {
+          id: `runtime:${mod.runtimeId.toLowerCase()}`,
+          label: displayModName(mod),
+          satisfied: true,
+          version: mod.packageVersion
+        });
+      }
+      for (const dependency of mod.dependencies) {
+        const id = dependency.id.trim().toLowerCase();
+        if (!id) {
+          continue;
+        }
+        const existing = checks.get(id);
+        const satisfied = dependency.status === "already-installed";
+        checks.set(id, {
+          id,
+          label: dependency.name || dependency.id,
+          satisfied: existing?.satisfied || satisfied,
+          version: dependency.version ?? existing?.version
+        });
+      }
+    }
+    return [...checks.values()].sort((first, second) => {
+      if (first.satisfied !== second.satisfied) {
+        return first.satisfied ? 1 : -1;
+      }
+      return first.label.localeCompare(second.label);
+    });
+  }, [installedMods]);
   const selectedSteamGame = useMemo(
     () => steamGames.find((game) => game.appId === selectedSteamGameAppId),
     [selectedSteamGameAppId, steamGames]
@@ -732,6 +798,7 @@ export function App() {
       installedModsRequestSequence.current += 1;
       selectedProfileIdRef.current = profileId;
       setInstalledMods([]);
+      setExpandedInstalledModId("");
     }
     setSelectedProfileId(profileId);
   }
@@ -799,8 +866,10 @@ export function App() {
         continue;
       }
       processedNxmLinks.current.add(replayKey);
+      const pendingInstall = pendingNexusInstallRef.current;
+      const activeModId = pendingInstall?.modId ?? nexusModIdFromNxmUrl(nxmUrl) ?? "nexus-handoff";
       setError("");
-      setInstallingOnlineModId("nexus-handoff");
+      setInstallingOnlineModId(activeModId);
       setStatus("Installing Nexus download");
       setNotice({
         kind: "warning",
@@ -840,6 +909,11 @@ export function App() {
           detail: String(caughtError)
         });
       } finally {
+        if (pendingNexusInstallTimeoutRef.current !== null) {
+          window.clearTimeout(pendingNexusInstallTimeoutRef.current);
+          pendingNexusInstallTimeoutRef.current = null;
+        }
+        pendingNexusInstallRef.current = null;
         setInstallingOnlineModId("");
       }
     }
@@ -1584,6 +1658,7 @@ export function App() {
   async function installOnlineMod(
     mod: OnlineModRecord,
     file?: OnlineModFileOption,
+    selection?: OnlineInstallSelection,
     skipDependencyPrompt = false,
     requestedProfileId?: string
   ) {
@@ -1601,7 +1676,7 @@ export function App() {
       try {
         const preflight = await api.preflightDiscoveredModInstall(targetProfileId, mod);
         if (preflight.confirmationRequired) {
-          setPendingDependencyPrompt({ profileId: targetProfileId, mod, file, preflight });
+          setPendingDependencyPrompt({ profileId: targetProfileId, mod, file, selection, preflight });
           setStatus("Dependency confirmation needed");
           return;
         }
@@ -1619,11 +1694,26 @@ export function App() {
     }
 
     if (file?.action === "browser") {
+      setError("");
+      setInstallingOnlineModId(mod.id);
+      pendingNexusInstallRef.current = { profileId: targetProfileId, modId: mod.id };
+      if (pendingNexusInstallTimeoutRef.current !== null) {
+        window.clearTimeout(pendingNexusInstallTimeoutRef.current);
+      }
+      pendingNexusInstallTimeoutRef.current = window.setTimeout(() => {
+        if (pendingNexusInstallRef.current?.modId === mod.id) {
+          pendingNexusInstallRef.current = null;
+          setInstallingOnlineModId("");
+          setStatus("Nexus confirmation expired");
+        }
+        pendingNexusInstallTimeoutRef.current = null;
+      }, 10 * 60 * 1000);
       try {
         const downloadPageUrl = await api.beginNexusBrowserDownload(
           targetProfileId,
           mod,
-          file
+          file,
+          selection
         );
         await openExternalUrl(downloadPageUrl);
         setStatus("Waiting for Nexus confirmation");
@@ -1633,6 +1723,12 @@ export function App() {
           detail: "Click Slow download, then Open via UniLoader for automated installs."
         });
       } catch (caughtError) {
+        if (pendingNexusInstallTimeoutRef.current !== null) {
+          window.clearTimeout(pendingNexusInstallTimeoutRef.current);
+          pendingNexusInstallTimeoutRef.current = null;
+        }
+        pendingNexusInstallRef.current = null;
+        setInstallingOnlineModId("");
         playInstallSound("failure");
         setError(String(caughtError));
         setStatus("Nexus handoff failed");
@@ -1663,7 +1759,7 @@ export function App() {
     setInstallingOnlineModId(mod.id);
     setStatus("Installing online mod");
     try {
-      const result = await api.installDiscoveredMod(targetProfileId, mod, file);
+      const result = await api.installDiscoveredMod(targetProfileId, mod, file, selection);
       playInstallSound("success");
       setOnlineInstallCompletionId((current) => current + 1);
       if (discoverProfileIdRef.current === targetProfileId) {
@@ -1740,7 +1836,7 @@ export function App() {
       return;
     }
 
-    await installOnlineMod(prompt.mod, prompt.file, true, prompt.profileId);
+    await installOnlineMod(prompt.mod, prompt.file, prompt.selection, true, prompt.profileId);
   }
 
   function openNexusAuthSettings() {
@@ -2382,6 +2478,67 @@ export function App() {
 
           <div className="main-grid">
             <section className="work-panel analysis-panel">
+              <div className="vault-insight-stack">
+                <section className="vault-insight-section" aria-label="Dependency checks">
+                  <div className="vault-insight-heading">
+                    <div>
+                      <p className="eyebrow">Dependency checks</p>
+                      <strong>Requirements</strong>
+                    </div>
+                    <span>{dependencyChecks.length}</span>
+                  </div>
+                  <div className="vault-insight-list">
+                    {dependencyChecks.length > 0 ? (
+                      dependencyChecks.slice(0, 3).map((dependency) => (
+                        <div
+                          className={dependency.satisfied ? "vault-insight-item success" : "vault-insight-item warning"}
+                          key={dependency.id}
+                        >
+                          {dependency.satisfied ? <CheckCircle2 size={14} /> : <AlertTriangle size={14} />}
+                          <span title={dependency.label}>{dependency.label}</span>
+                          <small>{dependency.version ? `v${dependency.version}` : dependency.satisfied ? "OK" : "Missing"}</small>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="vault-insight-item success empty">
+                        <CheckCircle2 size={14} />
+                        <span>No missing requirements</span>
+                        <small>OK</small>
+                      </div>
+                    )}
+                    {dependencyChecks.length > 3 ? (
+                      <small className="vault-insight-more">+{dependencyChecks.length - 3} more checked</small>
+                    ) : null}
+                  </div>
+                </section>
+
+                <section className="vault-insight-section" aria-label="Recent actions">
+                  <div className="vault-insight-heading">
+                    <div>
+                      <p className="eyebrow">Recent actions</p>
+                      <strong>Session activity</strong>
+                    </div>
+                    <Activity size={16} />
+                  </div>
+                  <div className="vault-insight-list">
+                    {recentActivities.length > 0 ? (
+                      recentActivities.slice(0, 4).map((activity) => (
+                        <div className={`vault-activity-item ${activity.kind}`} key={activity.id}>
+                          {activity.kind === "success" ? <CheckCircle2 size={14} /> : <AlertTriangle size={14} />}
+                          <span title={activity.label}>{activity.label}</span>
+                          <time>{activity.time}</time>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="vault-activity-item idle">
+                        <Activity size={14} />
+                        <span>No recent actions</span>
+                      </div>
+                    )}
+                  </div>
+                </section>
+              </div>
+
               <div className="panel-title-row">
                 <div>
                   <p className="eyebrow">Install vault</p>
@@ -2458,6 +2615,7 @@ export function App() {
               <div className="history-list">
                 {sortedInstalledMods.map((mod) => (
                   <ModCard
+                    expanded={expandedInstalledModId === mod.id}
                     key={mod.id}
                     mod={mod}
                     presentation={getStoredModPresentation(mod, modPresentations)}
@@ -2465,6 +2623,9 @@ export function App() {
                     onEnable={() => void handleModAction("enable", mod)}
                     onDisable={() => void handleModAction("disable", mod)}
                     onRemove={() => void handleModAction("remove", mod)}
+                    onToggleDetails={() =>
+                      setExpandedInstalledModId((current) => current === mod.id ? "" : mod.id)
+                    }
                   />
                 ))}
                 {installedMods.length === 0 ? (
@@ -3608,19 +3769,25 @@ function DiscoverView({
               onChange={changePage}
             />
           ) : null}
-          {visibleMods.map((mod) => (
-            <OnlineModCard
-              expanded={expandedModId === mod.id}
-              installing={installingModId === mod.id}
-              key={`${mod.provider}:${mod.id}:${mod.version}`}
-              mod={mod}
-              onInstall={onInstall}
-              onLoadFiles={onLoadFiles}
-              onNeedsAuth={onNeedsAuth}
-              onOpenPage={onOpenPage}
-              onToggle={() => setExpandedModId((current) => (current === mod.id ? "" : mod.id))}
-            />
-          ))}
+          {visibleMods.map((mod) => {
+            const installedMod = installedMods.find((item) =>
+              installedRecordMatchesOnlineMod(item, mod)
+            );
+            const displayedMod = installedMod && !mod.installed ? { ...mod, installed: true } : mod;
+            return (
+              <OnlineModCard
+                expanded={expandedModId === mod.id}
+                installing={installingModId === mod.id}
+                key={`${mod.provider}:${mod.id}:${mod.version}`}
+                mod={displayedMod}
+                onInstall={onInstall}
+                onLoadFiles={onLoadFiles}
+                onNeedsAuth={onNeedsAuth}
+                onOpenPage={onOpenPage}
+                onToggle={() => setExpandedModId((current) => (current === mod.id ? "" : mod.id))}
+              />
+            );
+          })}
           {!isLoading && !hasLoaded ? (
             <div className="empty-mods discover-empty">
               <Compass size={26} />
@@ -3865,7 +4032,6 @@ function OnlineModCard({
     !selectedFile ||
     selectedFile.action === "unsupported" ||
     selectedFile.action === "auth";
-
   useEffect(() => {
     fileRequestSequence.current += 1;
     setFiles([]);
@@ -4392,6 +4558,23 @@ function nexusNxmReplayKey(rawUrl: string): string | null {
       return null;
     }
     return `${parsed.hostname.toLowerCase()}${parsed.pathname}?expires=${parsed.searchParams.get("expires") ?? ""}&user_id=${parsed.searchParams.get("user_id") ?? ""}`;
+  } catch {
+    return null;
+  }
+}
+
+function nexusModIdFromNxmUrl(rawUrl: string): string | null {
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol.toLowerCase() !== "nxm:") {
+      return null;
+    }
+    const parts = parsed.pathname.split("/").filter(Boolean);
+    const modsIndex = parts.findIndex((part) => part.toLowerCase() === "mods");
+    const modId = modsIndex >= 0 ? parts[modsIndex + 1] : undefined;
+    return modId && /^\d+$/.test(modId)
+      ? `nexus:${parsed.hostname.toLowerCase()}/${modId}`
+      : null;
   } catch {
     return null;
   }
@@ -4951,12 +5134,98 @@ function DropZone({
 }
 
 interface ModCardProps {
+  expanded: boolean;
   mod: InstalledModRecord;
   presentation: StoredModPresentation;
   onConfigure(): void;
   onEnable(): void;
   onDisable(): void;
   onRemove(): void;
+  onToggleDetails(): void;
+}
+
+interface InstalledModTarget {
+  id: string;
+  label: string;
+  path: string;
+}
+
+function normalizedInstallPath(value: string): string {
+  return value.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+}
+
+function installTargetDirectory(value: string): string {
+  const normalized = normalizedInstallPath(value);
+  const separator = normalized.lastIndexOf("/");
+  return separator > 0 ? normalized.slice(0, separator) : normalized;
+}
+
+function installTargetLabel(path: string): string {
+  const normalized = `/${normalizedInstallPath(path).toLowerCase()}/`;
+  if (normalized.includes("/builds/windowsserver/") || normalized.includes("/windowsserver/")) {
+    return "Local Server Mods";
+  }
+  if (normalized.includes("/dedicated") || normalized.includes("dedicated/")) {
+    return "Dedicated Server Mods";
+  }
+  if (normalized.includes("/engine/binaries/")) {
+    return "Engine Mods";
+  }
+  if (normalized.includes("/ue4ss/mods/")) {
+    return "Game Mods (UE4SS)";
+  }
+  return "Game Mods";
+}
+
+function installedModTargets(mod: InstalledModRecord): InstalledModTarget[] {
+  if (mod.runtimeId || !mod.plan?.mappings.length) {
+    return [];
+  }
+
+  const targetsBySource = new Map<string, Set<string>>();
+  for (const mapping of mod.plan.mappings) {
+    const source = normalizedInstallPath(mapping.sourcePath).toLowerCase();
+    const directory = installTargetDirectory(mapping.targetRelativePath);
+    if (!source || !directory) {
+      continue;
+    }
+    const targets = targetsBySource.get(source) ?? new Set<string>();
+    targets.add(directory);
+    targetsBySource.set(source, targets);
+  }
+
+  const alternativePaths = new Set<string>();
+  for (const targets of targetsBySource.values()) {
+    if (targets.size > 1) {
+      targets.forEach((target) => alternativePaths.add(target));
+    }
+  }
+
+  const sortedPaths = [...alternativePaths].sort((first, second) => {
+    const firstServer = /(?:^|\/)windowsserver(?:\/|$)/i.test(first);
+    const secondServer = /(?:^|\/)windowsserver(?:\/|$)/i.test(second);
+    if (firstServer !== secondServer) {
+      return firstServer ? 1 : -1;
+    }
+    return first.localeCompare(second);
+  });
+
+  // Different route aliases can resolve to the same user-facing destination.
+  const targetsByPurpose = new Map<string, InstalledModTarget>();
+  for (const path of sortedPaths) {
+    const normalizedPath = normalizedInstallPath(path);
+    const label = installTargetLabel(normalizedPath);
+    const purpose = label.toLowerCase();
+    if (!targetsByPurpose.has(purpose)) {
+      targetsByPurpose.set(purpose, {
+        id: normalizedPath.toLowerCase(),
+        label,
+        path: normalizedPath
+      });
+    }
+  }
+
+  return [...targetsByPurpose.values()];
 }
 
 interface ConfigModalProps {
@@ -5275,66 +5544,146 @@ function isTruthyConfigValue(value: string): boolean {
 }
 
 function ModCard({
+  expanded,
   mod,
   presentation,
   onConfigure,
   onEnable,
   onDisable,
-  onRemove
+  onRemove,
+  onToggleDetails
 }: ModCardProps) {
   const configFiles = mod.configFiles ?? [];
   const dependencies = mod.dependencies ?? [];
   const modName = displayModName(mod);
   const isRuntime = Boolean(mod.runtimeId);
+  const targets = installedModTargets(mod);
+  const description =
+    presentation.description?.trim() ||
+    mod.summary?.trim() ||
+    "No description was included with this installed mod.";
 
   return (
-    <article className={`mod-card vault-mod-row ${mod.enabled ? "enabled" : "disabled"}${isRuntime ? " runtime" : ""}`}>
-      <ModArtwork mod={mod} name={modName} presentation={presentation} />
-      <div className="vault-mod-identity">
-        <strong title={mod.archiveName}>{modName}</strong>
-        <div className="vault-mod-byline">
-          <span>{presentation.owner ?? "Local package"}</span>
-          {presentation.version ? <span>v{presentation.version}</span> : null}
-          <span>{presentation.providerLabel ?? adapterDisplayName(mod.adapterId)}</span>
+    <article
+      className={`mod-card vault-mod-row ${mod.enabled ? "enabled" : "disabled"}${isRuntime ? " runtime" : ""}${expanded ? " expanded" : ""}`}
+    >
+      <div className="vault-mod-summary">
+        <ModArtwork mod={mod} name={modName} presentation={presentation} />
+        <div className="vault-mod-identity">
+          <strong title={mod.archiveName}>{modName}</strong>
+          <div className="vault-mod-byline">
+            <span>{presentation.owner ?? "Local package"}</span>
+            {presentation.version ? <span>v{presentation.version}</span> : null}
+            <span>{presentation.providerLabel ?? adapterDisplayName(mod.adapterId)}</span>
+          </div>
+          <small title={mod.summary}>
+            {isRuntime
+              ? mod.externallyManaged ? "Detected runtime" : "Managed runtime"
+              : dependencies.length > 0
+                ? `${dependencies.length} dependenc${dependencies.length === 1 ? "y" : "ies"} satisfied`
+                : `${mod.filesWritten.length} managed file${mod.filesWritten.length === 1 ? "" : "s"}`}
+          </small>
         </div>
-        <small title={mod.summary}>
-          {isRuntime
-            ? mod.externallyManaged ? "Detected runtime" : "Managed runtime"
-            : dependencies.length > 0
-              ? `${dependencies.length} dependenc${dependencies.length === 1 ? "y" : "ies"} satisfied`
-              : `${mod.filesWritten.length} managed file${mod.filesWritten.length === 1 ? "" : "s"}`}
-        </small>
-      </div>
-      <label
-        className="vault-mod-toggle"
-        title={isRuntime ? "Required runtimes remain enabled" : `${mod.enabled ? "Disable" : "Enable"} ${modName}`}
-      >
-        <span>{mod.enabled ? "ON" : "OFF"}</span>
-        <input
-          aria-label={`${mod.enabled ? "Disable" : "Enable"} ${modName}`}
-          checked={mod.enabled}
-          disabled={isRuntime}
-          onChange={(event) => event.currentTarget.checked ? onEnable() : onDisable()}
-          type="checkbox"
-        />
-        <i><b /></i>
-      </label>
-      <div className="vault-mod-actions">
-        {isRuntime ? (
-          <span className="vault-mod-protected" title="Required runtimes are protected so installed mods keep working.">
-            <ShieldCheck size={17} />
-          </span>
-        ) : (
-          <button aria-label={`Remove ${modName}`} className="vault-mod-remove" onClick={onRemove} title="Remove mod" type="button">
-            <X size={18} />
+        <label
+          className="vault-mod-toggle"
+          title={isRuntime ? "Required runtimes remain enabled" : `${mod.enabled ? "Disable" : "Enable"} ${modName}`}
+        >
+          <span>{mod.enabled ? "ON" : "OFF"}</span>
+          <input
+            aria-label={`${mod.enabled ? "Disable" : "Enable"} ${modName}`}
+            checked={mod.enabled}
+            disabled={isRuntime}
+            onChange={(event) => event.currentTarget.checked ? onEnable() : onDisable()}
+            type="checkbox"
+          />
+          <i><b /></i>
+        </label>
+        <div className="vault-mod-actions">
+          {isRuntime ? (
+            <span className="vault-mod-protected" title="Required runtimes are protected so installed mods keep working.">
+              <ShieldCheck size={17} />
+            </span>
+          ) : (
+            <button aria-label={`Remove ${modName}`} className="vault-mod-remove" onClick={onRemove} title="Remove mod" type="button">
+              <X size={18} />
+            </button>
+          )}
+          {configFiles.length > 0 ? (
+            <button aria-label={`Configure ${modName}`} className="vault-mod-config" onClick={onConfigure} title="Configure mod" type="button">
+              <Settings2 size={18} />
+            </button>
+          ) : null}
+          <button
+            aria-expanded={expanded}
+            aria-label={`${expanded ? "Hide" : "Show"} details for ${modName}`}
+            className="vault-mod-expand"
+            onClick={onToggleDetails}
+            title={expanded ? "Hide details" : "Show details"}
+            type="button"
+          >
+            {expanded ? <ChevronUp size={18} /> : <ChevronDown size={18} />}
           </button>
-        )}
-        {configFiles.length > 0 ? (
-          <button aria-label={`Configure ${modName}`} className="vault-mod-config" onClick={onConfigure} title="Configure mod" type="button">
-            <Settings2 size={18} />
-          </button>
-        ) : null}
+        </div>
       </div>
+
+      {expanded ? (
+        <div className="vault-mod-details">
+          <section className="vault-mod-detail-section">
+            <p className="vault-mod-detail-label">Description</p>
+            <p className="vault-mod-description">{description}</p>
+          </section>
+
+          <section className="vault-mod-detail-section">
+            <p className="vault-mod-detail-label">Requirements</p>
+            <div className="vault-mod-requirements">
+              {dependencies.length > 0 ? dependencies.map((dependency) => {
+                const satisfied = dependency.status === "already-installed";
+                return (
+                  <div
+                    className={satisfied ? "vault-mod-requirement satisfied" : "vault-mod-requirement attention"}
+                    key={dependency.id}
+                  >
+                    {satisfied ? <CheckCircle2 size={17} /> : <AlertTriangle size={17} />}
+                    <span>
+                      <strong>{dependency.name || dependency.id}</strong>
+                      <small>
+                        {dependency.version ? `v${dependency.version} / ` : ""}
+                        {satisfied ? "Installed" : dependency.status === "manual" ? "Manual requirement" : "Needs attention"}
+                      </small>
+                    </span>
+                  </div>
+                );
+              }) : (
+                <div className="vault-mod-requirement satisfied">
+                  <CheckCircle2 size={17} />
+                  <span>
+                    <strong>No additional requirements</strong>
+                    <small>Ready</small>
+                  </span>
+                </div>
+              )}
+            </div>
+          </section>
+
+          {targets.length > 1 ? (
+            <section className="vault-mod-detail-section">
+              <p className="vault-mod-detail-label">Install targets</p>
+              <div className="vault-mod-targets">
+                {targets.map((target, index) => (
+                  <div className="vault-mod-target" key={target.id}>
+                    <CheckCircle2 size={17} />
+                    <span>
+                      <strong>{target.label}</strong>
+                      <small>{target.path}</small>
+                    </span>
+                    {index === 0 ? <b>Primary</b> : <b>Installed</b>}
+                  </div>
+                ))}
+              </div>
+            </section>
+          ) : null}
+        </div>
+      ) : null}
     </article>
   );
 }

@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="tray-gold" x1="12" y1="7" x2="52" y2="58" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F5D88F"/>
+      <stop offset="0.48" stop-color="#D9A84F"/>
+      <stop offset="1" stop-color="#A36E27"/>
+    </linearGradient>
+  </defs>
+  <path
+    d="M32 2.5 59 13.2v19.4c0 15.9-9.7 25.1-27 29.2C14.7 57.7 5 48.5 5 32.6V13.2L32 2.5Z"
+    fill="#0B1011"
+    stroke="url(#tray-gold)"
+    stroke-width="4"
+    stroke-linejoin="round"
+  />
+  <path
+    d="M15.5 15.5h11.1v19.8c0 6.2 1.8 10.2 5.4 12.9 3.6-2.7 5.4-6.7 5.4-12.9V15.5h11.1v20.2c0 11.5-6 18.5-16.5 23.1-10.5-4.6-16.5-11.6-16.5-23.1V15.5Z"
+    fill="url(#tray-gold)"
+  />
+  <path d="m26.6 15.5 5.4-5.4 5.4 5.4-5.4 5.4-5.4-5.4Z" fill="#F8E7BA"/>
+</svg>
