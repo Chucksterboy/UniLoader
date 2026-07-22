@@ -51,11 +51,15 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "UniLoader ${{ github.ref_name }}"
           releaseBody: |
-            UniLoader v0.9.16 improves the mod library at compact window sizes.
+            UniLoader v0.9.17 improves responsiveness and hardens profile, discovery, configuration, and update workflows.
 
-            - The installed-mod list now follows the actual space available inside its panel instead of a viewport estimate.
-            - The final mod can always be scrolled completely above the fixed status bar.
-            - A small end inset keeps the last row and its controls comfortably visible at every supported window height.
+            - Blocking profile and filesystem work now runs away from the UI thread, with serialized mutations and safer rollback behavior.
+            - Discovery requests can be cancelled, stale responses are ignored, paging is more resilient, and provider caches are bounded.
+            - Profile state, installed-mod presentation, Steam artwork, and runtime/provider caches now have clearer ownership and limits.
+            - Configuration updates preserve comments and formatting while rejecting unsafe value-type changes.
+            - Update downloads receive stronger filename, size, file-format, and SHA-256 validation before execution.
+            - Restrained view, modal, notification, and row transitions make the interface feel smoother while respecting reduced-motion settings.
+            - Compact layouts keep the Install Vault controls clear and usable at the minimum supported window size.
           releaseDraft: false
           prerelease: false
 
