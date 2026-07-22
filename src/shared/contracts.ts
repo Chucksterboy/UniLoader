@@ -56,6 +56,7 @@ export interface GameProfile {
   setupStatus: "setting-up" | "ready" | "needs-action" | "failed";
   setupWarnings: string[];
   setupUpdatedAt?: string;
+  modsEnabled: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -503,6 +504,7 @@ export interface DesktopApi {
   beginNexusRequirementDownload(profileId: string, dependencyId: string): Promise<string>;
   installNexusNxmLink(nxmUrl: string): Promise<NexusNxmInstallResult>;
   listInstalledMods(profileId: string): Promise<InstalledModRecord[]>;
+  refreshInstalledModArtwork(profileId: string): Promise<InstalledModRecord[]>;
   getModConfigDetails(profileId: string, installedModId: string): Promise<ModConfigFile[]>;
   updateModConfigValue(input: UpdateModConfigValueInput): Promise<ModConfigFile>;
   disableMod(profileId: string, installedModId: string): Promise<ModActionResult>;

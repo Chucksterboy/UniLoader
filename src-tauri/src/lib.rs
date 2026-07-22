@@ -1,3 +1,5 @@
+mod operation;
+
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use chrono::Utc;
@@ -33,6 +35,7 @@ const MAX_CONFIG_SCAN_DEPTH: usize = 5;
 const MAX_PROFILE_CONFIG_FILES: usize = 500;
 const MAX_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_STEAM_ARTWORK_BYTES: u64 = 8 * 1024 * 1024;
+const STEAM_GAMES_CACHE_TTL: Duration = Duration::from_secs(5);
 const MAX_DOWNLOAD_ATTEMPTS: usize = 3;
 const DOWNLOAD_RETRY_BASE_DELAY_MS: u64 = 350;
 const DOWNLOAD_RETRY_MAX_DELAY_SECS: u64 = 5;
@@ -93,6 +96,8 @@ static PROFILE_RUNTIME_INFERENCE_CACHE: OnceLock<
     Mutex<HashMap<String, RuntimeInferenceCacheEntry>>,
 > = OnceLock::new();
 static DISCOVERY_PROVIDER_CACHE: OnceLock<Mutex<HashMap<String, DiscoveryProviderCacheEntry>>> =
+    OnceLock::new();
+static STEAM_GAMES_CACHE: OnceLock<Mutex<Option<(Instant, Vec<SteamGameRecord>)>>> =
     OnceLock::new();
 static RUNTIME_REGISTRY: OnceLock<Vec<RuntimeDefinition>> = OnceLock::new();
 static DEPENDENCY_PROVIDER_REGISTRY: OnceLock<Vec<DependencyProviderDefinition>> = OnceLock::new();
@@ -216,6 +221,8 @@ pub struct GameProfile {
     setup_warnings: Vec<String>,
     #[serde(default)]
     setup_updated_at: Option<String>,
+    #[serde(default = "default_true")]
+    mods_enabled: bool,
     created_at: String,
     updated_at: String,
 }
@@ -1351,7 +1358,15 @@ fn check_app_update_impl() -> AppUpdateInfo {
 }
 
 #[tauri::command]
-fn list_profiles(app: AppHandle) -> Result<Vec<GameProfile>, String> {
+async fn list_profiles(app: AppHandle) -> Result<Vec<GameProfile>, String> {
+    let task_app = app.clone();
+    operation::run_blocking(app, "list_profiles", None, move || {
+        list_profiles_sync(task_app)
+    })
+    .await
+}
+
+fn list_profiles_sync(app: AppHandle) -> Result<Vec<GameProfile>, String> {
     let root = store_root(&app)?;
     let path = profiles_path(&root);
     let mut store = read_store::<GameProfile>(&path).map_err(error_to_string)?;
@@ -1402,7 +1417,7 @@ fn list_profiles(app: AppHandle) -> Result<Vec<GameProfile>, String> {
         write_store(&path, &store).map_err(error_to_string)?;
     }
 
-    let installed_steam_games = scan_steam_games_impl()
+    let installed_steam_games = scan_steam_games_cached()
         .into_iter()
         .map(|game| {
             (
@@ -1466,6 +1481,7 @@ fn create_profile_in_store(root: &Path, input: CreateProfileInput) -> Result<Gam
         setup_status: "setting-up".to_string(),
         setup_warnings: Vec::new(),
         setup_updated_at: Some(now.clone()),
+        mods_enabled: true,
         created_at: now.clone(),
         updated_at: now,
     };
@@ -1478,9 +1494,13 @@ fn create_profile_in_store(root: &Path, input: CreateProfileInput) -> Result<Gam
 
 #[tauri::command]
 async fn scan_steam_games() -> Result<Vec<SteamGameRecord>, String> {
-    tauri::async_runtime::spawn_blocking(scan_steam_games_impl)
-        .await
-        .map_err(error_to_string)
+    tauri::async_runtime::spawn_blocking(|| {
+        let games = scan_steam_games_impl();
+        update_steam_games_cache(&games);
+        games
+    })
+    .await
+    .map_err(error_to_string)
 }
 
 #[tauri::command]
@@ -1670,7 +1690,7 @@ fn verify_installed_steam_game(requested: &SteamGameRecord) -> Result<SteamGameR
         normalize_profile_game_path(&requested.install_dir).trim_end_matches(['/', '\\']),
     );
 
-    scan_steam_games_impl()
+    scan_steam_games_cached()
         .into_iter()
         .find(|installed| {
             installed.app_id == requested.app_id
@@ -1703,25 +1723,37 @@ fn ensure_verified_steam_profile(profile: &GameProfile) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn launch_profile_game(
+async fn launch_profile_game(
     app: AppHandle,
     profile_id: String,
     mods_enabled: bool,
 ) -> Result<(), String> {
-    let _operation = lock_mutations()?;
-    let root = store_root(&app)?;
-    let profile = get_profile(&root, &profile_id)?;
-    let steam_app_id = profile
-        .steam_app_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|app_id| !app_id.is_empty())
-        .ok_or_else(|| {
-            "This profile does not have a Steam App ID yet. Add it through Steam scan to launch it from UniLoader.".to_string()
-        })?;
+    let operation_profile_id = profile_id.clone();
+    let task_app = app.clone();
+    operation::run_blocking(
+        app,
+        "launch_profile_game",
+        Some(operation_profile_id),
+        move || {
+            let _profile_operation = operation::lock_profile(&profile_id)?;
+            let _operation = lock_mutations()?;
+            let root = store_root(&task_app)?;
+            let profile = get_profile(&root, &profile_id)?;
+            let steam_app_id = profile
+                .steam_app_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|app_id| !app_id.is_empty())
+                .ok_or_else(|| {
+                    "This profile does not have a Steam App ID yet. Add it through Steam scan to launch it from UniLoader.".to_string()
+                })?;
 
-    prepare_profile_mod_launch(&root, &profile, mods_enabled)?;
-    open_url_in_shell(&format!("steam://run/{steam_app_id}"))
+            prepare_profile_mod_launch(&root, &profile, mods_enabled)?;
+            persist_profile_launch_mode(&root, &profile_id, mods_enabled)?;
+            open_url_in_shell(&format!("steam://run/{steam_app_id}"))
+        },
+    )
+    .await
 }
 
 #[tauri::command]
@@ -1730,35 +1762,53 @@ async fn set_profile_mod_launch_mode(
     profile_id: String,
     mods_enabled: bool,
 ) -> Result<ProfileLaunchModeResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let _operation = lock_mutations()?;
-        let root = store_root(&app)?;
-        let profile = get_profile(&root, &profile_id)?;
-        let changed_components = prepare_profile_mod_launch(&root, &profile, mods_enabled)?;
-        Ok(ProfileLaunchModeResult {
-            profile_id,
-            mods_enabled,
-            changed_components,
-        })
-    })
+    let operation_profile_id = profile_id.clone();
+    let task_app = app.clone();
+    operation::run_blocking(
+        app,
+        "set_profile_mod_launch_mode",
+        Some(operation_profile_id),
+        move || {
+            let _profile_operation = operation::lock_profile(&profile_id)?;
+            let _operation = lock_mutations()?;
+            let root = store_root(&task_app)?;
+            let profile = get_profile(&root, &profile_id)?;
+            let changed_components = prepare_profile_mod_launch(&root, &profile, mods_enabled)?;
+            persist_profile_launch_mode(&root, &profile_id, mods_enabled)?;
+            Ok(ProfileLaunchModeResult {
+                profile_id,
+                mods_enabled,
+                changed_components,
+            })
+        },
+    )
     .await
-    .map_err(error_to_string)?
 }
 
 #[tauri::command]
-fn profile_game_running(app: AppHandle, profile_id: String) -> Result<bool, String> {
-    let root = store_root(&app)?;
-    let profile = get_profile(&root, &profile_id)?;
-    if profile
-        .steam_app_id
-        .as_deref()
-        .map(str::trim)
-        .is_none_or(str::is_empty)
-    {
-        return Ok(false);
-    }
+async fn profile_game_running(app: AppHandle, profile_id: String) -> Result<bool, String> {
+    let operation_profile_id = profile_id.clone();
+    let task_app = app.clone();
+    operation::run_blocking(
+        app,
+        "profile_game_running",
+        Some(operation_profile_id),
+        move || {
+            let root = store_root(&task_app)?;
+            let profile = get_profile(&root, &profile_id)?;
+            if profile
+                .steam_app_id
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(str::is_empty)
+            {
+                return Ok(false);
+            }
 
-    game_process_running(Path::new(&profile.game_path))
+            game_process_running(Path::new(&profile.game_path))
+        },
+    )
+    .await
 }
 
 #[cfg(target_os = "windows")]
@@ -1898,6 +1948,26 @@ fn scan_steam_games_impl() -> Vec<SteamGameRecord> {
             .then_with(|| first.app_id.cmp(&second.app_id))
     });
     games
+}
+
+fn scan_steam_games_cached() -> Vec<SteamGameRecord> {
+    if let Ok(cache) = STEAM_GAMES_CACHE.get_or_init(|| Mutex::new(None)).lock() {
+        if let Some((fetched_at, games)) = cache.as_ref() {
+            if fetched_at.elapsed() <= STEAM_GAMES_CACHE_TTL {
+                return games.clone();
+            }
+        }
+    }
+
+    let games = scan_steam_games_impl();
+    update_steam_games_cache(&games);
+    games
+}
+
+fn update_steam_games_cache(games: &[SteamGameRecord]) {
+    if let Ok(mut cache) = STEAM_GAMES_CACHE.get_or_init(|| Mutex::new(None)).lock() {
+        *cache = Some((Instant::now(), games.to_vec()));
+    }
 }
 
 fn is_user_steam_game(game: &SteamGameRecord) -> bool {
@@ -2371,8 +2441,6 @@ fn refresh_profile_sync(
     let adopted_native_script_mods =
         adopt_existing_native_script_mods(&root, &profile, &mut installed_store)?;
     ensure_visible_runtime_records(&root, &profile, &mut installed_store)?;
-    let settings = read_app_settings(&root).ok();
-    backfill_installed_mod_artwork(&root, &profile, settings.as_ref(), &mut installed_store);
     let mut mod_file_health = Vec::new();
     let mut missing_dependencies = Vec::new();
     let mut dependency_keys = HashSet::new();
@@ -4674,7 +4742,22 @@ async fn install_nexus_nxm_link(
 }
 
 #[tauri::command]
-fn list_installed_mods(
+async fn list_installed_mods(
+    app: AppHandle,
+    profile_id: String,
+) -> Result<Vec<InstalledModRecord>, String> {
+    let operation_profile_id = profile_id.clone();
+    let task_app = app.clone();
+    operation::run_blocking(
+        app,
+        "list_installed_mods",
+        Some(operation_profile_id),
+        move || list_installed_mods_sync(task_app, profile_id),
+    )
+    .await
+}
+
+fn list_installed_mods_sync(
     app: AppHandle,
     profile_id: String,
 ) -> Result<Vec<InstalledModRecord>, String> {
@@ -4711,6 +4794,67 @@ fn list_installed_mods(
             record
         })
         .collect())
+}
+
+#[tauri::command]
+async fn refresh_installed_mod_artwork(
+    app: AppHandle,
+    profile_id: String,
+) -> Result<Vec<InstalledModRecord>, String> {
+    let operation_profile_id = profile_id.clone();
+    let task_app = app.clone();
+    operation::run_blocking(
+        app,
+        "refresh_installed_mod_artwork",
+        Some(operation_profile_id),
+        move || refresh_installed_mod_artwork_sync(task_app, profile_id),
+    )
+    .await
+}
+
+fn refresh_installed_mod_artwork_sync(
+    app: AppHandle,
+    profile_id: String,
+) -> Result<Vec<InstalledModRecord>, String> {
+    let root = store_root(&app)?;
+    let profile = get_profile(&root, &profile_id)?;
+    let settings = read_app_settings(&root).ok();
+    let store_path = installed_mods_path(&root);
+    let mut enriched = read_store::<InstalledModRecord>(&store_path).map_err(error_to_string)?;
+    let changed = backfill_installed_mod_artwork(&root, &profile, settings.as_ref(), &mut enriched);
+
+    if changed > 0 {
+        let _operation = lock_mutations()?;
+        let mut current = read_store::<InstalledModRecord>(&store_path).map_err(error_to_string)?;
+        let artwork = enriched
+            .items
+            .iter()
+            .filter(|record| record.profile_id == profile_id)
+            .map(|record| {
+                (
+                    record.id.as_str(),
+                    (record.icon_url.clone(), record.package_id.clone()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        for record in current
+            .items
+            .iter_mut()
+            .filter(|record| record.profile_id == profile_id)
+        {
+            if let Some((icon_url, package_id)) = artwork.get(record.id.as_str()) {
+                if record.icon_url.is_none() {
+                    record.icon_url.clone_from(icon_url);
+                }
+                if record.package_id.is_none() {
+                    record.package_id.clone_from(package_id);
+                }
+            }
+        }
+        write_store(&store_path, &current).map_err(error_to_string)?;
+    }
+
+    list_installed_mods_sync(app, profile_id)
 }
 
 #[tauri::command]
@@ -5309,6 +5453,7 @@ pub fn run() {
             begin_nexus_requirement_download,
             install_nexus_nxm_link,
             list_installed_mods,
+            refresh_installed_mod_artwork,
             get_mod_config_details,
             update_mod_config_value,
             disable_mod,
@@ -15111,6 +15256,23 @@ fn prepare_profile_mod_launch(
     }
 }
 
+fn persist_profile_launch_mode(
+    store_root: &Path,
+    profile_id: &str,
+    mods_enabled: bool,
+) -> Result<(), String> {
+    let profiles_file = profiles_path(store_root);
+    let mut profiles = read_store::<GameProfile>(&profiles_file).map_err(error_to_string)?;
+    let profile = profiles
+        .items
+        .iter_mut()
+        .find(|profile| profile.id == profile_id)
+        .ok_or_else(|| format!("Profile not found: {profile_id}"))?;
+    profile.mods_enabled = mods_enabled;
+    profile.updated_at = now_string();
+    write_store(&profiles_file, &profiles).map_err(error_to_string)
+}
+
 fn record_is_uniloader_owned(record: &InstalledModRecord) -> bool {
     if record.externally_managed {
         return false;
@@ -17335,6 +17497,10 @@ fn default_enabled() -> bool {
 
 fn default_profile_setup_status() -> String {
     "ready".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn apply_profile_setup_outcome(profile: &mut GameProfile, warnings: Vec<String>) {
@@ -19867,6 +20033,7 @@ mod tests {
             setup_status: default_profile_setup_status(),
             setup_warnings: Vec::new(),
             setup_updated_at: None,
+            mods_enabled: true,
         };
         let record = |id: &str,
                       file: &Path,
@@ -20004,6 +20171,7 @@ mod tests {
             setup_status: default_profile_setup_status(),
             setup_warnings: Vec::new(),
             setup_updated_at: None,
+            mods_enabled: true,
         };
         let record_id = "managed-runtime";
         let backup_file =
@@ -20240,6 +20408,7 @@ mod tests {
             setup_status: default_profile_setup_status(),
             setup_warnings: Vec::new(),
             setup_updated_at: None,
+            mods_enabled: true,
         };
         let windrose_candidates = provider_slug_candidates(&windrose);
         assert!(windrose_candidates.contains(&"windrose".to_string()));
@@ -20258,6 +20427,7 @@ mod tests {
             setup_status: default_profile_setup_status(),
             setup_warnings: Vec::new(),
             setup_updated_at: None,
+            mods_enabled: true,
         };
         let dragonwilds_candidates = provider_slug_candidates(&dragonwilds);
         assert!(dragonwilds_candidates.contains(&"dragonwilds".to_string()));
@@ -20299,6 +20469,7 @@ mod tests {
             setup_status: default_profile_setup_status(),
             setup_warnings: Vec::new(),
             setup_updated_at: None,
+            mods_enabled: true,
         };
         let client = provider_client().unwrap();
 
@@ -20324,6 +20495,7 @@ mod tests {
             setup_status: default_profile_setup_status(),
             setup_warnings: Vec::new(),
             setup_updated_at: None,
+            mods_enabled: true,
         };
         let plan = InstallPlan {
             adapter_id: "unreal-pak".to_string(),
@@ -20357,6 +20529,7 @@ mod tests {
             setup_status: default_profile_setup_status(),
             setup_warnings: Vec::new(),
             setup_updated_at: None,
+            mods_enabled: true,
         };
         let record = InstalledModRecord {
             id: "mod-1".to_string(),
@@ -20447,6 +20620,7 @@ mod tests {
             setup_status: default_profile_setup_status(),
             setup_warnings: Vec::new(),
             setup_updated_at: None,
+            mods_enabled: true,
         };
 
         let targets = unreal_pak_target_dirs(&profile);
@@ -21061,6 +21235,7 @@ mod tests {
             setup_status: default_profile_setup_status(),
             setup_warnings: Vec::new(),
             setup_updated_at: None,
+            mods_enabled: true,
         };
         let dependencies = profile_bootstrap_dependencies(&profile);
 
@@ -21095,6 +21270,7 @@ mod tests {
             setup_status: default_profile_setup_status(),
             setup_warnings: Vec::new(),
             setup_updated_at: None,
+            mods_enabled: true,
         };
         let plan = InstallPlan {
             adapter_id: "bepinex".to_string(),
@@ -21612,6 +21788,7 @@ mod tests {
             setup_status: default_profile_setup_status(),
             setup_warnings: Vec::new(),
             setup_updated_at: None,
+            mods_enabled: true,
         };
         let record = InstalledModRecord {
             id: "mod-1".to_string(),
@@ -21855,6 +22032,7 @@ mod tests {
             setup_status: default_profile_setup_status(),
             setup_warnings: Vec::new(),
             setup_updated_at: None,
+            mods_enabled: true,
         };
         let dependencies = profile_bootstrap_dependencies(&profile);
         assert_eq!(dependencies.len(), 1);
@@ -22099,6 +22277,7 @@ mod tests {
             setup_status: default_profile_setup_status(),
             setup_warnings: Vec::new(),
             setup_updated_at: None,
+            mods_enabled: true,
         };
 
         let scanned = scan_folder_source(&import_root, "ItemEditor.zip".to_string()).unwrap();
@@ -22134,6 +22313,7 @@ mod tests {
             setup_status: default_profile_setup_status(),
             setup_warnings: Vec::new(),
             setup_updated_at: None,
+            mods_enabled: true,
         };
         let mut store = StoreFile {
             version: 1,
@@ -23449,6 +23629,7 @@ mod tests {
             setup_status: default_profile_setup_status(),
             setup_warnings: Vec::new(),
             setup_updated_at: None,
+            mods_enabled: true,
         }
     }
 

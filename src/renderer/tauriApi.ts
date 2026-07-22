@@ -215,6 +215,8 @@ export const desktopApi: DesktopApi = {
     invoke<NexusNxmInstallResult>("install_nexus_nxm_link", { nxmUrl }),
   listInstalledMods: (profileId: string) =>
     invoke<InstalledModRecord[]>("list_installed_mods", { profileId }),
+  refreshInstalledModArtwork: (profileId: string) =>
+    invoke<InstalledModRecord[]>("refresh_installed_mod_artwork", { profileId }),
   getModConfigDetails: (profileId: string, installedModId: string) =>
     invoke<ModConfigFile[]>("get_mod_config_details", { profileId, installedModId }),
   updateModConfigValue: (input: UpdateModConfigValueInput) =>

@@ -59,7 +59,6 @@ import {
   ModConfigFile,
   OnlineModFileOption,
   OnlineModRecord,
-  ProfileDependencyBootstrapResult,
   ProfileRefreshResult,
   SteamGameRecord
 } from "../shared/contracts";
@@ -190,9 +189,11 @@ const startupSplashPulseMs = 2700;
 const startupSplashFadeMs = 420;
 const startupSplashMaximumMs = 8000;
 const modPresentationStorageKey = "uniloader.mod-presentations.v2";
-const profileLaunchModeStorageKey = "uniloader.profile-launch-modes.v1";
+const maxInstalledModProfileCaches = 12;
+const maxStoredModPresentations = 400;
 
 interface StoredModPresentation {
+  cachedAt?: string;
   description?: string;
   iconUrl?: string;
   name?: string;
@@ -203,7 +204,6 @@ interface StoredModPresentation {
 }
 
 type StoredModPresentations = Record<string, StoredModPresentation>;
-type StoredProfileLaunchModes = Record<string, boolean>;
 
 export function App() {
   const [activeView, setActiveView] = useState<ViewMode>("manager");
@@ -252,9 +252,6 @@ export function App() {
   const [isCreatingSteamProfile, setIsCreatingSteamProfile] = useState(false);
   const [isChangingProfileLaunchMode, setIsChangingProfileLaunchMode] = useState(false);
   const [gameLaunchState, setGameLaunchState] = useState<GameLaunchState>("idle");
-  const [profileLaunchModes, setProfileLaunchModes] = useState<StoredProfileLaunchModes>(() =>
-    loadStoredProfileLaunchModes()
-  );
   const [steamGames, setSteamGames] = useState<SteamGameRecord[]>([]);
   const [selectedSteamGameAppId, setSelectedSteamGameAppId] = useState("");
   const [profileCreatorOpen, setProfileCreatorOpen] = useState(false);
@@ -277,6 +274,8 @@ export function App() {
   const errorSequence = useRef(0);
   const updateAnnouncementShown = useRef(false);
   const installedModsRequestSequence = useRef(0);
+  const installedModsByProfile = useRef(new Map<string, InstalledModRecord[]>());
+  const artworkRefreshAttemptedProfiles = useRef(new Set<string>());
   const discoverInstalledModsRequestSequence = useRef(0);
   const discoveryRequestSequence = useRef(0);
   const processedNxmLinks = useRef(new Set<string>());
@@ -351,8 +350,11 @@ export function App() {
           version: mod.version || undefined
         };
         const existing = current[presentationKey];
-        if (JSON.stringify(existing) !== JSON.stringify(presentation)) {
-          next[presentationKey] = presentation;
+        if (!sameStoredModPresentation(existing, presentation)) {
+          next[presentationKey] = {
+            ...presentation,
+            cachedAt: new Date().toISOString()
+          };
           changed = true;
         }
       }
@@ -360,9 +362,49 @@ export function App() {
       if (!changed) {
         return current;
       }
-      saveStoredModPresentations(next);
-      return next;
+      const pruned = pruneStoredModPresentations(next);
+      saveStoredModPresentations(pruned);
+      return pruned;
     });
+  }
+
+  function rememberInstalledMods(profileId: string, mods: InstalledModRecord[]) {
+    installedModsByProfile.current.delete(profileId);
+    installedModsByProfile.current.set(profileId, mods);
+    while (installedModsByProfile.current.size > maxInstalledModProfileCaches) {
+      const oldestProfileId = installedModsByProfile.current.keys().next().value;
+      if (!oldestProfileId) {
+        break;
+      }
+      installedModsByProfile.current.delete(oldestProfileId);
+    }
+  }
+
+  function scheduleInstalledModArtworkRefresh(
+    profileId: string,
+    mods: InstalledModRecord[]
+  ) {
+    const needsArtwork = mods.some((mod) => !mod.runtimeId && !mod.iconUrl);
+    if (!needsArtwork || artworkRefreshAttemptedProfiles.current.has(profileId)) {
+      return;
+    }
+
+    artworkRefreshAttemptedProfiles.current.add(profileId);
+    void api
+      .refreshInstalledModArtwork(profileId)
+      .then((enrichedMods) => {
+        rememberInstalledMods(profileId, enrichedMods);
+        if (selectedProfileIdRef.current === profileId) {
+          setInstalledMods(enrichedMods);
+        }
+        if (discoverProfileIdRef.current === profileId) {
+          setDiscoverInstalledMods(enrichedMods);
+          setDiscoverInstalledModsProfileId(profileId);
+        }
+      })
+      .catch(() => {
+        // Artwork is optional and must never block profile or mod operations.
+      });
   }
 
   const api = desktopApi;
@@ -459,7 +501,7 @@ export function App() {
     );
   }, [steamGameSearch, steamGames]);
   const selectedProfileLaunchModsEnabled = selectedProfile
-    ? profileLaunchModes[selectedProfile.id] ?? true
+    ? selectedProfile.modsEnabled
     : true;
   const profileModToggleLabel = selectedProfileLaunchModsEnabled ? "ON" : "OFF";
   const gameLaunchBusy = gameLaunchState !== "idle";
@@ -797,7 +839,7 @@ export function App() {
     if (selectedProfileIdRef.current !== profileId) {
       installedModsRequestSequence.current += 1;
       selectedProfileIdRef.current = profileId;
-      setInstalledMods([]);
+      setInstalledMods(installedModsByProfile.current.get(profileId) ?? []);
       setExpandedInstalledModId("");
     }
     setSelectedProfileId(profileId);
@@ -817,11 +859,13 @@ export function App() {
   async function refreshInstalledMods(profileId: string) {
     const requestId = ++installedModsRequestSequence.current;
     const mods = await api.listInstalledMods(profileId);
+    rememberInstalledMods(profileId, mods);
     if (
       requestId === installedModsRequestSequence.current &&
       selectedProfileIdRef.current === profileId
     ) {
       setInstalledMods(mods);
+      scheduleInstalledModArtworkRefresh(profileId, mods);
     }
   }
 
@@ -920,12 +964,14 @@ export function App() {
   }
 
   async function updateAppSetting(nextSettings: AppSettings) {
+    const previousSettings = appSettings;
     setAppSettings(nextSettings);
     try {
       const savedSettings = await api.updateAppSettings(nextSettings);
       setAppSettings(savedSettings);
       setStatus("Settings saved");
     } catch (caughtError) {
+      setAppSettings(previousSettings);
       setError(String(caughtError));
       setNotice({
         kind: "error",
@@ -1075,51 +1121,28 @@ export function App() {
     setIsRefreshing(true);
     setStatus("Refreshing profile");
     try {
-      let result = await api.refreshProfile(selectedProfile.id);
-      let repairDetail = "";
-      let repairWarnings: string[] = [];
-
-      if (result.missingDependencies.length > 0) {
-        setStatus("Repairing dependencies");
-        setNotice({
-          kind: "warning",
-          title: "Installing dependencies",
-          detail: missingDependencyDetail(result)
-        });
-
-        try {
-          const dependencyResult = await api.bootstrapProfileDependencies(selectedProfile.id);
-          repairDetail = dependencyRepairSummary(dependencyResult);
-          repairWarnings = actionableDependencyWarnings(dependencyResult.warnings);
-          result = await api.refreshProfile(selectedProfile.id);
-        } catch (caughtError) {
-          repairWarnings = [String(caughtError)];
-        }
-      }
+      const result = await api.refreshProfile(selectedProfile.id);
 
       setProfiles((current) =>
         current.map((profile) => (profile.id === result.profile.id ? result.profile : profile))
       );
       selectProfile(result.profile.id);
       setDetection(result.detection);
+      rememberInstalledMods(result.profile.id, result.installedMods);
       setInstalledMods(result.installedMods);
+      scheduleInstalledModArtworkRefresh(result.profile.id, result.installedMods);
       setAnalysis(null);
-      const hasWarnings = result.warnings.length > 0 || repairWarnings.length > 0;
-      const wasRepaired = repairDetail.length > 0 && result.missingDependencies.length === 0;
+      const hasWarnings = result.warnings.length > 0;
       const updatedRuntime = (result.runtimeUpdates?.length ?? 0) > 0;
       setStatus(hasWarnings ? "Needs attention" : "Ready");
       setNotice({
         kind: hasWarnings ? "warning" : "success",
         title: hasWarnings
           ? "Refresh found issues"
-          : wasRepaired
-            ? "Dependencies repaired"
-            : updatedRuntime
-              ? "Runtime updated"
-              : "Profile refreshed",
-        detail: [refreshSummary(result), repairDetail, repairWarnings[0]]
-          .filter(Boolean)
-          .join(" ")
+          : updatedRuntime
+            ? "Runtime updated"
+            : "Profile refreshed",
+        detail: refreshSummary(result)
       });
       if (configModal) {
         const refreshedMod = result.installedMods.find((mod) => mod.id === configModal.mod.id);
@@ -1199,12 +1222,6 @@ export function App() {
       const result = await api.removeProfile(profile.id);
       const nextProfiles = profiles.filter((item) => item.id !== profile.id);
       setProfiles(nextProfiles);
-      setProfileLaunchModes((current) => {
-        const next = { ...current };
-        delete next[profile.id];
-        saveStoredProfileLaunchModes(next);
-        return next;
-      });
 
       if (selectedProfileIdRef.current === profile.id) {
         const nextSelectedProfileId = nextProfiles[0]?.id ?? "";
@@ -1475,11 +1492,11 @@ export function App() {
     setStatus(enabled ? "Restoring managed components" : "Preparing unmodded state");
     try {
       const result = await api.setProfileModLaunchMode(profile.id, enabled);
-      setProfileLaunchModes((current) => {
-        const next = { ...current, [profile.id]: enabled };
-        saveStoredProfileLaunchModes(next);
-        return next;
-      });
+      setProfiles((current) =>
+        current.map((item) =>
+          item.id === profile.id ? { ...item, modsEnabled: result.modsEnabled } : item
+        )
+      );
       setStatus(enabled ? "Mods enabled for launch" : "Unmodded state ready");
       setNotice({
         kind: "success",
@@ -1556,6 +1573,7 @@ export function App() {
       }
       setProfiles((current) => [...current, result.profile]);
       selectProfile(result.profile.id);
+      rememberInstalledMods(result.profile.id, result.installedMods);
       setInstalledMods(result.installedMods);
       setAnalysis(null);
       setDetection(null);
@@ -4676,26 +4694,6 @@ function refreshSummary(result: ProfileRefreshResult): string {
   return parts.join(" ");
 }
 
-function missingDependencyDetail(result: ProfileRefreshResult): string {
-  return `Missing: ${dependencyNames(result.missingDependencies)}. UniLoader is trying to install what it can automatically.`;
-}
-
-function dependencyRepairSummary(result: ProfileDependencyBootstrapResult): string {
-  if (result.installedDependencies.length > 0) {
-    return `Installed ${result.installedDependencies.length} missing dependenc${
-      result.installedDependencies.length === 1 ? "y" : "ies"
-    }: ${result.installedDependencies.slice(0, 3).join(", ")}${
-      result.installedDependencies.length > 3 ? ", ..." : ""
-    }.`;
-  }
-
-  if (result.skippedDependencies.length > 0) {
-    return "Required dependencies were already present after repair.";
-  }
-
-  return "";
-}
-
 function actionableDependencyWarnings(warnings: string[]): string[] {
   return warnings.filter((warning) => !warning.startsWith("Installed dependency "));
 }
@@ -4708,11 +4706,48 @@ function loadStoredModPresentations(): StoredModPresentations {
     }
     const parsed = JSON.parse(raw) as unknown;
     return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? (parsed as StoredModPresentations)
+      ? pruneStoredModPresentations(parsed as StoredModPresentations)
       : {};
   } catch {
     return {};
   }
+}
+
+function sameStoredModPresentation(
+  first: StoredModPresentation | undefined,
+  second: StoredModPresentation
+): boolean {
+  if (!first) {
+    return false;
+  }
+  return (
+    first.description === second.description &&
+    first.iconUrl === second.iconUrl &&
+    first.name === second.name &&
+    first.owner === second.owner &&
+    first.providerLabel === second.providerLabel &&
+    first.updatedAt === second.updatedAt &&
+    first.version === second.version
+  );
+}
+
+function pruneStoredModPresentations(
+  presentations: StoredModPresentations
+): StoredModPresentations {
+  const entries = Object.entries(presentations);
+  if (entries.length <= maxStoredModPresentations) {
+    return presentations;
+  }
+
+  return Object.fromEntries(
+    entries
+      .sort(([, first], [, second]) => {
+        const firstTime = Date.parse(first.cachedAt || first.updatedAt || "") || 0;
+        const secondTime = Date.parse(second.cachedAt || second.updatedAt || "") || 0;
+        return secondTime - firstTime;
+      })
+      .slice(0, maxStoredModPresentations)
+  );
 }
 
 function saveStoredModPresentations(presentations: StoredModPresentations) {
@@ -4720,35 +4755,6 @@ function saveStoredModPresentations(presentations: StoredModPresentations) {
     window.localStorage.setItem(modPresentationStorageKey, JSON.stringify(presentations));
   } catch {
     // Artwork metadata is optional; installs must keep working if storage is unavailable.
-  }
-}
-
-function loadStoredProfileLaunchModes(): StoredProfileLaunchModes {
-  try {
-    const raw = window.localStorage.getItem(profileLaunchModeStorageKey);
-    if (!raw) {
-      return {};
-    }
-    const parsed = JSON.parse(raw) as unknown;
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return {};
-    }
-
-    return Object.fromEntries(
-      Object.entries(parsed).filter((entry): entry is [string, boolean] =>
-        typeof entry[1] === "boolean"
-      )
-    );
-  } catch {
-    return {};
-  }
-}
-
-function saveStoredProfileLaunchModes(modes: StoredProfileLaunchModes) {
-  try {
-    window.localStorage.setItem(profileLaunchModeStorageKey, JSON.stringify(modes));
-  } catch {
-    // Launch preferences can safely fall back to ON when browser storage is unavailable.
   }
 }
 
