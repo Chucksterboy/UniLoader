@@ -190,7 +190,21 @@ const startupSplashFadeMs = 420;
 const startupSplashMaximumMs = 8000;
 const modPresentationStorageKey = "uniloader.mod-presentations.v2";
 const maxInstalledModProfileCaches = 12;
+const maxArtworkRefreshProfiles = 48;
+const maxProcessedNxmLinks = 128;
 const maxStoredModPresentations = 400;
+
+function rememberBoundedSetValue<T>(values: Set<T>, value: T, maxEntries: number) {
+  values.delete(value);
+  values.add(value);
+  while (values.size > maxEntries) {
+    const oldest = values.values().next().value as T | undefined;
+    if (oldest === undefined) {
+      break;
+    }
+    values.delete(oldest);
+  }
+}
 
 interface StoredModPresentation {
   cachedAt?: string;
@@ -389,7 +403,11 @@ export function App() {
       return;
     }
 
-    artworkRefreshAttemptedProfiles.current.add(profileId);
+    rememberBoundedSetValue(
+      artworkRefreshAttemptedProfiles.current,
+      profileId,
+      maxArtworkRefreshProfiles
+    );
     void api
       .refreshInstalledModArtwork(profileId)
       .then((enrichedMods) => {
@@ -909,7 +927,7 @@ export function App() {
       if (!replayKey || processedNxmLinks.current.has(replayKey)) {
         continue;
       }
-      processedNxmLinks.current.add(replayKey);
+      rememberBoundedSetValue(processedNxmLinks.current, replayKey, maxProcessedNxmLinks);
       const pendingInstall = pendingNexusInstallRef.current;
       const activeModId = pendingInstall?.modId ?? nexusModIdFromNxmUrl(nxmUrl) ?? "nexus-handoff";
       setError("");
@@ -3630,10 +3648,20 @@ function DiscoverView({
   const [page, setPage] = useState(1);
   const [sortMode, setSortMode] = useState<OnlineSortMode>("downloads");
   const [expandedModId, setExpandedModId] = useState("");
+  const onLoadRef = useRef(onLoad);
+  const sortModeRef = useRef(sortMode);
   const selectedProfile = profiles.find((profile) => profile.id === selectedProfileId);
   const pageCount = Math.max(1, Math.ceil(total / discoverPageSize));
   const currentPage = Math.min(page, pageCount);
   const visibleMods = mods;
+
+  useEffect(() => {
+    onLoadRef.current = onLoad;
+  }, [onLoad]);
+
+  useEffect(() => {
+    sortModeRef.current = sortMode;
+  }, [sortMode]);
 
   useEffect(() => {
     setPage(1);
@@ -3660,10 +3688,10 @@ function DiscoverView({
     }
     const timeout = window.setTimeout(() => {
       setPage(1);
-      void onLoad(1, sortMode, query.trim());
+      void onLoadRef.current(1, sortModeRef.current, query.trim());
     }, 300);
     return () => window.clearTimeout(timeout);
-  }, [query]);
+  }, [hasLoaded, query, selectedProfileId]);
 
   async function changeSort(nextSort: OnlineSortMode) {
     setExpandedModId("");

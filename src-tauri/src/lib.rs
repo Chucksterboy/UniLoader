@@ -59,6 +59,12 @@ const DISCOVERY_PROVIDER_CACHE_MINUTES: u64 = 30;
 const DISCOVERY_PROVIDER_CACHE_MAX_RECORDS: usize = 2_500;
 const DISCOVERY_PROVIDER_CACHE_MAX_ENTRIES: usize = 64;
 const DISCOVERY_CANCELLED_ERROR: &str = "Discovery request was superseded.";
+const THUNDERSTORE_CACHE_MAX_ENTRIES: usize = 32;
+const PROVIDER_MAPPING_CACHE_MAX_ENTRIES: usize = 128;
+const PROFILE_RUNTIME_CACHE_MAX_ENTRIES: usize = 128;
+const NEXUS_GAME_ID_CACHE_MAX_ENTRIES: usize = 256;
+const NEXUS_GAME_ID_CACHE_HOURS: u64 = 24;
+const NEXUS_KEY_VALIDATION_CACHE_MINUTES: u64 = 15;
 const MAX_PROVIDER_CANDIDATES: usize = 16;
 const PROFILE_LAUNCH_SUSPENSION_VERSION: u32 = 1;
 const PROFILE_RUNTIME_SAMPLE_SIZE: usize = 40;
@@ -93,13 +99,16 @@ static THUNDERSTORE_CACHE: OnceLock<Mutex<HashMap<String, ThunderstoreCacheEntry
     OnceLock::new();
 static PROVIDER_MAPPING_CACHE: OnceLock<Mutex<HashMap<String, ProviderMappingCacheEntry>>> =
     OnceLock::new();
-static NEXUS_GAME_ID_CACHE: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+static NEXUS_GAME_ID_CACHE: OnceLock<Mutex<HashMap<String, NexusGameIdCacheEntry>>> =
+    OnceLock::new();
 static PROFILE_RUNTIME_INFERENCE_CACHE: OnceLock<
     Mutex<HashMap<String, RuntimeInferenceCacheEntry>>,
 > = OnceLock::new();
 static DISCOVERY_PROVIDER_CACHE: OnceLock<Mutex<HashMap<String, DiscoveryProviderCacheEntry>>> =
     OnceLock::new();
 static STEAM_GAMES_CACHE: OnceLock<Mutex<Option<(Instant, Vec<SteamGameRecord>)>>> =
+    OnceLock::new();
+static NEXUS_KEY_VALIDATION_CACHE: OnceLock<Mutex<Option<NexusKeyValidationCacheEntry>>> =
     OnceLock::new();
 static RUNTIME_REGISTRY: OnceLock<Vec<RuntimeDefinition>> = OnceLock::new();
 static DEPENDENCY_PROVIDER_REGISTRY: OnceLock<Vec<DependencyProviderDefinition>> = OnceLock::new();
@@ -114,6 +123,19 @@ struct ThunderstoreCacheEntry {
 struct ProviderMappingCacheEntry {
     fetched_at: Instant,
     value: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct NexusGameIdCacheEntry {
+    fetched_at: Instant,
+    game_id: u64,
+}
+
+#[derive(Debug, Clone)]
+struct NexusKeyValidationCacheEntry {
+    fetched_at: Instant,
+    fingerprint: String,
+    account: NexusUserValidation,
 }
 
 #[derive(Debug, Clone)]
@@ -9089,15 +9111,46 @@ where
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
     {
+        let now = Instant::now();
+        cache.retain(|_, entry| {
+            let ttl = if entry.value.is_some() {
+                Duration::from_secs(PROVIDER_MAPPING_CACHE_HOURS * 60 * 60)
+            } else {
+                Duration::from_secs(PROVIDER_MAPPING_NEGATIVE_CACHE_MINUTES * 60)
+            };
+            now.duration_since(entry.fetched_at) < ttl
+        });
+        evict_oldest_provider_mapping_entry(
+            &mut cache,
+            PROVIDER_MAPPING_CACHE_MAX_ENTRIES,
+            &cache_key,
+        );
         cache.insert(
             cache_key,
             ProviderMappingCacheEntry {
-                fetched_at: Instant::now(),
+                fetched_at: now,
                 value: value.clone(),
             },
         );
     }
     value
+}
+
+fn evict_oldest_provider_mapping_entry(
+    cache: &mut HashMap<String, ProviderMappingCacheEntry>,
+    max_entries: usize,
+    incoming_key: &str,
+) {
+    if cache.len() < max_entries || cache.contains_key(incoming_key) {
+        return;
+    }
+    if let Some(oldest) = cache
+        .iter()
+        .min_by_key(|(_, entry)| entry.fetched_at)
+        .map(|(key, _)| key.clone())
+    {
+        cache.remove(&oldest);
+    }
 }
 
 fn parallel_first_map<T, F>(items: &[String], mapper: &F) -> Option<T>
@@ -9267,10 +9320,28 @@ fn infer_profile_foundation_runtime(profile: &GameProfile) -> Option<ProviderRun
 
     let value = choose_runtime_inference(supporters, providers, sampled_mods);
     if let Ok(mut cache) = cache.lock() {
+        let now = Instant::now();
+        cache.retain(|_, entry| {
+            let ttl = if entry.value.is_some() {
+                Duration::from_secs(PROVIDER_MAPPING_CACHE_HOURS * 60 * 60)
+            } else {
+                Duration::from_secs(PROVIDER_MAPPING_NEGATIVE_CACHE_MINUTES * 60)
+            };
+            now.duration_since(entry.fetched_at) < ttl
+        });
+        if cache.len() >= PROFILE_RUNTIME_CACHE_MAX_ENTRIES && !cache.contains_key(&cache_key) {
+            if let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.fetched_at)
+                .map(|(key, _)| key.clone())
+            {
+                cache.remove(&oldest);
+            }
+        }
         cache.insert(
             cache_key,
             RuntimeInferenceCacheEntry {
-                fetched_at: Instant::now(),
+                fetched_at: now,
                 value: value.clone(),
             },
         );
@@ -11426,10 +11497,23 @@ fn fetch_thunderstore_community_packages(
             .json::<Vec<ThunderstoreCommunityPackage>>()
             .map_err(error_to_string)?;
         if let Ok(mut cache) = cache.lock() {
+            let now = Instant::now();
+            cache.retain(|_, entry| {
+                now.duration_since(entry.fetched_at) < Duration::from_secs(10 * 60)
+            });
+            if cache.len() >= THUNDERSTORE_CACHE_MAX_ENTRIES && !cache.contains_key(community) {
+                if let Some(oldest) = cache
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.fetched_at)
+                    .map(|(key, _)| key.clone())
+                {
+                    cache.remove(&oldest);
+                }
+            }
             cache.insert(
                 community.to_string(),
                 ThunderstoreCacheEntry {
-                    fetched_at: Instant::now(),
+                    fetched_at: now,
                     packages: packages.clone(),
                 },
             );
@@ -11792,13 +11876,17 @@ fn fetch_nexus_game_id_for_domain(
     api_key: Option<&str>,
 ) -> Result<u64, String> {
     let normalized_domain = compact_provider_slug(domain);
-    if let Ok(cache) = NEXUS_GAME_ID_CACHE
+    if let Ok(mut cache) = NEXUS_GAME_ID_CACHE
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
     {
-        if let Some(game_id) = cache.get(&normalized_domain) {
-            return Ok(*game_id);
+        if let Some(entry) = cache.get(&normalized_domain) {
+            if entry.fetched_at.elapsed() < Duration::from_secs(NEXUS_GAME_ID_CACHE_HOURS * 60 * 60)
+            {
+                return Ok(entry.game_id);
+            }
         }
+        cache.remove(&normalized_domain);
     }
 
     if let Some(api_key) = api_key {
@@ -11843,7 +11931,27 @@ fn cache_nexus_game_id(domain: &str, game_id: u64) {
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
     {
-        cache.insert(domain.to_string(), game_id);
+        let now = Instant::now();
+        cache.retain(|_, entry| {
+            now.duration_since(entry.fetched_at)
+                < Duration::from_secs(NEXUS_GAME_ID_CACHE_HOURS * 60 * 60)
+        });
+        if cache.len() >= NEXUS_GAME_ID_CACHE_MAX_ENTRIES && !cache.contains_key(domain) {
+            if let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.fetched_at)
+                .map(|(key, _)| key.clone())
+            {
+                cache.remove(&oldest);
+            }
+        }
+        cache.insert(
+            domain.to_string(),
+            NexusGameIdCacheEntry {
+                fetched_at: now,
+                game_id,
+            },
+        );
     }
 }
 
@@ -13010,6 +13118,21 @@ fn nexus_api_get(client: &Client, url: &str, api_key: &str) -> reqwest::blocking
 }
 
 fn validate_nexus_api_key(api_key: &str) -> Result<NexusUserValidation, String> {
+    let fingerprint = nexus_api_key_fingerprint(api_key);
+    if let Ok(cache) = NEXUS_KEY_VALIDATION_CACHE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        if let Some(entry) = cache.as_ref() {
+            if entry.fingerprint == fingerprint
+                && entry.fetched_at.elapsed()
+                    < Duration::from_secs(NEXUS_KEY_VALIDATION_CACHE_MINUTES * 60)
+            {
+                return Ok(entry.account.clone());
+            }
+        }
+    }
+
     let client = provider_client()?;
     let response = nexus_api_get(
         &client,
@@ -13020,9 +13143,20 @@ fn validate_nexus_api_key(api_key: &str) -> Result<NexusUserValidation, String> 
     .map_err(|error| format!("Could not validate the Nexus API key: {error}"))?;
 
     if response.status().is_success() {
-        return response.json::<NexusUserValidation>().map_err(|error| {
+        let account = response.json::<NexusUserValidation>().map_err(|error| {
             format!("Nexus validated the key but returned invalid account data: {error}")
-        });
+        })?;
+        if let Ok(mut cache) = NEXUS_KEY_VALIDATION_CACHE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+        {
+            *cache = Some(NexusKeyValidationCacheEntry {
+                fetched_at: Instant::now(),
+                fingerprint,
+                account: account.clone(),
+            });
+        }
+        return Ok(account);
     }
     if response.status().as_u16() == 401 || response.status().as_u16() == 403 {
         return Err(
@@ -13035,6 +13169,27 @@ fn validate_nexus_api_key(api_key: &str) -> Result<NexusUserValidation, String> 
         "Nexus Mods could not validate the API key right now (HTTP {}). Please try again.",
         response.status()
     ))
+}
+
+fn nexus_api_key_fingerprint(api_key: &str) -> String {
+    hex::encode(Sha256::digest(api_key.trim().as_bytes()))
+}
+
+fn clear_stale_nexus_key_validation(value: Option<&str>) {
+    let Ok(mut cache) = NEXUS_KEY_VALIDATION_CACHE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    else {
+        return;
+    };
+    let expected = value.map(nexus_api_key_fingerprint);
+    if cache
+        .as_ref()
+        .is_some_and(|entry| Some(entry.fingerprint.as_str()) != expected.as_deref())
+        || value.is_none()
+    {
+        *cache = None;
+    }
 }
 
 fn choose_requested_nexus_file(
@@ -19056,7 +19211,7 @@ fn read_nexus_api_key() -> Result<Option<String>, String> {
 fn write_nexus_api_key(value: Option<&str>) -> Result<(), String> {
     let entry =
         keyring::Entry::new(NEXUS_KEYRING_SERVICE, NEXUS_KEYRING_USER).map_err(error_to_string)?;
-    match value {
+    let result = match value {
         Some(value) => entry
             .set_password(value)
             .map_err(|error| format!("Could not save the Nexus API key securely: {error}")),
@@ -19064,7 +19219,11 @@ fn write_nexus_api_key(value: Option<&str>) -> Result<(), String> {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(error) => Err(format!("Could not remove the Nexus API key: {error}")),
         },
+    };
+    if result.is_ok() {
+        clear_stale_nexus_key_validation(value);
     }
+    result
 }
 
 fn profiles_path(root: &Path) -> PathBuf {
