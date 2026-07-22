@@ -51,14 +51,13 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "UniLoader ${{ github.ref_name }}"
           releaseBody: |
-            UniLoader v0.9.14 improves library clarity, install feedback, and compact-window behavior.
+            UniLoader v0.9.15 keeps generated mod folders readable and safely repairs older installs.
 
-            - Installed mods now expand to show descriptions, requirement status, and distinct deployment targets.
-            - Equivalent install-route aliases are deduplicated while genuinely separate server targets remain visible.
-            - Dependency checks and recent session activity are shown above the Install Vault.
-            - Nexus handoffs report active installation state and installed discovery entries reconcile correctly.
-            - The Install Vault now preserves spacing, stacks compact controls, and scrolls instead of overlapping in small windows.
-            - A dedicated high-contrast tray icon stays clear and recognizable at Windows notification-area sizes.
+            - New mods use a concise, recognizable mod-name folder instead of provider IDs and timestamp-heavy archive names.
+            - Refresh migrates existing UniLoader-owned generated folders across every recorded client, engine, and server route.
+            - Receipts, hashes, configuration paths, and deployment plans stay synchronized with migrated folders.
+            - Collision checks preserve existing files and report a warning instead of overwriting unrelated data.
+            - Protected runtimes and externally managed mods are never renamed by the migration.
           releaseDraft: false
           prerelease: false
 

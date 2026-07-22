@@ -74,8 +74,7 @@ const APP_UPDATE_REPOSITORY: &str = "Chucksterboy/UniLoader";
 const BEPINBUILDS_BASE: &str = "https://builds.bepinex.dev";
 const BEPINBUILDS_BEPINEX_BE: &str = "https://builds.bepinex.dev/projects/bepinex_be";
 const APP_ICON: tauri::image::Image<'static> = tauri::include_image!("./icons/icon.png");
-const TRAY_ICON: tauri::image::Image<'static> =
-    tauri::include_image!("./icons/tray-icon.png");
+const TRAY_ICON: tauri::image::Image<'static> = tauri::include_image!("./icons/tray-icon.png");
 const GAME_DEFINITIONS_JSON: &str = include_str!("game_definitions.json");
 const RUNTIME_DEFINITIONS_JSON: &str = include_str!("runtime_definitions.json");
 const DEPENDENCY_PROVIDER_DEFINITIONS_JSON: &str =
@@ -2318,6 +2317,7 @@ fn refresh_profile_sync(
     let launch_suspension = read_profile_launch_suspension(&root, &profile.id)?;
     let mut bootstrap_warnings = Vec::new();
     let mut runtime_refresh = RuntimeRefreshOutcome::default();
+    let mut can_repair_managed_folders = false;
     if !launch_suspension.mods.is_empty() {
         runtime_refresh.notes.push(
             "Runtime updates are postponed while Mods OFF clean-launch mode is active.".to_string(),
@@ -2328,6 +2328,7 @@ fn refresh_profile_sync(
                 "Runtime updates are postponed until the game is closed.".to_string(),
             ),
             Ok(false) => {
+                can_repair_managed_folders = true;
                 bootstrap_warnings = install_profile_bootstrap_dependencies(&root, &profile);
                 runtime_refresh = refresh_profile_runtime_updates(&root, &profile);
             }
@@ -2344,9 +2345,21 @@ fn refresh_profile_sync(
         push_unique_route(&mut detection.created_mod_folders, route);
     }
     apply_profile_identity_to_detection(&profile, &mut detection, runtime_inference.as_ref());
+    let managed_folder_migration = if can_repair_managed_folders {
+        migrate_legacy_generated_mod_folders(&root, &profile)?
+    } else {
+        ManagedFolderMigrationOutcome::default()
+    };
+    if managed_folder_migration.migrated_records > 0 {
+        runtime_refresh.notes.push(format!(
+            "Renamed legacy generated folders for {} managed mod(s) ({} file(s)).",
+            managed_folder_migration.migrated_records, managed_folder_migration.migrated_files
+        ));
+    }
     let mut setup_warnings = bootstrap_warnings.clone();
     setup_warnings.extend(runtime_refresh.warnings.clone());
     setup_warnings.extend(route_outcome.warnings.clone());
+    setup_warnings.extend(managed_folder_migration.warnings.clone());
     apply_profile_setup_outcome(&mut profile, setup_warnings);
     profiles.items[profile_index] = profile.clone();
 
@@ -2414,6 +2427,7 @@ fn refresh_profile_sync(
     warnings.extend(bootstrap_warnings);
     warnings.extend(runtime_refresh.warnings.clone());
     warnings.extend(route_outcome.warnings);
+    warnings.extend(managed_folder_migration.warnings);
 
     Ok(ProfileRefreshResult {
         profile,
@@ -4248,7 +4262,10 @@ where
         .cloned()
         .ok_or_else(|| "The installed mod selected for update no longer exists.".to_string())?;
     if record.runtime_id.is_some() || record.externally_managed {
-        return Err("Protected or externally managed components cannot be replaced by a provider update.".to_string());
+        return Err(
+            "Protected or externally managed components cannot be replaced by a provider update."
+                .to_string(),
+        );
     }
     if !record
         .package_id
@@ -4267,7 +4284,9 @@ where
         if record.enabled {
             restore_deactivated_mods(store_root, profile, std::slice::from_ref(&record));
         }
-        return Err(format!("Could not prepare the existing mod for update: {error}"));
+        return Err(format!(
+            "Could not prepare the existing mod for update: {error}"
+        ));
     }
 
     match install() {
@@ -4330,12 +4349,7 @@ async fn preflight_discovered_mod_install(
         let (dependencies, install_targets) = match provider.as_str() {
             "nexus" => {
                 let (domain, nexus_mod_id) = parse_nexus_online_mod_id(&mod_id)?;
-                verified_discovery_provider_game(
-                    &profile,
-                    "nexus",
-                    Some(&domain),
-                    Some(&domain),
-                )?;
+                verified_discovery_provider_game(&profile, "nexus", Some(&domain), Some(&domain))?;
                 let client = provider_client()?;
                 let requirements = fetch_nexus_mod_requirements(
                     &client,
@@ -6830,6 +6844,10 @@ fn analyze_scanned_archive_with_identity(
     .into_iter()
     .flatten()
     .map(|plan| attach_manifest_dependencies(plan, scanned.manifest.as_ref()))
+    .map(|mut plan| {
+        normalize_generated_package_directories(&mut plan, &scanned);
+        plan
+    })
     .collect::<Vec<_>>();
 
     plans.sort_by(|a, b| {
@@ -7205,7 +7223,7 @@ fn ue4ss_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<Install
     let mut mappings = Vec::new();
     let mut warnings = Vec::new();
     let mut summary_targets = Vec::new();
-    let mod_folder_name = archive_stem(&scanned.archive_name);
+    let mod_folder_name = scanned_generated_mod_folder_name(scanned);
     let (target_roots, mod_target_dirs) = ue4ss_install_targets(profile);
 
     for file in &files {
@@ -17884,6 +17902,694 @@ fn archive_stem(archive_name: &str) -> String {
         .to_string()
 }
 
+fn generated_mod_folder_name(raw_name: &str) -> String {
+    let normalized = normalize_archive_path(raw_name);
+    let file_name = basename(&normalized);
+    let stem = archive_stem(&file_name);
+    let without_internal_id = strip_internal_download_id(&stem);
+    let without_hosting_tail = strip_hosting_filename_tail(without_internal_id);
+    let readable_name = humanize_mod_display_name(without_hosting_tail);
+    let mut folder_name = readable_name
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .take(80)
+        .collect::<String>();
+
+    if folder_name.is_empty() || is_windows_reserved_folder_name(&folder_name) {
+        folder_name.insert_str(0, "Mod");
+    }
+
+    folder_name
+}
+
+fn scanned_generated_mod_folder_name(scanned: &ScannedArchive) -> String {
+    generated_mod_folder_name(
+        scanned
+            .manifest
+            .as_ref()
+            .map(|manifest| manifest.name.as_str())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or(&scanned.archive_name),
+    )
+}
+
+fn normalize_generated_package_directories(plan: &mut InstallPlan, scanned: &ScannedArchive) {
+    let normalized_archive_name = normalize_archive_path(&scanned.archive_name);
+    let archive_file_name = basename(&normalized_archive_name);
+    let raw_stem = archive_stem(&archive_file_name);
+    let without_internal_id = strip_internal_download_id(&raw_stem);
+    let safe_raw_stem = sanitize_file_segment(&raw_stem);
+    let safe_without_internal_id = sanitize_file_segment(without_internal_id);
+    let recognizable_name = scanned_generated_mod_folder_name(scanned);
+
+    for mapping in &mut plan.mappings {
+        mapping.target_relative_path = normalize_archive_path(&mapping.target_relative_path)
+            .split('/')
+            .map(|segment| {
+                let is_generated_archive_segment = segment.eq_ignore_ascii_case(&raw_stem)
+                    || segment.eq_ignore_ascii_case(without_internal_id)
+                    || segment.eq_ignore_ascii_case(&safe_raw_stem)
+                    || segment.eq_ignore_ascii_case(&safe_without_internal_id);
+                if is_generated_archive_segment {
+                    recognizable_name.as_str()
+                } else {
+                    segment
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+    }
+}
+
+#[derive(Debug, Default)]
+struct ManagedFolderMigrationOutcome {
+    migrated_records: usize,
+    migrated_files: usize,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ManagedFolderFileMove {
+    source: PathBuf,
+    destination: PathBuf,
+}
+
+#[derive(Debug)]
+struct ManagedFolderRecordMigration {
+    store_index: usize,
+    original: InstalledModRecord,
+    revised: InstalledModRecord,
+    file_moves: Vec<ManagedFolderFileMove>,
+    legacy_roots: Vec<PathBuf>,
+}
+
+fn migrate_legacy_generated_mod_folders(
+    store_root: &Path,
+    profile: &GameProfile,
+) -> Result<ManagedFolderMigrationOutcome, String> {
+    let installed_path = installed_mods_path(store_root);
+    let original_store =
+        read_store::<InstalledModRecord>(&installed_path).map_err(error_to_string)?;
+    let mut revised_store = original_store.clone();
+    let mut outcome = ManagedFolderMigrationOutcome::default();
+    let current_owners = original_store
+        .items
+        .iter()
+        .flat_map(|record| {
+            record.files_written.iter().map(move |path| {
+                (
+                    normalize_filesystem_identity(path),
+                    (record.id.clone(), display_record_name(record)),
+                )
+            })
+        })
+        .collect::<HashMap<_, _>>();
+    let mut reserved_destinations = HashMap::<String, String>::new();
+    let mut migrations = Vec::new();
+
+    for (store_index, record) in original_store.items.iter().enumerate() {
+        if record.profile_id != profile.id
+            || !record_is_uniloader_owned(record)
+            || record.runtime_id.is_some()
+            || record.plan.is_none()
+        {
+            continue;
+        }
+
+        let Some(mut migration) = (match build_managed_folder_record_migration(store_index, record)
+        {
+            Ok(migration) => migration,
+            Err(reason) => {
+                outcome.warnings.push(format!(
+                    "UniLoader kept the existing folder for {} because {}.",
+                    display_record_name(record),
+                    reason
+                ));
+                continue;
+            }
+        }) else {
+            continue;
+        };
+
+        let mut local_destinations = HashMap::<String, String>::new();
+        let preflight = migration.file_moves.iter().try_for_each(|file_move| {
+            validate_managed_record_path(store_root, profile, &file_move.source)?;
+            validate_managed_record_path(store_root, profile, &file_move.destination)?;
+
+            let source_key =
+                normalize_filesystem_identity(file_move.source.to_string_lossy().as_ref());
+            let destination_key =
+                normalize_filesystem_identity(file_move.destination.to_string_lossy().as_ref());
+            if source_key == destination_key {
+                return Ok(());
+            }
+
+            if let Some((owner_id, owner_name)) = current_owners.get(&destination_key) {
+                if owner_id != &record.id {
+                    return Err(format!(
+                        "the clean destination is already managed by {owner_name}"
+                    ));
+                }
+            }
+            if let Some(owner_id) = reserved_destinations.get(&destination_key) {
+                if owner_id != &record.id {
+                    return Err(
+                        "the clean destination is also required by another managed mod".to_string(),
+                    );
+                }
+            }
+            if let Some(previous_source) =
+                local_destinations.insert(destination_key.clone(), source_key.clone())
+            {
+                if previous_source != source_key {
+                    return Err(
+                        "more than one legacy file would be renamed to the same destination"
+                            .to_string(),
+                    );
+                }
+            }
+
+            if file_move.source.exists() && !file_move.source.is_file() {
+                return Err(format!(
+                    "the recorded source is not a regular file: {}",
+                    file_move.source.to_string_lossy()
+                ));
+            }
+            if file_move.destination.exists() {
+                if !file_move.destination.is_file() {
+                    return Err(format!(
+                        "the clean destination is not a regular file: {}",
+                        file_move.destination.to_string_lossy()
+                    ));
+                }
+                if file_move.source.is_file()
+                    && sha256_file(&file_move.source)? != sha256_file(&file_move.destination)?
+                {
+                    return Err(format!(
+                        "the clean destination already contains different data: {}",
+                        file_move.destination.to_string_lossy()
+                    ));
+                }
+            }
+            Ok::<(), String>(())
+        });
+
+        if let Err(reason) = preflight {
+            outcome.warnings.push(format!(
+                "UniLoader kept the existing folder for {} because {}.",
+                display_record_name(record),
+                reason
+            ));
+            continue;
+        }
+
+        migration.file_moves.sort_by(|left, right| {
+            normalize_filesystem_identity(left.source.to_string_lossy().as_ref()).cmp(
+                &normalize_filesystem_identity(right.source.to_string_lossy().as_ref()),
+            )
+        });
+        migration.file_moves.dedup_by(|left, right| {
+            normalize_filesystem_identity(left.source.to_string_lossy().as_ref())
+                == normalize_filesystem_identity(right.source.to_string_lossy().as_ref())
+                && normalize_filesystem_identity(left.destination.to_string_lossy().as_ref())
+                    == normalize_filesystem_identity(right.destination.to_string_lossy().as_ref())
+        });
+        for file_move in &migration.file_moves {
+            reserved_destinations.insert(
+                normalize_filesystem_identity(file_move.destination.to_string_lossy().as_ref()),
+                record.id.clone(),
+            );
+        }
+        revised_store.items[migration.store_index] = migration.revised.clone();
+        migrations.push(migration);
+    }
+
+    if migrations.is_empty() {
+        return Ok(outcome);
+    }
+
+    let mut created_destinations = Vec::new();
+    let copy_result = migrations.iter().try_for_each(|migration| {
+        migration.file_moves.iter().try_for_each(|file_move| {
+            if !file_move.source.is_file()
+                || normalize_filesystem_identity(file_move.source.to_string_lossy().as_ref())
+                    == normalize_filesystem_identity(
+                        file_move.destination.to_string_lossy().as_ref(),
+                    )
+                || file_move.destination.exists()
+            {
+                return Ok(());
+            }
+            replace_file_from_path(&file_move.source, &file_move.destination)?;
+            created_destinations.push(file_move.destination.clone());
+            Ok::<(), String>(())
+        })
+    });
+    if let Err(error) = copy_result {
+        rollback_created_migration_files(&created_destinations);
+        return Err(format!(
+            "Could not prepare the managed-folder rename safely: {error}"
+        ));
+    }
+
+    let receipt_snapshots = migrations
+        .iter()
+        .map(|migration| {
+            let path = installed_mod_receipt_path(store_root, profile, &migration.original.id);
+            let content = if path.exists() {
+                Some(fs::read(&path).map_err(error_to_string)?)
+            } else {
+                None
+            };
+            Ok::<_, String>((path, content))
+        })
+        .collect::<Result<Vec<_>, _>>();
+    let receipt_snapshots = match receipt_snapshots {
+        Ok(snapshots) => snapshots,
+        Err(error) => {
+            rollback_created_migration_files(&created_destinations);
+            return Err(format!(
+                "Could not snapshot the managed-mod receipts before renaming folders: {error}"
+            ));
+        }
+    };
+
+    let persist_result = (|| -> Result<(), String> {
+        for migration in &migrations {
+            write_receipt(store_root, profile, &migration.revised)?;
+        }
+        write_store(&installed_path, &revised_store).map_err(error_to_string)
+    })();
+    if let Err(error) = persist_result {
+        rollback_created_migration_files(&created_destinations);
+        restore_migration_receipts(&receipt_snapshots);
+        let _ = write_store(&installed_path, &original_store);
+        return Err(format!(
+            "Could not save the managed-folder rename safely: {error}"
+        ));
+    }
+
+    let mut removed_sources = HashSet::new();
+    let mut legacy_roots = Vec::new();
+    for migration in &migrations {
+        for file_move in &migration.file_moves {
+            let source_key =
+                normalize_filesystem_identity(file_move.source.to_string_lossy().as_ref());
+            if !removed_sources.insert(source_key)
+                || !file_move.source.is_file()
+                || !file_move.destination.is_file()
+            {
+                continue;
+            }
+            match (sha256_file(&file_move.source), sha256_file(&file_move.destination)) {
+                (Ok(source_hash), Ok(destination_hash)) if source_hash == destination_hash => {
+                    if let Err(error) = fs::remove_file(&file_move.source) {
+                        outcome.warnings.push(format!(
+                            "The clean folder is active, but UniLoader could not remove the old copy at {}: {error}",
+                            file_move.source.to_string_lossy()
+                        ));
+                    } else {
+                        outcome.migrated_files += 1;
+                    }
+                }
+                _ => outcome.warnings.push(format!(
+                    "The clean folder is active, but UniLoader kept an old copy whose contents could not be verified: {}",
+                    file_move.source.to_string_lossy()
+                )),
+            }
+        }
+        legacy_roots.extend(migration.legacy_roots.iter().cloned());
+    }
+
+    legacy_roots.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    legacy_roots.dedup_by(|left, right| {
+        normalize_filesystem_identity(left.to_string_lossy().as_ref())
+            == normalize_filesystem_identity(right.to_string_lossy().as_ref())
+    });
+    for legacy_root in legacy_roots {
+        if let Err(error) = remove_empty_migration_tree(&legacy_root) {
+            outcome.warnings.push(format!(
+                "UniLoader renamed the managed files but could not remove an empty legacy folder at {}: {error}",
+                legacy_root.to_string_lossy()
+            ));
+        }
+    }
+
+    outcome.migrated_records = migrations.len();
+    Ok(outcome)
+}
+
+fn build_managed_folder_record_migration(
+    store_index: usize,
+    record: &InstalledModRecord,
+) -> Result<Option<ManagedFolderRecordMigration>, String> {
+    let preferred_name = record
+        .display_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(&record.archive_name);
+    let clean_folder_name = generated_mod_folder_name(preferred_name);
+    let candidates = legacy_generated_folder_candidates(record);
+    let mut revised = record.clone();
+    let mut file_moves = Vec::new();
+    let mut legacy_roots = Vec::new();
+    let mut changed = false;
+
+    for path in &mut revised.files_written {
+        changed |= rewrite_managed_record_path(
+            path,
+            &candidates,
+            &clean_folder_name,
+            false,
+            &mut file_moves,
+            &mut legacy_roots,
+        );
+    }
+    for path in &mut revised.backups_written {
+        changed |= rewrite_managed_record_path(
+            path,
+            &candidates,
+            &clean_folder_name,
+            false,
+            &mut file_moves,
+            &mut legacy_roots,
+        );
+    }
+    for path in &mut revised.config_files {
+        changed |= rewrite_managed_record_path(
+            path,
+            &candidates,
+            &clean_folder_name,
+            false,
+            &mut file_moves,
+            &mut legacy_roots,
+        );
+    }
+
+    let mut rewritten_hashes = HashMap::new();
+    for (path, hash) in &record.written_file_hashes {
+        let rewritten = rewrite_legacy_generated_path(path, &candidates, &clean_folder_name, false);
+        let rewritten_path = rewritten.as_deref().unwrap_or(path).to_string();
+        if let Some(existing_hash) = rewritten_hashes.insert(rewritten_path.clone(), hash.clone()) {
+            if existing_hash != *hash {
+                return Err(format!(
+                    "the saved file hashes for {} would collide after cleanup",
+                    display_record_name(record)
+                ));
+            }
+        }
+        if let Some(rewritten) = rewritten {
+            changed = true;
+            push_managed_folder_file_move(
+                path,
+                &rewritten,
+                &candidates,
+                &clean_folder_name,
+                &mut file_moves,
+                &mut legacy_roots,
+            );
+        }
+    }
+    revised.written_file_hashes = rewritten_hashes;
+
+    if let Some(plan) = &mut revised.plan {
+        for mapping in &mut plan.mappings {
+            if let Some(rewritten) = rewrite_legacy_generated_path(
+                &mapping.target_relative_path,
+                &candidates,
+                &clean_folder_name,
+                true,
+            ) {
+                mapping.target_relative_path = rewritten;
+                changed = true;
+            }
+        }
+    }
+
+    if !changed {
+        return Ok(None);
+    }
+
+    Ok(Some(ManagedFolderRecordMigration {
+        store_index,
+        original: record.clone(),
+        revised,
+        file_moves,
+        legacy_roots,
+    }))
+}
+
+fn rewrite_managed_record_path(
+    path: &mut String,
+    candidates: &HashSet<String>,
+    clean_folder_name: &str,
+    portable: bool,
+    file_moves: &mut Vec<ManagedFolderFileMove>,
+    legacy_roots: &mut Vec<PathBuf>,
+) -> bool {
+    let original = path.clone();
+    let Some(rewritten) =
+        rewrite_legacy_generated_path(&original, candidates, clean_folder_name, portable)
+    else {
+        return false;
+    };
+    push_managed_folder_file_move(
+        &original,
+        &rewritten,
+        candidates,
+        clean_folder_name,
+        file_moves,
+        legacy_roots,
+    );
+    *path = rewritten;
+    true
+}
+
+fn push_managed_folder_file_move(
+    source: &str,
+    destination: &str,
+    candidates: &HashSet<String>,
+    clean_folder_name: &str,
+    file_moves: &mut Vec<ManagedFolderFileMove>,
+    legacy_roots: &mut Vec<PathBuf>,
+) {
+    let source_path = PathBuf::from(source);
+    let destination_path = PathBuf::from(destination);
+    file_moves.push(ManagedFolderFileMove {
+        source: source_path.clone(),
+        destination: destination_path,
+    });
+    if let Some(root) = legacy_generated_folder_root(&source_path, candidates, clean_folder_name) {
+        legacy_roots.push(root);
+    }
+}
+
+fn legacy_generated_folder_candidates(record: &InstalledModRecord) -> HashSet<String> {
+    let mut candidates = HashSet::new();
+    for value in [&record.archive_name, &record.archive_path] {
+        let normalized = normalize_archive_path(value);
+        let file_name = basename(&normalized);
+        let stem = archive_stem(&file_name);
+        let without_internal_id = strip_internal_download_id(&stem);
+        for candidate in [
+            stem.clone(),
+            sanitize_file_segment(&stem),
+            without_internal_id.to_string(),
+            sanitize_file_segment(without_internal_id),
+        ] {
+            if !candidate.trim().is_empty() {
+                candidates.insert(candidate.to_ascii_lowercase());
+            }
+        }
+    }
+    candidates
+}
+
+fn is_legacy_generated_folder_segment(
+    segment: &str,
+    candidates: &HashSet<String>,
+    clean_folder_name: &str,
+) -> bool {
+    if segment.eq_ignore_ascii_case(clean_folder_name) {
+        return false;
+    }
+    if candidates.contains(&segment.to_ascii_lowercase()) {
+        return true;
+    }
+
+    let without_internal_id = strip_internal_download_id(segment);
+    let without_hosting_tail = strip_hosting_filename_tail(without_internal_id);
+    let looks_generated =
+        without_internal_id != segment || without_hosting_tail != without_internal_id;
+    looks_generated && generated_mod_folder_name(segment).eq_ignore_ascii_case(clean_folder_name)
+}
+
+fn rewrite_legacy_generated_path(
+    value: &str,
+    candidates: &HashSet<String>,
+    clean_folder_name: &str,
+    portable: bool,
+) -> Option<String> {
+    let mut rewritten = PathBuf::new();
+    let mut changed = false;
+    for component in Path::new(value).components() {
+        match component {
+            Component::Normal(segment) => {
+                let segment = segment.to_string_lossy();
+                if is_legacy_generated_folder_segment(
+                    segment.as_ref(),
+                    candidates,
+                    clean_folder_name,
+                ) {
+                    rewritten.push(clean_folder_name);
+                    changed = true;
+                } else {
+                    rewritten.push(component.as_os_str());
+                }
+            }
+            _ => rewritten.push(component.as_os_str()),
+        }
+    }
+
+    changed.then(|| {
+        if portable {
+            to_portable_path(&rewritten)
+        } else {
+            rewritten.to_string_lossy().to_string()
+        }
+    })
+}
+
+fn legacy_generated_folder_root(
+    path: &Path,
+    candidates: &HashSet<String>,
+    clean_folder_name: &str,
+) -> Option<PathBuf> {
+    let mut root = PathBuf::new();
+    for component in path.components() {
+        root.push(component.as_os_str());
+        if let Component::Normal(segment) = component {
+            if is_legacy_generated_folder_segment(
+                segment.to_string_lossy().as_ref(),
+                candidates,
+                clean_folder_name,
+            ) {
+                return Some(root);
+            }
+        }
+    }
+    None
+}
+
+fn installed_mod_receipt_path(
+    store_root: &Path,
+    profile: &GameProfile,
+    installed_mod_id: &str,
+) -> PathBuf {
+    profile_dir(store_root, &profile.id)
+        .join("receipts")
+        .join(format!("{installed_mod_id}.json"))
+}
+
+fn rollback_created_migration_files(paths: &[PathBuf]) {
+    for path in paths.iter().rev() {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn restore_migration_receipts(snapshots: &[(PathBuf, Option<Vec<u8>>)]) {
+    for (path, content) in snapshots {
+        if let Some(content) = content {
+            let _ = atomic_write(path, content);
+        } else {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn remove_empty_migration_tree(path: &Path) -> io::Result<bool> {
+    if !path.is_dir() {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() && !file_type.is_symlink() {
+            remove_empty_migration_tree(&entry.path())?;
+        }
+    }
+    if fs::read_dir(path)?.next().is_none() {
+        fs::remove_dir(path)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn strip_internal_download_id(value: &str) -> &str {
+    let Some(prefix) = value.get(..36) else {
+        return value;
+    };
+    let Some(separator) = value.as_bytes().get(36).copied() else {
+        return value;
+    };
+    if !matches!(separator, b'-' | b'_') || Uuid::parse_str(prefix).is_err() {
+        return value;
+    }
+
+    value
+        .get(37..)
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(value)
+}
+
+fn strip_hosting_filename_tail(value: &str) -> &str {
+    for (index, separator) in value.char_indices() {
+        if !matches!(separator, '-' | '_') {
+            continue;
+        }
+
+        let Some(tail) = value.get(index + separator.len_utf8()..) else {
+            continue;
+        };
+        let tokens = tail
+            .split(['-', '_'])
+            .filter(|token| !token.is_empty())
+            .collect::<Vec<_>>();
+        let starts_with_file_id = tokens.first().is_some_and(|token| {
+            token.chars().all(|character| character.is_ascii_digit())
+                || token.strip_prefix(['v', 'V']).is_some_and(|version| {
+                    !version.is_empty()
+                        && version.chars().all(|character| character.is_ascii_digit())
+                })
+        });
+        let metadata_tokens = tokens
+            .iter()
+            .filter(|token| {
+                token.chars().all(|character| character.is_ascii_digit())
+                    || (token.len() >= 6
+                        && token.chars().any(|character| character.is_ascii_digit()))
+            })
+            .count();
+
+        if starts_with_file_id && tokens.len() >= 3 && metadata_tokens >= 3 {
+            return value[..index].trim_end_matches(['-', '_']);
+        }
+    }
+
+    value
+}
+
+fn is_windows_reserved_folder_name(value: &str) -> bool {
+    let upper = value.to_ascii_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper
+                .as_bytes()
+                .last()
+                .is_some_and(|digit| matches!(digit, b'1'..=b'9')))
+}
+
 fn walk_game_folder(root: &Path) -> Vec<ProbeEntry> {
     let mut entries = Vec::new();
     let mut queue = VecDeque::from([(root.to_path_buf(), PathBuf::new(), 0usize)]);
@@ -18050,9 +18756,7 @@ fn write_receipt(
     profile: &GameProfile,
     record: &InstalledModRecord,
 ) -> Result<(), String> {
-    let receipt_path = profile_dir(store_root, &profile.id)
-        .join("receipts")
-        .join(format!("{}.json", record.id));
+    let receipt_path = installed_mod_receipt_path(store_root, profile, &record.id);
     if let Some(parent) = receipt_path.parent() {
         fs::create_dir_all(parent).map_err(error_to_string)?;
     }
@@ -19905,6 +20609,41 @@ mod tests {
     }
 
     #[test]
+    fn ue4ss_plan_uses_a_recognizable_generated_mod_folder() {
+        let root = temp_game_dir("recognizable-ue4ss-folder");
+        fs::create_dir_all(root.join("Pal/Binaries/Win64/ue4ss/Mods")).unwrap();
+        let mut profile = test_profile(
+            "future-unreal-game",
+            "Future Unreal Game",
+            "unreal",
+            "ue4ss",
+        );
+        profile.game_path = root.to_string_lossy().to_string();
+        let scanned = ScannedArchive {
+            archive_path: "C:/Downloads/7e099258-4cff-4617-9673-cdb0e89a5ffe-QuickDepositToChests_343_1_2_2026-06-28T19-17Z_eWCall0Oy.zip".to_string(),
+            archive_name: "7e099258-4cff-4617-9673-cdb0e89a5ffe-QuickDepositToChests_343_1_2_2026-06-28T19-17Z_eWCall0Oy.zip".to_string(),
+            entries: vec![ArchiveEntry {
+                path: "scripts/main.lua".to_string(),
+                logical_path: "scripts/main.lua".to_string(),
+                size: 1,
+                is_directory: false,
+            }],
+            manifest: None,
+            package_identity: None,
+        };
+
+        let plan = ue4ss_plan(&scanned, &profile).unwrap();
+
+        assert_eq!(plan.mappings.len(), 1);
+        assert_eq!(
+            plan.mappings[0].target_relative_path,
+            "Pal/Binaries/Win64/ue4ss/Mods/QuickDepositToChests/scripts/main.lua"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn catalogue_routes_require_independent_mod_consensus_before_creation() {
         let root = temp_game_dir("route-consensus");
         fs::create_dir_all(root.join("R5")).unwrap();
@@ -20460,6 +21199,360 @@ mod tests {
             humanize_mod_display_name("World Map Compass as"),
             "World Map Compass"
         );
+    }
+
+    #[test]
+    fn generated_mod_folders_hide_internal_and_provider_filename_noise() {
+        assert_eq!(
+            generated_mod_folder_name(
+                "7e099258-4cff-4617-9673-cdb0e89a5ffe-QuickDepositToChests_343_1_2_2026-06-28T19-17Z_eWCall0Oy.zip"
+            ),
+            "QuickDepositToChests"
+        );
+        assert_eq!(
+            generated_mod_folder_name("ShipLootx2-172-3-1777184245.zip"),
+            "ShipLootx2"
+        );
+        assert_eq!(
+            generated_mod_folder_name("1 Mil Fast Travel Bells-287-1-1777707453.zip"),
+            "1MilFastTravelBells"
+        );
+        assert_eq!(
+            generated_mod_folder_name("MoreMineralResources-2x.zip"),
+            "MoreMineralResources2x"
+        );
+    }
+
+    #[test]
+    fn generated_folder_normalization_is_adapter_neutral() {
+        let archive_name = "7e099258-4cff-4617-9673-cdb0e89a5ffe-QuickDepositToChests_343_1_2_2026-06-28T19-17Z_eWCall0Oy.zip";
+        let scanned = ScannedArchive {
+            archive_path: format!("C:/Downloads/{archive_name}"),
+            archive_name: archive_name.to_string(),
+            entries: Vec::new(),
+            manifest: None,
+            package_identity: None,
+        };
+        let mut plan = InstallPlan {
+            adapter_id: "future-runtime".to_string(),
+            adapter_name: "Future Runtime".to_string(),
+            confidence: 1.0,
+            summary: "Test route".to_string(),
+            mappings: vec![mapping(
+                "scripts/main.lua",
+                "game",
+                &format!("CustomMods/{}/scripts/main.lua", archive_stem(archive_name)),
+                "Future adapter generated package directory.",
+            )],
+            dependencies: Vec::new(),
+            warnings: Vec::new(),
+            requires_confirmation: false,
+        };
+
+        normalize_generated_package_directories(&mut plan, &scanned);
+
+        assert_eq!(
+            plan.mappings[0].target_relative_path,
+            "CustomMods/QuickDepositToChests/scripts/main.lua"
+        );
+    }
+
+    #[test]
+    fn refresh_migrates_legacy_generated_folders_across_every_recorded_route() {
+        let store_root = temp_game_dir("legacy-folder-migration-store");
+        let game_root = temp_game_dir("legacy-folder-migration-game");
+        let mut profile = test_profile(
+            "future-unreal-game",
+            "Future Unreal Game",
+            "unreal",
+            "ue4ss",
+        );
+        profile.game_path = game_root.to_string_lossy().to_string();
+        let legacy_folder = "7e099258-4cff-4617-9673-cdb0e89a5ffe-QuickDepositToChests_343_1_2_2026-06-28T19-17Z_eWCall0Oy";
+        let routes = [
+            "Binaries/Win64/Mods",
+            "Engine/Binaries/Win64/Mods",
+            "RSDragonwilds/Binaries/Win64/ue4ss/Mods",
+        ];
+        let mut files_written = Vec::new();
+        let mut written_file_hashes = HashMap::new();
+        let mut mappings = Vec::new();
+        for (index, route) in routes.iter().enumerate() {
+            let relative_path = format!("{route}/{legacy_folder}/scripts/main.lua");
+            let absolute_path = game_root.join(&relative_path);
+            fs::create_dir_all(absolute_path.parent().unwrap()).unwrap();
+            fs::write(&absolute_path, format!("route-{index}")).unwrap();
+            let absolute_path = absolute_path.to_string_lossy().to_string();
+            written_file_hashes.insert(
+                absolute_path.clone(),
+                sha256_file(Path::new(&absolute_path)).unwrap(),
+            );
+            files_written.push(absolute_path);
+            mappings.push(mapping(
+                "scripts/main.lua",
+                "game",
+                &relative_path,
+                "Generated adapter route.",
+            ));
+        }
+
+        let archive_name = format!("{legacy_folder}.zip");
+        let record = InstalledModRecord {
+            id: "quick-deposit".to_string(),
+            profile_id: profile.id.clone(),
+            archive_path: store_root
+                .join("packages")
+                .join(&archive_name)
+                .to_string_lossy()
+                .to_string(),
+            archive_name,
+            display_name: Some("Quick Deposit To Chests".to_string()),
+            package_id: Some("nexus:343".to_string()),
+            dependency_string: None,
+            package_provider: Some("nexus".to_string()),
+            package_version: Some("1.2".to_string()),
+            source_archive_sha256: None,
+            icon_url: None,
+            adapter_id: "future-runtime".to_string(),
+            summary: "Deploy a future runtime mod.".to_string(),
+            installed_at: now_string(),
+            files_written,
+            backups_written: Vec::new(),
+            written_file_hashes,
+            dependencies: Vec::new(),
+            config_files: Vec::new(),
+            runtime_id: None,
+            externally_managed: false,
+            enabled: true,
+            last_status: "installed".to_string(),
+            plan: Some(InstallPlan {
+                adapter_id: "future-runtime".to_string(),
+                adapter_name: "Future Runtime".to_string(),
+                confidence: 1.0,
+                summary: "Deploy a future runtime mod.".to_string(),
+                mappings,
+                dependencies: Vec::new(),
+                warnings: Vec::new(),
+                requires_confirmation: false,
+            }),
+        };
+        write_store(
+            &installed_mods_path(&store_root),
+            &StoreFile {
+                version: 1,
+                items: vec![record.clone()],
+            },
+        )
+        .unwrap();
+        write_receipt(&store_root, &profile, &record).unwrap();
+
+        let outcome = migrate_legacy_generated_mod_folders(&store_root, &profile).unwrap();
+
+        assert_eq!(outcome.migrated_records, 1);
+        assert_eq!(outcome.migrated_files, routes.len());
+        assert!(outcome.warnings.is_empty());
+        for route in routes {
+            assert!(!game_root.join(route).join(legacy_folder).exists());
+            assert!(game_root
+                .join(route)
+                .join("QuickDepositToChests/scripts/main.lua")
+                .is_file());
+        }
+
+        let migrated_store =
+            read_store::<InstalledModRecord>(&installed_mods_path(&store_root)).unwrap();
+        let migrated = &migrated_store.items[0];
+        assert!(migrated
+            .files_written
+            .iter()
+            .all(|path| path.contains("QuickDepositToChests") && !path.contains(legacy_folder)));
+        assert!(migrated.written_file_hashes.keys().all(|path| {
+            path.contains("QuickDepositToChests") && !path.contains(legacy_folder)
+        }));
+        assert!(migrated
+            .plan
+            .as_ref()
+            .unwrap()
+            .mappings
+            .iter()
+            .all(|mapping| {
+                mapping
+                    .target_relative_path
+                    .contains("QuickDepositToChests")
+                    && !mapping.target_relative_path.contains(legacy_folder)
+            }));
+        let receipt = read_json_with_backup::<InstalledModRecord>(&installed_mod_receipt_path(
+            &store_root,
+            &profile,
+            &record.id,
+        ))
+        .unwrap();
+        assert_eq!(receipt.files_written, migrated.files_written);
+        assert_eq!(receipt.written_file_hashes, migrated.written_file_hashes);
+
+        deactivate_mod_files(&store_root, &profile, migrated).unwrap();
+        for route in routes {
+            assert!(!game_root
+                .join(route)
+                .join("QuickDepositToChests/scripts/main.lua")
+                .exists());
+        }
+
+        let _ = fs::remove_dir_all(store_root);
+        let _ = fs::remove_dir_all(game_root);
+    }
+
+    #[test]
+    fn legacy_folder_migration_never_changes_externally_managed_records() {
+        let store_root = temp_game_dir("legacy-folder-external-store");
+        let game_root = temp_game_dir("legacy-folder-external-game");
+        let mut profile = test_profile("future-game", "Future Game", "unreal", "ue4ss");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        let legacy_folder = "7e099258-4cff-4617-9673-cdb0e89a5ffe-ExternalMod_343_1_2_2026-06-28";
+        let old_path = game_root.join(format!("Mods/{legacy_folder}/main.lua"));
+        fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+        fs::write(&old_path, "external").unwrap();
+        let record = InstalledModRecord {
+            id: "external-mod".to_string(),
+            profile_id: profile.id.clone(),
+            archive_path: format!("C:/Downloads/{legacy_folder}.zip"),
+            archive_name: format!("{legacy_folder}.zip"),
+            display_name: Some("External Mod".to_string()),
+            package_id: Some("external-script:test".to_string()),
+            dependency_string: None,
+            package_provider: None,
+            package_version: None,
+            source_archive_sha256: None,
+            icon_url: None,
+            adapter_id: "future-runtime".to_string(),
+            summary: String::new(),
+            installed_at: now_string(),
+            files_written: vec![old_path.to_string_lossy().to_string()],
+            backups_written: Vec::new(),
+            written_file_hashes: HashMap::new(),
+            dependencies: Vec::new(),
+            config_files: Vec::new(),
+            runtime_id: None,
+            externally_managed: true,
+            enabled: true,
+            last_status: "installed".to_string(),
+            plan: Some(InstallPlan {
+                adapter_id: "future-runtime".to_string(),
+                adapter_name: "Future Runtime".to_string(),
+                confidence: 1.0,
+                summary: String::new(),
+                mappings: vec![mapping(
+                    "main.lua",
+                    "game",
+                    &format!("Mods/{legacy_folder}/main.lua"),
+                    "External route.",
+                )],
+                dependencies: Vec::new(),
+                warnings: Vec::new(),
+                requires_confirmation: false,
+            }),
+        };
+        write_store(
+            &installed_mods_path(&store_root),
+            &StoreFile {
+                version: 1,
+                items: vec![record.clone()],
+            },
+        )
+        .unwrap();
+
+        let outcome = migrate_legacy_generated_mod_folders(&store_root, &profile).unwrap();
+
+        assert_eq!(outcome.migrated_records, 0);
+        assert!(old_path.is_file());
+        let unchanged =
+            read_store::<InstalledModRecord>(&installed_mods_path(&store_root)).unwrap();
+        assert_eq!(unchanged.items[0].files_written, record.files_written);
+
+        let _ = fs::remove_dir_all(store_root);
+        let _ = fs::remove_dir_all(game_root);
+    }
+
+    #[test]
+    fn legacy_folder_migration_keeps_old_files_when_clean_destination_conflicts() {
+        let store_root = temp_game_dir("legacy-folder-collision-store");
+        let game_root = temp_game_dir("legacy-folder-collision-game");
+        let mut profile = test_profile("future-game", "Future Game", "unreal", "ue4ss");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        let legacy_folder = "7e099258-4cff-4617-9673-cdb0e89a5ffe-CollisionMod_343_1_2_2026-06-28";
+        let old_path = game_root.join(format!("Mods/{legacy_folder}/main.lua"));
+        let clean_path = game_root.join("Mods/CollisionMod/main.lua");
+        fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(clean_path.parent().unwrap()).unwrap();
+        fs::write(&old_path, "managed old file").unwrap();
+        fs::write(&clean_path, "different existing file").unwrap();
+        let record = InstalledModRecord {
+            id: "collision-mod".to_string(),
+            profile_id: profile.id.clone(),
+            archive_path: format!("C:/Downloads/{legacy_folder}.zip"),
+            archive_name: format!("{legacy_folder}.zip"),
+            display_name: Some("Collision Mod".to_string()),
+            package_id: Some("nexus:343".to_string()),
+            dependency_string: None,
+            package_provider: Some("nexus".to_string()),
+            package_version: Some("1.2".to_string()),
+            source_archive_sha256: None,
+            icon_url: None,
+            adapter_id: "future-runtime".to_string(),
+            summary: String::new(),
+            installed_at: now_string(),
+            files_written: vec![old_path.to_string_lossy().to_string()],
+            backups_written: Vec::new(),
+            written_file_hashes: HashMap::from([(
+                old_path.to_string_lossy().to_string(),
+                sha256_file(&old_path).unwrap(),
+            )]),
+            dependencies: Vec::new(),
+            config_files: Vec::new(),
+            runtime_id: None,
+            externally_managed: false,
+            enabled: true,
+            last_status: "installed".to_string(),
+            plan: Some(InstallPlan {
+                adapter_id: "future-runtime".to_string(),
+                adapter_name: "Future Runtime".to_string(),
+                confidence: 1.0,
+                summary: String::new(),
+                mappings: vec![mapping(
+                    "main.lua",
+                    "game",
+                    &format!("Mods/{legacy_folder}/main.lua"),
+                    "Generated route.",
+                )],
+                dependencies: Vec::new(),
+                warnings: Vec::new(),
+                requires_confirmation: false,
+            }),
+        };
+        write_store(
+            &installed_mods_path(&store_root),
+            &StoreFile {
+                version: 1,
+                items: vec![record.clone()],
+            },
+        )
+        .unwrap();
+
+        let outcome = migrate_legacy_generated_mod_folders(&store_root, &profile).unwrap();
+
+        assert_eq!(outcome.migrated_records, 0);
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(old_path.is_file());
+        assert_eq!(
+            fs::read_to_string(&clean_path).unwrap(),
+            "different existing file"
+        );
+        let unchanged =
+            read_store::<InstalledModRecord>(&installed_mods_path(&store_root)).unwrap();
+        assert_eq!(unchanged.items[0].files_written, record.files_written);
+
+        let _ = fs::remove_dir_all(store_root);
+        let _ = fs::remove_dir_all(game_root);
     }
 
     #[test]
