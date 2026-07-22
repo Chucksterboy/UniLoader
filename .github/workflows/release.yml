@@ -51,13 +51,11 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "UniLoader ${{ github.ref_name }}"
           releaseBody: |
-            UniLoader v0.9.15 keeps generated mod folders readable and safely repairs older installs.
+            UniLoader v0.9.16 improves the mod library at compact window sizes.
 
-            - New mods use a concise, recognizable mod-name folder instead of provider IDs and timestamp-heavy archive names.
-            - Refresh migrates existing UniLoader-owned generated folders across every recorded client, engine, and server route.
-            - Receipts, hashes, configuration paths, and deployment plans stay synchronized with migrated folders.
-            - Collision checks preserve existing files and report a warning instead of overwriting unrelated data.
-            - Protected runtimes and externally managed mods are never renamed by the migration.
+            - The installed-mod list now follows the actual space available inside its panel instead of a viewport estimate.
+            - The final mod can always be scrolled completely above the fixed status bar.
+            - A small end inset keeps the last row and its controls comfortably visible at every supported window height.
           releaseDraft: false
           prerelease: false
 

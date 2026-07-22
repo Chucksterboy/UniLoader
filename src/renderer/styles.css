@@ -5330,12 +5330,13 @@ body {
   display: flex;
   flex-direction: column;
   align-items: stretch;
-  block-size: clamp(190px, calc(100vh - 440px), 576px);
-  max-block-size: 576px;
+  block-size: 100%;
+  max-block-size: none;
   min-height: 0;
   overflow-y: scroll;
   gap: 5px;
-  padding-right: 6px;
+  padding: 0 6px 10px 0;
+  scroll-padding-bottom: 10px;
   scrollbar-color: rgba(205, 157, 70, 0.58) rgba(7, 10, 11, 0.8);
   scrollbar-gutter: stable;
   scrollbar-width: thin;
