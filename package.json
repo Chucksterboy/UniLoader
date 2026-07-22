@@ -9,7 +9,8 @@
     "build:app": "tauri build --features custom-protocol --no-bundle",
     "build:web": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "test": "pnpm run typecheck && cargo test --manifest-path src-tauri/Cargo.toml",
+    "test": "pnpm run typecheck && pnpm run test:frontend && cargo test --manifest-path src-tauri/Cargo.toml",
+    "test:frontend": "vitest run",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -24,9 +25,13 @@
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.4",
+    "@testing-library/dom": "10.4.1",
+    "@testing-library/react": "16.3.0",
     "@types/node": "^22.10.5",
     "@types/react": "^18.3.18",
     "@types/react-dom": "^18.3.5",
-    "typescript": "^5.7.2"
+    "jsdom": "26.1.0",
+    "typescript": "^5.7.2",
+    "vitest": "3.2.4"
   }
 }

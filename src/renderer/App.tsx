@@ -63,6 +63,14 @@ import {
   SteamGameRecord
 } from "../shared/contracts";
 import { desktopApi } from "./tauriApi";
+import { rememberBoundedSetValue } from "./boundedCache";
+import { profileNeedsAttention } from "./health";
+import {
+  type MotionPhase,
+  motionDurationMs,
+  useFadePresence,
+  useFadeSwitch
+} from "./motion";
 
 const emptyProfileInput: CreateProfileInput = {
   name: "",
@@ -168,21 +176,6 @@ interface ConfigModalState {
   error?: string;
 }
 
-type MotionPhase = "entering" | "exiting";
-
-interface MotionState<T> {
-  className: string;
-  phase: MotionPhase;
-  value: T;
-}
-
-interface MotionPresence<T> {
-  className: string;
-  phase: MotionPhase;
-  value: T | null;
-}
-
-const motionDurationMs = 180;
 const discoverPageSize = 20;
 const nexusApiKeysUrl = "https://www.nexusmods.com/settings/api-keys";
 const startupSplashPulseMs = 2700;
@@ -193,18 +186,6 @@ const maxInstalledModProfileCaches = 12;
 const maxArtworkRefreshProfiles = 48;
 const maxProcessedNxmLinks = 128;
 const maxStoredModPresentations = 400;
-
-function rememberBoundedSetValue<T>(values: Set<T>, value: T, maxEntries: number) {
-  values.delete(value);
-  values.add(value);
-  while (values.size > maxEntries) {
-    const oldest = values.values().next().value as T | undefined;
-    if (oldest === undefined) {
-      break;
-    }
-    values.delete(oldest);
-  }
-}
 
 interface StoredModPresentation {
   cachedAt?: string;
@@ -527,10 +508,15 @@ export function App() {
     discoverLoadedProfileId === discoverProfileId ? onlineMods : [];
   const selectedPlan = analysis?.recommendedPlan;
   const detectionIssue = getDetectionIssue(detection);
+  const profileHealthNeedsAttention = profileNeedsAttention(
+    selectedProfile,
+    selectedProfileFolderConnected,
+    detection?.warnings.length ?? 0
+  );
   const healthTone: NoticeKind =
     error || notice?.kind === "error"
       ? "error"
-      : notice?.kind === "warning" || status.toLowerCase().includes("needs")
+      : notice?.kind === "warning" || profileHealthNeedsAttention
         ? "warning"
         : "success";
   const healthMessage = isRefreshing
@@ -1104,7 +1090,9 @@ export function App() {
       try {
         const installerPath = await api.downloadUpdateInstaller(
           updateInfo.installerUrl,
-          updateInfo.installerName
+          updateInfo.installerName,
+          updateInfo.installerSize,
+          updateInfo.installerSha256
         );
         setStatus("Installer launched");
         setNotice({
@@ -1894,6 +1882,17 @@ export function App() {
         title: "Could not open link",
         detail: String(caughtError)
       });
+    }
+  }
+
+  async function openDiagnosticsFolder() {
+    setError("");
+    try {
+      await api.openDiagnosticsFolder();
+      setStatus("Diagnostics folder opened");
+    } catch (caughtError) {
+      setError(String(caughtError));
+      setStatus("Diagnostics unavailable");
     }
   }
 
@@ -2721,6 +2720,7 @@ export function App() {
           <SettingsView
             appSettings={appSettings}
             nexusAttentionId={nexusSettingsAttentionId}
+            onOpenDiagnostics={() => void openDiagnosticsFolder()}
             onOpenExternalUrl={(url) => void openExternalUrl(url)}
             onSaveNexusApiKey={saveNexusApiKey}
             onUpdateSettings={updateAppSetting}
@@ -2826,70 +2826,6 @@ export function App() {
     ) : null}
     </>
   );
-}
-
-function motionClassName(phase: MotionPhase): string {
-  return phase === "exiting" ? "ui-motion-exit" : "ui-motion-enter";
-}
-
-function useFadePresence<T>(
-  value: T | null,
-  durationMs = motionDurationMs
-): MotionPresence<T> {
-  const [renderedValue, setRenderedValue] = useState<T | null>(value);
-  const [phase, setPhase] = useState<MotionPhase>("entering");
-
-  useEffect(() => {
-    if (value !== null) {
-      setRenderedValue(value);
-      setPhase("entering");
-      return undefined;
-    }
-
-    if (renderedValue === null) {
-      return undefined;
-    }
-
-    setPhase("exiting");
-    const timeoutId = window.setTimeout(() => {
-      setRenderedValue(null);
-      setPhase("entering");
-    }, durationMs);
-
-    return () => window.clearTimeout(timeoutId);
-  }, [durationMs, renderedValue, value]);
-
-  return {
-    className: motionClassName(phase),
-    phase,
-    value: renderedValue
-  };
-}
-
-function useFadeSwitch<T>(value: T, durationMs = motionDurationMs): MotionState<T> {
-  const [renderedValue, setRenderedValue] = useState<T>(value);
-  const [phase, setPhase] = useState<MotionPhase>("entering");
-
-  useEffect(() => {
-    if (Object.is(value, renderedValue)) {
-      setPhase("entering");
-      return undefined;
-    }
-
-    setPhase("exiting");
-    const timeoutId = window.setTimeout(() => {
-      setRenderedValue(value);
-      setPhase("entering");
-    }, durationMs);
-
-    return () => window.clearTimeout(timeoutId);
-  }, [durationMs, renderedValue, value]);
-
-  return {
-    className: motionClassName(phase),
-    phase,
-    value: renderedValue
-  };
 }
 
 function getFolderName(folderPath: string): string {
@@ -4460,6 +4396,7 @@ function TransferView({
 interface SettingsViewProps {
   appSettings: AppSettings;
   nexusAttentionId: number;
+  onOpenDiagnostics(): void;
   onOpenExternalUrl(url: string): void;
   onSaveNexusApiKey(apiKey: string): Promise<void>;
   onUpdateSettings(settings: AppSettings): Promise<void>;
@@ -4468,6 +4405,7 @@ interface SettingsViewProps {
 function SettingsView({
   appSettings,
   nexusAttentionId,
+  onOpenDiagnostics,
   onOpenExternalUrl,
   onSaveNexusApiKey,
   onUpdateSettings
@@ -4512,6 +4450,25 @@ function SettingsView({
             type="checkbox"
           />
         </label>
+      </section>
+
+      <section className="work-panel settings-panel">
+        <div className="panel-title-row">
+          <div>
+            <p className="eyebrow">Support</p>
+            <h3>Diagnostics</h3>
+          </div>
+          <Activity size={20} />
+        </div>
+        <p className="muted">
+          UniLoader keeps a small rotating operation log without API keys or mod contents.
+        </p>
+        <div className="settings-key-actions">
+          <button className="secondary-button" onClick={onOpenDiagnostics} type="button">
+            <FolderOpen size={16} />
+            Open Diagnostics
+          </button>
+        </div>
       </section>
 
       <section

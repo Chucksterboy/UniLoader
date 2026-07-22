@@ -42,8 +42,18 @@ export const desktopApi: DesktopApi = {
   minimizeWindow: () => getCurrentWindow().minimize(),
   toggleMaximizeWindow: () => getCurrentWindow().toggleMaximize(),
   closeWindow: () => getCurrentWindow().close(),
-  downloadUpdateInstaller: (url: string, fileName?: string) =>
-    invoke<string>("download_update_installer", { url, fileName }),
+  downloadUpdateInstaller: (
+    url: string,
+    fileName?: string,
+    expectedSize?: number,
+    expectedSha256?: string
+  ) =>
+    invoke<string>("download_update_installer", {
+      url,
+      fileName,
+      expectedSize,
+      expectedSha256
+    }),
   getCachedSteamArtwork: (steamAppId, variant) =>
     invoke<string | null>("get_cached_steam_artwork", { steamAppId, variant }),
   scanSteamGames: () => invoke<SteamGameRecord[]>("scan_steam_games"),
@@ -232,7 +242,8 @@ export const desktopApi: DesktopApi = {
     invoke<void>("open_profile_game_folder", { profileId }),
   openExternalUrl: (url: string) =>
     invoke<void>("open_external_url", { url }),
-  getStorePath: () => invoke<string>("get_store_path")
+  getStorePath: () => invoke<string>("get_store_path"),
+  openDiagnosticsFolder: () => invoke<void>("open_diagnostics_folder")
 };
 
 function normalizeDialogSelection(selection: string | string[] | null): string | null {

@@ -106,8 +106,7 @@ static PROFILE_RUNTIME_INFERENCE_CACHE: OnceLock<
 > = OnceLock::new();
 static DISCOVERY_PROVIDER_CACHE: OnceLock<Mutex<HashMap<String, DiscoveryProviderCacheEntry>>> =
     OnceLock::new();
-static STEAM_GAMES_CACHE: OnceLock<Mutex<Option<(Instant, Vec<SteamGameRecord>)>>> =
-    OnceLock::new();
+static STEAM_GAMES_CACHE: OnceLock<Mutex<Option<SteamGamesCacheEntry>>> = OnceLock::new();
 static NEXUS_KEY_VALIDATION_CACHE: OnceLock<Mutex<Option<NexusKeyValidationCacheEntry>>> =
     OnceLock::new();
 static RUNTIME_REGISTRY: OnceLock<Vec<RuntimeDefinition>> = OnceLock::new();
@@ -149,6 +148,20 @@ struct DiscoveryProviderCacheEntry {
 struct RuntimeInferenceCacheEntry {
     fetched_at: Instant,
     value: Option<ProviderRuntimeInference>,
+}
+
+#[derive(Debug, Clone)]
+struct SteamGamesCacheEntry {
+    fetched_at: Instant,
+    games: Vec<SteamGameRecord>,
+}
+
+struct DiscoveryQuery<'a> {
+    page: usize,
+    page_size: usize,
+    sort: &'a str,
+    query: &'a str,
+    request_id: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -691,6 +704,10 @@ struct GithubReleaseResponse {
 struct GithubReleaseAsset {
     name: String,
     browser_download_url: String,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
+    digest: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1145,6 +1162,8 @@ pub struct AppUpdateInfo {
     release_url: Option<String>,
     installer_url: Option<String>,
     installer_name: Option<String>,
+    installer_size: Option<u64>,
+    installer_sha256: Option<String>,
     status: String,
     message: String,
 }
@@ -1262,6 +1281,8 @@ async fn check_app_update() -> AppUpdateInfo {
             release_url: None,
             installer_url: None,
             installer_name: None,
+            installer_size: None,
+            installer_sha256: None,
             status: "error".to_string(),
             message: format!("Update check stopped unexpectedly: {error}"),
         })
@@ -1280,6 +1301,8 @@ fn check_app_update_impl() -> AppUpdateInfo {
                 release_url: None,
                 installer_url: None,
                 installer_name: None,
+                installer_size: None,
+                installer_sha256: None,
                 status: "error".to_string(),
                 message: format!("Could not prepare update checker: {error}"),
             };
@@ -1300,6 +1323,8 @@ fn check_app_update_impl() -> AppUpdateInfo {
                 release_url: None,
                 installer_url: None,
                 installer_name: None,
+                installer_size: None,
+                installer_sha256: None,
                 status: "error".to_string(),
                 message: format!("Could not check for updates: {error}"),
             };
@@ -1314,6 +1339,8 @@ fn check_app_update_impl() -> AppUpdateInfo {
             release_url: None,
             installer_url: None,
             installer_name: None,
+            installer_size: None,
+            installer_sha256: None,
             status: "unavailable".to_string(),
             message: "No GitHub release has been published yet.".to_string(),
         };
@@ -1328,6 +1355,8 @@ fn check_app_update_impl() -> AppUpdateInfo {
             release_url: None,
             installer_url: None,
             installer_name: None,
+            installer_size: None,
+            installer_sha256: None,
             status: "error".to_string(),
             message: format!("GitHub update check failed with HTTP {status}."),
         };
@@ -1343,6 +1372,8 @@ fn check_app_update_impl() -> AppUpdateInfo {
                 release_url: None,
                 installer_url: None,
                 installer_name: None,
+                installer_size: None,
+                installer_sha256: None,
                 status: "error".to_string(),
                 message: format!("GitHub release response was not readable: {error}"),
             };
@@ -1359,6 +1390,8 @@ fn check_app_update_impl() -> AppUpdateInfo {
         release_url: release.html_url.clone(),
         installer_url: installer_asset.map(|asset| asset.browser_download_url.clone()),
         installer_name: installer_asset.map(|asset| asset.name.clone()),
+        installer_size: installer_asset.and_then(|asset| asset.size),
+        installer_sha256: installer_asset.and_then(github_asset_sha256),
         status: if update_available {
             "available"
         } else {
@@ -1976,9 +2009,9 @@ fn scan_steam_games_impl() -> Vec<SteamGameRecord> {
 
 fn scan_steam_games_cached() -> Vec<SteamGameRecord> {
     if let Ok(cache) = STEAM_GAMES_CACHE.get_or_init(|| Mutex::new(None)).lock() {
-        if let Some((fetched_at, games)) = cache.as_ref() {
-            if fetched_at.elapsed() <= STEAM_GAMES_CACHE_TTL {
-                return games.clone();
+        if let Some(entry) = cache.as_ref() {
+            if entry.fetched_at.elapsed() <= STEAM_GAMES_CACHE_TTL {
+                return entry.games.clone();
             }
         }
     }
@@ -1990,7 +2023,10 @@ fn scan_steam_games_cached() -> Vec<SteamGameRecord> {
 
 fn update_steam_games_cache(games: &[SteamGameRecord]) {
     if let Ok(mut cache) = STEAM_GAMES_CACHE.get_or_init(|| Mutex::new(None)).lock() {
-        *cache = Some((Instant::now(), games.to_vec()));
+        *cache = Some(SteamGamesCacheEntry {
+            fetched_at: Instant::now(),
+            games: games.to_vec(),
+        });
     }
 }
 
@@ -4282,7 +4318,16 @@ async fn discover_online_mods(
             ensure_verified_steam_profile(&profile)?;
             let settings = read_app_settings(&root)?;
             discover_online_mods_for_profile(
-                &root, &profile, &settings, page, page_size, &sort, &query, request_id,
+                &root,
+                &profile,
+                &settings,
+                DiscoveryQuery {
+                    page,
+                    page_size,
+                    sort: &sort,
+                    query: &query,
+                    request_id,
+                },
             )
         },
     )
@@ -5342,6 +5387,16 @@ fn get_store_path(app: AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn open_diagnostics_folder(app: AppHandle) -> Result<(), String> {
+    let diagnostics_file = operation::diagnostics_path(&app)?;
+    let diagnostics_dir = diagnostics_file
+        .parent()
+        .ok_or_else(|| "Could not resolve the diagnostics folder.".to_string())?;
+    fs::create_dir_all(diagnostics_dir).map_err(error_to_string)?;
+    open_folder_in_shell(diagnostics_dir)
+}
+
+#[tauri::command]
 fn open_profile_game_folder(app: AppHandle, profile_id: String) -> Result<(), String> {
     let root = store_root(&app)?;
     let profile = get_profile(&root, &profile_id)?;
@@ -5363,16 +5418,38 @@ fn open_external_url(url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn download_update_installer(
+async fn download_update_installer(
     app: AppHandle,
     url: String,
     file_name: Option<String>,
+    expected_size: Option<u64>,
+    expected_sha256: Option<String>,
+) -> Result<String, String> {
+    let operation_app = app.clone();
+    operation::run_blocking(app, "download_update_installer", None, move || {
+        download_update_installer_sync(
+            operation_app,
+            url,
+            file_name,
+            expected_size,
+            expected_sha256,
+        )
+    })
+    .await
+}
+
+fn download_update_installer_sync(
+    app: AppHandle,
+    url: String,
+    file_name: Option<String>,
+    expected_size: Option<u64>,
+    expected_sha256: Option<String>,
 ) -> Result<String, String> {
     let trimmed_url = validated_update_url(&url)?;
     let safe_name = update_installer_file_name(&trimmed_url, file_name.as_deref())?;
     let download_dir = update_download_dir()?;
     fs::create_dir_all(&download_dir).map_err(error_to_string)?;
-    let destination = download_dir.join(safe_name);
+    let destination = download_dir.join(&safe_name);
     if destination.exists() {
         fs::remove_file(&destination).map_err(error_to_string)?;
     }
@@ -5382,8 +5459,29 @@ fn download_update_installer(
         .map_err(error_to_string)?;
 
     download_url_to_file(&client, &trimmed_url, &destination)?;
+    if let Some(expected_size) = expected_size {
+        let actual_size = destination.metadata().map_err(error_to_string)?.len();
+        if actual_size != expected_size {
+            let _ = fs::remove_file(&destination);
+            return Err("The downloaded installer size does not match the selected GitHub asset and was deleted.".to_string());
+        }
+    }
+    match has_expected_installer_magic(&destination) {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = fs::remove_file(&destination);
+            return Err(
+                "The downloaded file is not a recognized Windows installer and was deleted."
+                    .to_string(),
+            );
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&destination);
+            return Err(error);
+        }
+    }
     let checksum_url = format!("{trimmed_url}.sha256");
-    let expected_hash = download_update_checksum(&client, &checksum_url)?;
+    let expected_hash = download_update_checksum(&client, &checksum_url, &safe_name)?;
     let actual_hash = sha256_file(&destination)?;
     if !actual_hash.eq_ignore_ascii_case(&expected_hash) {
         let _ = fs::remove_file(&destination);
@@ -5391,6 +5489,15 @@ fn download_update_installer(
             "The downloaded installer failed its SHA-256 integrity check and was deleted."
                 .to_string(),
         );
+    }
+    if let Some(api_hash) = expected_sha256.as_deref() {
+        if !actual_hash.eq_ignore_ascii_case(api_hash) {
+            let _ = fs::remove_file(&destination);
+            return Err(
+                "The downloaded installer does not match GitHub's release digest and was deleted."
+                    .to_string(),
+            );
+        }
     }
     launch_update_installer(&destination)?;
 
@@ -5500,7 +5607,8 @@ pub fn run() {
             open_external_url,
             download_update_installer,
             check_app_update,
-            get_store_path
+            get_store_path,
+            open_diagnostics_folder
         ])
         .run(tauri::generate_context!())
         .expect("failed to run UniLoader");
@@ -8683,22 +8791,18 @@ fn discover_online_mods_for_profile(
     store_root: &Path,
     profile: &GameProfile,
     settings: &AppSettings,
-    page: usize,
-    page_size: usize,
-    sort: &str,
-    query: &str,
-    request_id: u64,
+    request: DiscoveryQuery<'_>,
 ) -> Result<DiscoveryPage, String> {
-    let page = page.max(1);
-    let page_size = page_size.clamp(1, MAX_DISCOVERY_PAGE_SIZE);
+    let page = request.page.max(1);
+    let page_size = request.page_size.clamp(1, MAX_DISCOVERY_PAGE_SIZE);
     let offset = (page - 1).saturating_mul(page_size);
     let needed = offset.saturating_add(page_size);
     let mut results = Vec::new();
     let mut provider_errors = Vec::new();
     let mut provider_total = 0_usize;
-    let normalized_query = query.trim().to_lowercase();
+    let normalized_query = request.query.trim().to_lowercase();
 
-    ensure_discovery_is_current(&profile.id, request_id)?;
+    ensure_discovery_is_current(&profile.id, request.request_id)?;
 
     if let Some(community) = thunderstore_community_for_profile(profile) {
         match discover_thunderstore_community_mods(store_root, profile, &community) {
@@ -8713,14 +8817,14 @@ fn discover_online_mods_for_profile(
             Err(error) => provider_errors.push(format!("Thunderstore: {error}")),
         }
     }
-    ensure_discovery_is_current(&profile.id, request_id)?;
+    ensure_discovery_is_current(&profile.id, request.request_id)?;
 
     if let Some(domain) = nexus_domain_for_profile(profile) {
         let cache_key = format!(
             "nexus:{}:{}:{}:{}",
             profile.id,
             domain.to_ascii_lowercase(),
-            sort.to_ascii_lowercase(),
+            request.sort.to_ascii_lowercase(),
             normalized_query
         );
         let fetch_count = needed.min(DISCOVERY_PROVIDER_CACHE_MAX_RECORDS);
@@ -8729,9 +8833,9 @@ fn discover_online_mods_for_profile(
             &domain,
             settings.nexus_api_ready(),
             fetch_count,
-            sort,
+            request.sort,
             &normalized_query,
-            request_id,
+            request.request_id,
         ) {
             Ok((mut records, mut total)) => {
                 let fetched_count = records.len();
@@ -8754,7 +8858,7 @@ fn discover_online_mods_for_profile(
             }
         }
     }
-    ensure_discovery_is_current(&profile.id, request_id)?;
+    ensure_discovery_is_current(&profile.id, request.request_id)?;
 
     let mut seen_records = HashSet::new();
     let before_deduplication = results.len();
@@ -8766,7 +8870,7 @@ fn discover_online_mods_for_profile(
         ))
     });
     provider_total = provider_total.saturating_sub(before_deduplication - results.len());
-    sort_online_mods(&mut results, sort);
+    sort_online_mods(&mut results, request.sort);
     if results.is_empty() && !provider_errors.is_empty() {
         return Err(provider_errors.join(" "));
     }
@@ -17098,8 +17202,211 @@ fn update_yaml_config_content(
 
     let target = yaml_value_at_path_mut(&mut root, &path)
         .ok_or_else(|| format!("Setting not found: {key}"))?;
-    *target = typed_yaml_config_value(target, next_value)?;
-    serde_yaml::to_string(&root).map_err(error_to_string)
+    let next_typed_value = typed_yaml_config_value(target, next_value)?;
+    let replacement = yaml_scalar_replacement(&next_typed_value)?;
+    replace_yaml_value_in_place(content, &path, &replacement)
+}
+
+fn yaml_scalar_replacement(value: &serde_yaml::Value) -> Result<String, String> {
+    if matches!(
+        value,
+        serde_yaml::Value::Mapping(_) | serde_yaml::Value::Tagged(_)
+    ) {
+        return Err("Complex YAML objects cannot be edited safely in place.".to_string());
+    }
+
+    let serialized = serde_yaml::to_string(value).map_err(error_to_string)?;
+    let value = serialized
+        .trim()
+        .strip_prefix("---")
+        .unwrap_or(serialized.trim())
+        .trim();
+    if value.contains('\n') {
+        return Err("Multi-line YAML values cannot be edited safely in place.".to_string());
+    }
+    Ok(value.to_string())
+}
+
+fn replace_yaml_value_in_place(
+    content: &str,
+    target_path: &[String],
+    replacement: &str,
+) -> Result<String, String> {
+    let newline = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let had_trailing_newline = content.ends_with('\n') || content.ends_with('\r');
+    let mut mapping_path: Vec<(usize, String)> = Vec::new();
+    let mut replaced = false;
+    let mut output = Vec::new();
+
+    for line in content.lines() {
+        if replaced {
+            output.push(line.to_string());
+            continue;
+        }
+
+        let Some((indent, key, colon_index)) = yaml_mapping_line(line) else {
+            output.push(line.to_string());
+            continue;
+        };
+
+        while mapping_path
+            .last()
+            .map(|(parent_indent, _)| *parent_indent >= indent)
+            .unwrap_or(false)
+        {
+            mapping_path.pop();
+        }
+
+        let mut current_path = mapping_path
+            .iter()
+            .map(|(_, part)| part.clone())
+            .collect::<Vec<_>>();
+        current_path.push(key.clone());
+
+        let remainder = &line[colon_index + 1..];
+        let value_without_comment = yaml_value_without_comment(remainder).trim();
+        if current_path == target_path {
+            if value_without_comment.is_empty() {
+                return Err("Block-style YAML values cannot be edited safely in place.".to_string());
+            }
+            output.push(replace_yaml_line_value(line, colon_index, replacement));
+            replaced = true;
+            continue;
+        }
+
+        if value_without_comment.is_empty() {
+            mapping_path.push((indent, key));
+        }
+        output.push(line.to_string());
+    }
+
+    if !replaced {
+        return Err(format!(
+            "Setting not found in a formatting-preserving YAML location: {}",
+            target_path.join(".")
+        ));
+    }
+
+    let mut updated = output.join(newline);
+    if had_trailing_newline {
+        updated.push_str(newline);
+    }
+    Ok(updated)
+}
+
+fn yaml_mapping_line(line: &str) -> Option<(usize, String, usize)> {
+    let indent = line
+        .len()
+        .saturating_sub(line.trim_start_matches(' ').len());
+    let trimmed = line.get(indent..)?;
+    if trimmed.is_empty()
+        || trimmed.starts_with('#')
+        || trimmed.starts_with('-')
+        || trimmed.starts_with("---")
+        || trimmed.starts_with("...")
+    {
+        return None;
+    }
+
+    let colon_offset = yaml_unquoted_character_index(trimmed, ':')?;
+    let raw_key = trimmed[..colon_offset].trim();
+    if raw_key.is_empty() {
+        return None;
+    }
+    let key = raw_key
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            raw_key
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        })
+        .unwrap_or(raw_key)
+        .to_string();
+    Some((indent, key, indent + colon_offset))
+}
+
+fn yaml_unquoted_character_index(value: &str, needle: char) -> Option<usize> {
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+    for (index, character) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && double_quoted {
+            escaped = true;
+            continue;
+        }
+        match character {
+            '\'' if !double_quoted => single_quoted = !single_quoted,
+            '"' if !single_quoted => double_quoted = !double_quoted,
+            _ if character == needle && !single_quoted && !double_quoted => return Some(index),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn yaml_value_without_comment(value: &str) -> &str {
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+    for (index, character) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && double_quoted {
+            escaped = true;
+            continue;
+        }
+        match character {
+            '\'' if !double_quoted => single_quoted = !single_quoted,
+            '"' if !single_quoted => double_quoted = !double_quoted,
+            '#' if !single_quoted
+                && !double_quoted
+                && value[..index]
+                    .chars()
+                    .last()
+                    .map(char::is_whitespace)
+                    .unwrap_or(true) =>
+            {
+                return &value[..index];
+            }
+            _ => {}
+        }
+    }
+    value
+}
+
+fn replace_yaml_line_value(line: &str, colon_index: usize, replacement: &str) -> String {
+    let remainder = &line[colon_index + 1..];
+    let spacing_len = remainder.len().saturating_sub(remainder.trim_start().len());
+    let spacing = &remainder[..spacing_len];
+    let value_and_comment = &remainder[spacing_len..];
+    let value_without_comment = yaml_value_without_comment(value_and_comment);
+    let suffix = &value_and_comment[value_without_comment.len()..];
+    let trailing_spacing_len = value_without_comment
+        .len()
+        .saturating_sub(value_without_comment.trim_end().len());
+    let trailing_spacing = &value_without_comment[value_without_comment
+        .len()
+        .saturating_sub(trailing_spacing_len)..];
+
+    format!(
+        "{}{}{}{}{}",
+        &line[..colon_index + 1],
+        spacing,
+        replacement,
+        trailing_spacing,
+        suffix
+    )
 }
 
 fn yaml_value_at_path_mut<'a>(
@@ -19512,6 +19819,13 @@ fn select_update_installer_asset(release: &GithubReleaseResponse) -> Option<&Git
         .map(|(_, asset)| asset)
 }
 
+fn github_asset_sha256(asset: &GithubReleaseAsset) -> Option<String> {
+    let digest = asset.digest.as_deref()?.trim();
+    let hash = digest.strip_prefix("sha256:")?;
+    (hash.len() == 64 && hash.chars().all(|character| character.is_ascii_hexdigit()))
+        .then(|| hash.to_ascii_lowercase())
+}
+
 fn update_installer_asset_score(name: &str) -> Option<i32> {
     let lower_name = name.to_lowercase();
     if !lower_name.starts_with("uniloader") {
@@ -19624,7 +19938,11 @@ fn validated_update_url(value: &str) -> Result<String, String> {
     Ok(parsed.to_string())
 }
 
-fn download_update_checksum(client: &Client, checksum_url: &str) -> Result<String, String> {
+fn download_update_checksum(
+    client: &Client,
+    checksum_url: &str,
+    expected_file_name: &str,
+) -> Result<String, String> {
     validated_update_url(checksum_url.trim_end_matches(".sha256"))?;
     let mut response = client
         .get(checksum_url)
@@ -19644,12 +19962,35 @@ fn download_update_checksum(client: &Client, checksum_url: &str) -> Result<Strin
         return Err("The update checksum file is unexpectedly large.".to_string());
     }
     let text = String::from_utf8(bytes).map_err(error_to_string)?;
-    let hash = text
-        .split_whitespace()
+    let mut fields = text.split_whitespace();
+    let hash = fields
         .next()
         .filter(|value| value.len() == 64 && value.chars().all(|ch| ch.is_ascii_hexdigit()))
         .ok_or_else(|| "The update checksum file is invalid.".to_string())?;
+    let checksum_file_name = fields
+        .next()
+        .map(|value| value.trim_start_matches('*'))
+        .ok_or_else(|| "The update checksum is not bound to an installer file.".to_string())?;
+    if !checksum_file_name.eq_ignore_ascii_case(expected_file_name) {
+        return Err("The update checksum belongs to a different installer asset.".to_string());
+    }
     Ok(hash.to_lowercase())
+}
+
+fn has_expected_installer_magic(path: &Path) -> Result<bool, String> {
+    let mut file = fs::File::open(path).map_err(error_to_string)?;
+    let mut header = [0_u8; 8];
+    let read = file.read(&mut header).map_err(error_to_string)?;
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    Ok(match extension.as_str() {
+        "exe" => read >= 2 && header[..2] == *b"MZ",
+        "msi" => read == header.len() && header == [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1],
+        _ => false,
+    })
 }
 
 fn update_download_dir() -> Result<PathBuf, String> {
@@ -20593,18 +20934,56 @@ mod tests {
                     browser_download_url:
                         "https://github.com/Chucksterboy/UniLoader/releases/download/v0.5/UniLoader_0.5.0_x64_en-US.msi"
                             .to_string(),
+                    size: Some(42),
+                    digest: None,
                 },
                 GithubReleaseAsset {
                     name: "UniLoader_0.5.0_x64-setup.exe".to_string(),
                     browser_download_url:
                         "https://github.com/Chucksterboy/UniLoader/releases/download/v0.5/UniLoader_0.5.0_x64-setup.exe"
                             .to_string(),
+                    size: Some(84),
+                    digest: Some(format!("sha256:{}", "a".repeat(64))),
                 },
             ],
         };
 
         let asset = select_update_installer_asset(&release).unwrap();
         assert_eq!(asset.name, "UniLoader_0.5.0_x64-setup.exe");
+        assert_eq!(asset.size, Some(84));
+        assert_eq!(github_asset_sha256(asset), Some("a".repeat(64)));
+    }
+
+    #[test]
+    fn github_release_digest_accepts_only_well_formed_sha256_values() {
+        let asset = GithubReleaseAsset {
+            name: "UniLoader-setup.exe".to_string(),
+            browser_download_url:
+                "https://github.com/Chucksterboy/UniLoader/releases/download/v1/UniLoader-setup.exe"
+                    .to_string(),
+            size: Some(42),
+            digest: Some("sha256:not-a-hash".to_string()),
+        };
+
+        assert_eq!(github_asset_sha256(&asset), None);
+    }
+
+    #[test]
+    fn update_installer_magic_rejects_web_payloads() {
+        let root = temp_game_dir("update-installer-magic");
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("UniLoader-setup.exe");
+        let package = root.join("UniLoader.msi");
+        let invalid = root.join("invalid-setup.exe");
+        fs::write(&executable, b"MZ\0\0test").unwrap();
+        fs::write(&package, [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]).unwrap();
+        fs::write(&invalid, b"<!doctype html>").unwrap();
+
+        assert!(has_expected_installer_magic(&executable).unwrap());
+        assert!(has_expected_installer_magic(&package).unwrap());
+        assert!(!has_expected_installer_magic(&invalid).unwrap());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -22190,6 +22569,29 @@ mod tests {
             server.get("enabled").and_then(serde_yaml::Value::as_bool),
             Some(false)
         );
+    }
+
+    #[test]
+    fn yaml_config_editor_preserves_comments_spacing_and_sibling_order() {
+        let content = "# Keep this header\r\ngameplay:\r\n  stamina: 100  # points\r\n  enabled: true # keep inline\r\nserver:\r\n  enabled: false\r\n";
+
+        let updated =
+            update_yaml_config_content(content, Some("gameplay"), "enabled", "false").unwrap();
+
+        assert_eq!(
+            updated,
+            "# Keep this header\r\ngameplay:\r\n  stamina: 100  # points\r\n  enabled: false # keep inline\r\nserver:\r\n  enabled: false\r\n"
+        );
+    }
+
+    #[test]
+    fn yaml_config_editor_rejects_type_changes_without_rewriting_file() {
+        let content = "gameplay:\n  stamina: 100\n";
+
+        let result = update_yaml_config_content(content, Some("gameplay"), "stamina", "high");
+
+        assert!(result.is_err());
+        assert_eq!(content, "gameplay:\n  stamina: 100\n");
     }
 
     #[test]

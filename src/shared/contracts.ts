@@ -282,6 +282,8 @@ export interface AppUpdateInfo {
   releaseUrl?: string;
   installerUrl?: string;
   installerName?: string;
+  installerSize?: number;
+  installerSha256?: string;
   status: AppUpdateStatus;
   message: string;
 }
@@ -444,7 +446,12 @@ export interface DesktopApi {
   minimizeWindow(): Promise<void>;
   toggleMaximizeWindow(): Promise<void>;
   closeWindow(): Promise<void>;
-  downloadUpdateInstaller(url: string, fileName?: string): Promise<string>;
+  downloadUpdateInstaller(
+    url: string,
+    fileName?: string,
+    expectedSize?: number,
+    expectedSha256?: string
+  ): Promise<string>;
   getCachedSteamArtwork(
     steamAppId: string,
     variant: "hero" | "poster"
@@ -514,4 +521,5 @@ export interface DesktopApi {
   openProfileGameFolder(profileId: string): Promise<void>;
   openExternalUrl(url: string): Promise<void>;
   getStorePath(): Promise<string>;
+  openDiagnosticsFolder(): Promise<void>;
 }
