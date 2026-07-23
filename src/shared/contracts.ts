@@ -433,23 +433,6 @@ export interface ProfileImportResult {
   warnings: string[];
 }
 
-export interface ProfileShareGenerateResult {
-  code: string;
-  expiresAt: string;
-  profileName: string;
-  uploadedBytes: number;
-  exportedMods: number;
-  exportedConfigFiles: number;
-  warnings: string[];
-}
-
-export interface ProfileShareImportResult {
-  code: string;
-  expiresAt: string;
-  downloadedBytes: number;
-  importResult: ProfileImportResult;
-}
-
 export interface AppState {
   profiles: GameProfile[];
   installedMods: InstalledModRecord[];
@@ -495,8 +478,6 @@ export interface DesktopApi {
   updateProfileGameFolder(profileId: string, gamePath: string): Promise<ProfileGameFolderUpdateResult>;
   exportProfileBundle(profileId: string, profileName: string): Promise<ProfileExportResult | null>;
   importProfileBundle(): Promise<ProfileImportResult | null>;
-  generateProfileShare(profileId: string): Promise<ProfileShareGenerateResult>;
-  importProfileShare(code: string): Promise<ProfileShareImportResult>;
   selectGameFolder(): Promise<string | null>;
   detectGameSetup(gamePath: string): Promise<GameDetectionResult>;
   selectAndAnalyzeArchive(profileId: string): Promise<ArchiveAnalysis | null>;

@@ -28,8 +28,6 @@ import {
   ProfileLaunchModeResult,
   ProfileModToggleResult,
   ProfileRefreshResult,
-  ProfileShareGenerateResult,
-  ProfileShareImportResult,
   SteamGameRecord,
   UpdateModConfigValueInput
 } from "../shared/contracts";
@@ -117,10 +115,6 @@ export const desktopApi: DesktopApi = {
 
     return invoke<ProfileImportResult>("import_profile_bundle", { bundlePath });
   },
-  generateProfileShare: (profileId: string) =>
-    invoke<ProfileShareGenerateResult>("generate_profile_share", { profileId }),
-  importProfileShare: (code: string) =>
-    invoke<ProfileShareImportResult>("import_profile_share", { code }),
   selectGameFolder: async () => {
     const selected = await open({
       directory: true,

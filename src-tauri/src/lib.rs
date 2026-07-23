@@ -46,9 +46,6 @@ const MAX_ARCHIVE_PATH_DEPTH: usize = 32;
 const MAX_ARCHIVE_COMPRESSION_RATIO: u64 = 500;
 const MAX_IMPORT_SCAN_DEPTH: usize = 32;
 const IMPORT_CACHE_MAX_AGE_HOURS: i64 = 24;
-const PROFILE_SHARE_CODE_LENGTH: usize = 16;
-const PROFILE_SHARE_CONTENT_TYPE: &str = "application/vnd.uniloader.profile+zip";
-const PROFILE_SHARE_API_ENV: &str = "UNILOADER_PROFILE_SHARE_API_URL";
 const THUNDERSTORE_API_BASE: &str = "https://thunderstore.io/api/experimental/package";
 const THUNDERSTORE_COMMUNITY_API_BASE: &str = "https://thunderstore.io/c";
 const NEXUS_GRAPHQL_API_BASE: &str = "https://api.nexusmods.com/v2/graphql";
@@ -1135,27 +1132,6 @@ pub struct ProfileImportResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ProfileShareGenerateResult {
-    code: String,
-    expires_at: String,
-    profile_name: String,
-    uploaded_bytes: u64,
-    exported_mods: usize,
-    exported_config_files: usize,
-    warnings: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProfileShareImportResult {
-    code: String,
-    expires_at: String,
-    downloaded_bytes: u64,
-    import_result: ProfileImportResult,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ProfileBundleManifest {
     schema_version: u32,
     exported_at: String,
@@ -1198,49 +1174,14 @@ impl ProfileBundleExportOptions {
         }
     }
 
-    fn cloud_share() -> Self {
+    #[cfg(test)]
+    fn self_contained() -> Self {
         Self {
             include_managed_runtimes: true,
             require_complete_sources: true,
             self_contained: true,
         }
     }
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ProfileShareCreateRequest {
-    profile_name: String,
-    size_bytes: u64,
-    sha256: String,
-    app_version: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ProfileShareCompleteRequest {
-    size_bytes: u64,
-    sha256: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ProfileShareCreateResponse {
-    code: String,
-    expires_at: String,
-    upload_url: String,
-    #[serde(default)]
-    upload_headers: HashMap<String, String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ProfileShareResolveResponse {
-    code: String,
-    expires_at: String,
-    download_url: String,
-    size_bytes: u64,
-    sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2902,35 +2843,6 @@ async fn import_profile_bundle(
     .map_err(error_to_string)?
 }
 
-#[tauri::command]
-async fn generate_profile_share(
-    app: AppHandle,
-    profile_id: String,
-) -> Result<ProfileShareGenerateResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let profile_operation = operation::profile_lock(&profile_id)?;
-        let _profile_operation = operation::lock_profile(&profile_operation)?;
-        let root = store_root(&app)?;
-        generate_profile_share_impl(&root, &profile_id)
-    })
-    .await
-    .map_err(error_to_string)?
-}
-
-#[tauri::command]
-async fn import_profile_share(
-    app: AppHandle,
-    code: String,
-) -> Result<ProfileShareImportResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let _import = lock_profile_imports()?;
-        let root = store_root(&app)?;
-        import_profile_share_impl(&root, &code, &scan_steam_games_impl())
-    })
-    .await
-    .map_err(error_to_string)?
-}
-
 fn profile_dependency_candidates(
     root: &Path,
     profile: &GameProfile,
@@ -3634,305 +3546,6 @@ fn import_profile_bundle_impl_unchecked(
         config_files_written,
         warnings,
     })
-}
-
-fn generate_profile_share_impl(
-    root: &Path,
-    profile_id: &str,
-) -> Result<ProfileShareGenerateResult, String> {
-    let api_base = profile_share_api_base_url()?;
-    let share_dir = root.join("profile-shares").join("outgoing");
-    fs::create_dir_all(&share_dir).map_err(error_to_string)?;
-    let bundle_path = share_dir.join(format!("{}.uniloader-profile", Uuid::new_v4()));
-
-    let result = (|| {
-        let exported = export_profile_bundle_impl_with_options(
-            root,
-            profile_id,
-            &bundle_path,
-            ProfileBundleExportOptions::cloud_share(),
-        )?;
-        let size_bytes = bundle_path.metadata().map_err(error_to_string)?.len();
-        if size_bytes == 0 {
-            return Err("The generated profile share was empty.".to_string());
-        }
-        if size_bytes > MAX_DOWNLOAD_BYTES {
-            return Err(format!(
-                "The profile share is too large: {} MB exceeds UniLoader's {} MB limit.",
-                size_bytes / 1024 / 1024,
-                MAX_DOWNLOAD_BYTES / 1024 / 1024
-            ));
-        }
-        let sha256 = sha256_file(&bundle_path)?;
-        let client = profile_share_client()?;
-        let create_url = format!("{api_base}/v1/shares");
-        let create_response = client
-            .post(&create_url)
-            .json(&ProfileShareCreateRequest {
-                profile_name: exported.profile_name.clone(),
-                size_bytes,
-                sha256: sha256.clone(),
-                app_version: env!("CARGO_PKG_VERSION").to_string(),
-            })
-            .send()
-            .map_err(|error| format!("Could not contact the profile share service: {error}"))?;
-        let created = profile_share_json_response::<ProfileShareCreateResponse>(
-            create_response,
-            "Could not create the share key",
-        )?;
-        let normalized_code = normalize_profile_share_code(&created.code)?;
-        validate_https_url(&created.upload_url)?;
-
-        let source = File::open(&bundle_path).map_err(error_to_string)?;
-        let mut upload = client
-            .put(&created.upload_url)
-            .header(reqwest::header::CONTENT_LENGTH, size_bytes)
-            .body(reqwest::blocking::Body::new(source));
-        let mut content_type_set = false;
-        for (name, value) in &created.upload_headers {
-            let normalized_name = name.trim().to_ascii_lowercase();
-            if normalized_name != "content-type" && !normalized_name.starts_with("x-goog-meta-") {
-                return Err(format!(
-                    "The profile share service requested an unsupported upload header: {name}"
-                ));
-            }
-            if normalized_name == "content-type" {
-                content_type_set = true;
-            }
-            let header_name = reqwest::header::HeaderName::from_bytes(normalized_name.as_bytes())
-                .map_err(error_to_string)?;
-            let header_value =
-                reqwest::header::HeaderValue::from_str(value).map_err(error_to_string)?;
-            upload = upload.header(header_name, header_value);
-        }
-        if !content_type_set {
-            upload = upload.header(reqwest::header::CONTENT_TYPE, PROFILE_SHARE_CONTENT_TYPE);
-        }
-        let upload_response = upload
-            .send()
-            .map_err(|error| format!("Could not upload the profile share: {error}"))?;
-        profile_share_success_response(upload_response, "Could not upload the profile share")?;
-
-        let complete_url = format!("{api_base}/v1/shares/{normalized_code}/complete");
-        let complete_response = client
-            .post(&complete_url)
-            .json(&ProfileShareCompleteRequest { size_bytes, sha256 })
-            .send()
-            .map_err(|error| format!("Could not finalize the profile share: {error}"))?;
-        profile_share_success_response(complete_response, "Could not finalize the profile share")?;
-
-        Ok(ProfileShareGenerateResult {
-            code: format_profile_share_code(&normalized_code),
-            expires_at: created.expires_at,
-            profile_name: exported.profile_name,
-            uploaded_bytes: size_bytes,
-            exported_mods: exported.exported_mods,
-            exported_config_files: exported.exported_config_files,
-            warnings: exported.warnings,
-        })
-    })();
-
-    let _ = fs::remove_file(bundle_path);
-    result
-}
-
-fn import_profile_share_impl(
-    root: &Path,
-    code: &str,
-    installed_games: &[SteamGameRecord],
-) -> Result<ProfileShareImportResult, String> {
-    let normalized_code = normalize_profile_share_code(code)?;
-    let api_base = profile_share_api_base_url()?;
-    let client = profile_share_client()?;
-    let resolve_url = format!("{api_base}/v1/shares/{normalized_code}");
-    let resolve_response = client
-        .get(&resolve_url)
-        .send()
-        .map_err(|error| format!("Could not contact the profile share service: {error}"))?;
-    let resolved = profile_share_json_response::<ProfileShareResolveResponse>(
-        resolve_response,
-        "Could not download this share key",
-    )?;
-    if normalize_profile_share_code(&resolved.code)? != normalized_code {
-        return Err("The profile share service returned a mismatched key.".to_string());
-    }
-    if resolved.size_bytes == 0 || resolved.size_bytes > MAX_DOWNLOAD_BYTES {
-        return Err("The shared profile size is outside UniLoader's safety limits.".to_string());
-    }
-    validate_sha256_hex(&resolved.sha256)?;
-    validate_https_url(&resolved.download_url)?;
-
-    let share_dir = root.join("profile-shares").join("incoming");
-    fs::create_dir_all(&share_dir).map_err(error_to_string)?;
-    let bundle_path = share_dir.join(format!("{}.uniloader-profile", Uuid::new_v4()));
-    let result = (|| {
-        let mut response = client
-            .get(&resolved.download_url)
-            .send()
-            .map_err(|error| format!("Could not download the shared profile: {error}"))?
-            .error_for_status()
-            .map_err(|error| format!("Could not download the shared profile: {error}"))?;
-        if let Some(content_length) = response.content_length() {
-            if content_length != resolved.size_bytes {
-                return Err(
-                    "The shared profile size does not match its signed metadata.".to_string(),
-                );
-            }
-        }
-        let mut output = File::create(&bundle_path).map_err(error_to_string)?;
-        let downloaded_bytes = copy_with_limit(&mut response, &mut output, MAX_DOWNLOAD_BYTES)?;
-        output.sync_all().map_err(error_to_string)?;
-        drop(output);
-        if downloaded_bytes != resolved.size_bytes {
-            return Err(
-                "The shared profile download was incomplete and has been discarded.".to_string(),
-            );
-        }
-        let actual_sha256 = sha256_file(&bundle_path)?;
-        if !actual_sha256.eq_ignore_ascii_case(&resolved.sha256) {
-            return Err(
-                "The shared profile failed its SHA-256 integrity check and has been discarded."
-                    .to_string(),
-            );
-        }
-
-        let game = resolve_profile_bundle_steam_game(&bundle_path, installed_games)?;
-        let import_result =
-            import_profile_bundle_impl(root, &bundle_path, Path::new(&game.install_dir))?;
-        Ok(ProfileShareImportResult {
-            code: format_profile_share_code(&normalized_code),
-            expires_at: resolved.expires_at,
-            downloaded_bytes,
-            import_result,
-        })
-    })();
-
-    let _ = fs::remove_file(bundle_path);
-    result
-}
-
-fn profile_share_api_base_url() -> Result<String, String> {
-    let configured = std::env::var(PROFILE_SHARE_API_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            option_env!("UNILOADER_PROFILE_SHARE_API_URL")
-                .map(str::to_string)
-                .filter(|value| !value.trim().is_empty())
-        })
-        .ok_or_else(|| {
-            "Profile key sharing is not configured in this UniLoader build yet.".to_string()
-        })?;
-    validate_profile_share_api_url(&configured)
-}
-
-fn validate_profile_share_api_url(value: &str) -> Result<String, String> {
-    let mut parsed = url::Url::parse(value.trim())
-        .map_err(|error| format!("Invalid profile share service URL: {error}"))?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| "The profile share service URL is missing a host.".to_string())?;
-    let local_http = parsed.scheme() == "http" && matches!(host, "localhost" | "127.0.0.1" | "::1");
-    if parsed.scheme() != "https" && !local_http {
-        return Err("The profile share service must use HTTPS.".to_string());
-    }
-    if parsed.query().is_some() || parsed.fragment().is_some() {
-        return Err(
-            "The profile share service URL cannot contain a query or fragment.".to_string(),
-        );
-    }
-    let trimmed_path = parsed.path().trim_end_matches('/').to_string();
-    parsed.set_path(&trimmed_path);
-    Ok(parsed.to_string().trim_end_matches('/').to_string())
-}
-
-fn profile_share_client() -> Result<Client, String> {
-    Client::builder()
-        .user_agent(format!("UniLoader/{}", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(15 * 60))
-        .build()
-        .map_err(error_to_string)
-}
-
-fn profile_share_json_response<T: DeserializeOwned>(
-    response: Response,
-    context: &str,
-) -> Result<T, String> {
-    if !response.status().is_success() {
-        return Err(profile_share_response_error(response, context));
-    }
-    response
-        .json::<T>()
-        .map_err(|error| format!("{context}: invalid service response: {error}"))
-}
-
-fn profile_share_success_response(response: Response, context: &str) -> Result<(), String> {
-    if response.status().is_success() {
-        Ok(())
-    } else {
-        Err(profile_share_response_error(response, context))
-    }
-}
-
-fn profile_share_response_error(mut response: Response, context: &str) -> String {
-    let status = response.status();
-    let mut body = String::new();
-    let _ = response.by_ref().take(8193).read_to_string(&mut body);
-    let message = serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("error")
-                .and_then(|error| {
-                    error
-                        .get("message")
-                        .and_then(|message| message.as_str())
-                        .or_else(|| error.as_str())
-                })
-                .or_else(|| value.get("message").and_then(|message| message.as_str()))
-                .map(str::to_string)
-        })
-        .filter(|message| !message.trim().is_empty())
-        .unwrap_or_else(|| {
-            status
-                .canonical_reason()
-                .unwrap_or("service error")
-                .to_string()
-        });
-    format!("{context}: {message} (HTTP {})", status.as_u16())
-}
-
-fn normalize_profile_share_code(value: &str) -> Result<String, String> {
-    const ALPHABET: &str = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
-    let normalized = value
-        .chars()
-        .filter(|ch| !ch.is_ascii_whitespace() && *ch != '-')
-        .map(|ch| ch.to_ascii_uppercase())
-        .collect::<String>();
-    if normalized.len() != PROFILE_SHARE_CODE_LENGTH
-        || !normalized.chars().all(|ch| ALPHABET.contains(ch))
-    {
-        return Err("Enter the 16-character UniLoader key exactly as it was shared.".to_string());
-    }
-    Ok(normalized)
-}
-
-fn format_profile_share_code(normalized: &str) -> String {
-    normalized
-        .as_bytes()
-        .chunks(4)
-        .map(|chunk| String::from_utf8_lossy(chunk).to_string())
-        .collect::<Vec<_>>()
-        .join("-")
-}
-
-fn validate_sha256_hex(value: &str) -> Result<(), String> {
-    if value.len() == 64 && value.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        Ok(())
-    } else {
-        Err("The profile share service returned an invalid SHA-256 value.".to_string())
-    }
 }
 
 fn install_profile_bootstrap_dependencies(root: &Path, profile: &GameProfile) -> Vec<String> {
@@ -6550,8 +6163,6 @@ pub fn run() {
             update_profile_game_folder,
             export_profile_bundle,
             import_profile_bundle,
-            generate_profile_share,
-            import_profile_share,
             detect_game_setup,
             analyze_archive_for_profile,
             install_archive,
@@ -27069,7 +26680,7 @@ mod tests {
             &root,
             &profile.id,
             &bundle_path,
-            ProfileBundleExportOptions::cloud_share(),
+            ProfileBundleExportOptions::self_contained(),
         )
         .unwrap();
         assert_eq!(exported.exported_mods, 2);
@@ -27125,7 +26736,7 @@ mod tests {
             &external_root,
             &external_fixture.profile.id,
             &external_root.join("external.uniloader-profile"),
-            ProfileBundleExportOptions::cloud_share(),
+            ProfileBundleExportOptions::self_contained(),
         )
         .unwrap_err();
         assert!(external_error.contains("managed outside UniLoader"));
@@ -27145,38 +26756,13 @@ mod tests {
             &missing_root,
             &missing_fixture.profile.id,
             &missing_root.join("missing.uniloader-profile"),
-            ProfileBundleExportOptions::cloud_share(),
+            ProfileBundleExportOptions::self_contained(),
         )
         .unwrap_err();
         assert!(missing_error.contains("managed package source"));
 
         let _ = fs::remove_dir_all(external_root);
         let _ = fs::remove_dir_all(missing_root);
-    }
-
-    #[test]
-    fn profile_share_codes_and_service_urls_are_strictly_validated() {
-        assert_eq!(
-            normalize_profile_share_code("2345-6789-abcd-efgh").unwrap(),
-            "23456789ABCDEFGH"
-        );
-        assert_eq!(
-            format_profile_share_code("23456789ABCDEFGH"),
-            "2345-6789-ABCD-EFGH"
-        );
-        assert!(normalize_profile_share_code("1234-5678-ABCD-EFGH").is_err());
-        assert!(normalize_profile_share_code("2345-6789-ABCD-EFGI").is_err());
-
-        assert_eq!(
-            validate_profile_share_api_url("https://example.com/profile-share/").unwrap(),
-            "https://example.com/profile-share"
-        );
-        assert_eq!(
-            validate_profile_share_api_url("http://127.0.0.1:5001/share/").unwrap(),
-            "http://127.0.0.1:5001/share"
-        );
-        assert!(validate_profile_share_api_url("http://example.com/share").is_err());
-        assert!(validate_profile_share_api_url("https://example.com/share?unsafe=true").is_err());
     }
 
     #[test]
