@@ -1,33 +1,37 @@
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 
-const PROFILE_LOCK_STRIPES: usize = 64;
 const MAX_DISCOVERY_GENERATIONS: usize = 128;
 const DISCOVERY_GENERATION_TTL: Duration = Duration::from_secs(15 * 60);
 const MAX_OPERATION_LOG_BYTES: u64 = 2 * 1024 * 1024;
 
-static PROFILE_LOCKS: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
+static PROFILE_LOCKS: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
 static DISCOVERY_GENERATIONS: OnceLock<Mutex<HashMap<String, (u64, Instant)>>> = OnceLock::new();
 static OPERATION_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-pub fn lock_profile(profile_id: &str) -> Result<MutexGuard<'static, ()>, String> {
-    let locks = PROFILE_LOCKS.get_or_init(|| {
-        (0..PROFILE_LOCK_STRIPES)
-            .map(|_| Mutex::new(()))
-            .collect::<Vec<_>>()
-    });
-    let mut hasher = DefaultHasher::new();
-    profile_id.hash(&mut hasher);
-    let index = hasher.finish() as usize % locks.len();
-    locks[index]
+pub fn profile_lock(profile_id: &str) -> Result<Arc<Mutex<()>>, String> {
+    let mut locks = PROFILE_LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
+        .map_err(|_| "Profile operation coordinator is unavailable.".to_string())?;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(profile_id).and_then(Weak::upgrade) {
+        return Ok(lock);
+    }
+
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(profile_id.to_string(), Arc::downgrade(&lock));
+    Ok(lock)
+}
+
+pub fn lock_profile(lock: &Arc<Mutex<()>>) -> Result<std::sync::MutexGuard<'_, ()>, String> {
+    lock.lock()
         .map_err(|_| "Profile operation lock is unavailable.".to_string())
 }
 
@@ -133,5 +137,40 @@ fn record_operation(
     });
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "{entry}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn profile_locks_are_exactly_shared_for_the_same_profile() {
+        let profile_id = format!("profile-lock-{}", Uuid::new_v4());
+        let first = profile_lock(&profile_id).unwrap();
+        let second = profile_lock(&profile_id).unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn different_profiles_do_not_share_an_operation_lock() {
+        let first = profile_lock(&format!("profile-lock-a-{}", Uuid::new_v4())).unwrap();
+        let second = profile_lock(&format!("profile-lock-b-{}", Uuid::new_v4())).unwrap();
+
+        assert!(!Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn unused_profile_locks_can_be_reclaimed() {
+        let profile_id = format!("profile-lock-reclaim-{}", Uuid::new_v4());
+        let first = profile_lock(&profile_id).unwrap();
+        let weak = Arc::downgrade(&first);
+        drop(first);
+
+        assert!(weak.upgrade().is_none());
+        let replacement = profile_lock(&profile_id).unwrap();
+        assert_eq!(Arc::strong_count(&replacement), 1);
     }
 }

@@ -433,6 +433,23 @@ export interface ProfileImportResult {
   warnings: string[];
 }
 
+export interface ProfileShareGenerateResult {
+  code: string;
+  expiresAt: string;
+  profileName: string;
+  uploadedBytes: number;
+  exportedMods: number;
+  exportedConfigFiles: number;
+  warnings: string[];
+}
+
+export interface ProfileShareImportResult {
+  code: string;
+  expiresAt: string;
+  downloadedBytes: number;
+  importResult: ProfileImportResult;
+}
+
 export interface AppState {
   profiles: GameProfile[];
   installedMods: InstalledModRecord[];
@@ -469,12 +486,17 @@ export interface DesktopApi {
   profileFolderExists(profileId: string): Promise<boolean>;
   createProfile(input: CreateProfileInput): Promise<GameProfile>;
   renameProfile(profileId: string, name: string): Promise<GameProfile>;
-  removeProfile(profileId: string): Promise<ProfileActionResult>;
+  removeProfile(
+    profileId: string,
+    forceForgetModified?: boolean
+  ): Promise<ProfileActionResult>;
   refreshProfile(profileId: string): Promise<ProfileRefreshResult>;
   bootstrapProfileDependencies(profileId: string): Promise<ProfileDependencyBootstrapResult>;
   updateProfileGameFolder(profileId: string, gamePath: string): Promise<ProfileGameFolderUpdateResult>;
   exportProfileBundle(profileId: string, profileName: string): Promise<ProfileExportResult | null>;
   importProfileBundle(): Promise<ProfileImportResult | null>;
+  generateProfileShare(profileId: string): Promise<ProfileShareGenerateResult>;
+  importProfileShare(code: string): Promise<ProfileShareImportResult>;
   selectGameFolder(): Promise<string | null>;
   detectGameSetup(gamePath: string): Promise<GameDetectionResult>;
   selectAndAnalyzeArchive(profileId: string): Promise<ArchiveAnalysis | null>;
@@ -517,7 +539,11 @@ export interface DesktopApi {
   updateModConfigValue(input: UpdateModConfigValueInput): Promise<ModConfigFile>;
   disableMod(profileId: string, installedModId: string): Promise<ModActionResult>;
   enableMod(profileId: string, installedModId: string): Promise<ModActionResult>;
-  removeMod(profileId: string, installedModId: string): Promise<ModActionResult>;
+  removeMod(
+    profileId: string,
+    installedModId: string,
+    forceForgetModified?: boolean
+  ): Promise<ModActionResult>;
   openProfileGameFolder(profileId: string): Promise<void>;
   openExternalUrl(url: string): Promise<void>;
   getStorePath(): Promise<string>;

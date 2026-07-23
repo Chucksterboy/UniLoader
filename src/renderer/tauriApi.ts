@@ -28,6 +28,8 @@ import {
   ProfileLaunchModeResult,
   ProfileModToggleResult,
   ProfileRefreshResult,
+  ProfileShareGenerateResult,
+  ProfileShareImportResult,
   SteamGameRecord,
   UpdateModConfigValueInput
 } from "../shared/contracts";
@@ -77,8 +79,8 @@ export const desktopApi: DesktopApi = {
     invoke<GameProfile>("create_profile", { input }),
   renameProfile: (profileId: string, name: string) =>
     invoke<GameProfile>("rename_profile", { profileId, name }),
-  removeProfile: (profileId: string) =>
-    invoke<ProfileActionResult>("remove_profile", { profileId }),
+  removeProfile: (profileId: string, forceForgetModified = false) =>
+    invoke<ProfileActionResult>("remove_profile", { profileId, forceForgetModified }),
   refreshProfile: (profileId: string) =>
     invoke<ProfileRefreshResult>("refresh_profile", { profileId }),
   bootstrapProfileDependencies: (profileId: string) =>
@@ -115,6 +117,10 @@ export const desktopApi: DesktopApi = {
 
     return invoke<ProfileImportResult>("import_profile_bundle", { bundlePath });
   },
+  generateProfileShare: (profileId: string) =>
+    invoke<ProfileShareGenerateResult>("generate_profile_share", { profileId }),
+  importProfileShare: (code: string) =>
+    invoke<ProfileShareImportResult>("import_profile_share", { code }),
   selectGameFolder: async () => {
     const selected = await open({
       directory: true,
@@ -236,8 +242,12 @@ export const desktopApi: DesktopApi = {
     invoke<ModActionResult>("disable_mod", { profileId, installedModId }),
   enableMod: (profileId: string, installedModId: string) =>
     invoke<ModActionResult>("enable_mod", { profileId, installedModId }),
-  removeMod: (profileId: string, installedModId: string) =>
-    invoke<ModActionResult>("remove_mod", { profileId, installedModId }),
+  removeMod: (profileId: string, installedModId: string, forceForgetModified = false) =>
+    invoke<ModActionResult>("remove_mod", {
+      profileId,
+      installedModId,
+      forceForgetModified
+    }),
   openProfileGameFolder: (profileId: string) =>
     invoke<void>("open_profile_game_folder", { profileId }),
   openExternalUrl: (url: string) =>

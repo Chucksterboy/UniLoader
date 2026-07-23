@@ -4,7 +4,11 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronUp,
+  Clock3,
+  CloudDownload,
+  CloudUpload,
   Compass,
+  Copy,
   Database,
   Download,
   ExternalLink,
@@ -22,6 +26,8 @@ import {
   PowerOff,
   RefreshCw,
   Search,
+  KeyRound,
+  LoaderCircle,
   Settings2,
   ShieldCheck,
   SlidersHorizontal,
@@ -59,7 +65,10 @@ import {
   ModConfigFile,
   OnlineModFileOption,
   OnlineModRecord,
+  ProfileImportResult,
   ProfileRefreshResult,
+  ProfileShareGenerateResult,
+  ProfileShareImportResult,
   SteamGameRecord
 } from "../shared/contracts";
 import { desktopApi } from "./tauriApi";
@@ -134,7 +143,7 @@ function loadCachedGameArtwork(
 type ViewMode = "manager" | "discover" | "transfer" | "settings";
 type ModSortMode = "newest" | "oldest";
 type OnlineSortMode = "downloads" | "newest" | "oldest";
-type TransferMode = "import" | "export" | null;
+type TransferMode = "import" | "export" | "generate-key" | "download-key" | null;
 type NoticeKind = "success" | "warning" | "error";
 type InstallSoundKind = keyof typeof installSoundUrls;
 type StartupSplashPhase = "intro" | "exiting" | "hidden";
@@ -176,8 +185,27 @@ interface ConfigModalState {
   error?: string;
 }
 
+interface CloudImportProgress {
+  detail: string;
+}
+
+type ForceRemovalPrompt =
+  | {
+      kind: "profile";
+      profile: GameProfile;
+      detail: string;
+    }
+  | {
+      kind: "mod";
+      profileId: string;
+      mod: InstalledModRecord;
+      source: "library" | "discovery";
+      detail: string;
+    };
+
 const discoverPageSize = 20;
 const nexusApiKeysUrl = "https://www.nexusmods.com/settings/api-keys";
+const forceRemovalRequiredPrefix = "UNILOADER_FORCE_REMOVAL_REQUIRED:";
 const startupSplashPulseMs = 2700;
 const startupSplashFadeMs = 420;
 const startupSplashMaximumMs = 8000;
@@ -186,6 +214,15 @@ const maxInstalledModProfileCaches = 12;
 const maxArtworkRefreshProfiles = 48;
 const maxProcessedNxmLinks = 128;
 const maxStoredModPresentations = 400;
+
+function forceRemovalDetail(error: unknown): string | null {
+  const message = String(error);
+  const prefixIndex = message.indexOf(forceRemovalRequiredPrefix);
+  if (prefixIndex < 0) {
+    return null;
+  }
+  return message.slice(prefixIndex + forceRemovalRequiredPrefix.length).trim();
+}
 
 interface StoredModPresentation {
   cachedAt?: string;
@@ -243,6 +280,8 @@ export function App() {
   const [isCheckingForUpdate, setIsCheckingForUpdate] = useState(false);
   const [isDownloadingUpdate, setIsDownloadingUpdate] = useState(false);
   const [isTransferringProfile, setIsTransferringProfile] = useState(false);
+  const [cloudImportProgress, setCloudImportProgress] =
+    useState<CloudImportProgress | null>(null);
   const [isScanningSteamGames, setIsScanningSteamGames] = useState(false);
   const [isCreatingSteamProfile, setIsCreatingSteamProfile] = useState(false);
   const [isChangingProfileLaunchMode, setIsChangingProfileLaunchMode] = useState(false);
@@ -258,6 +297,7 @@ export function App() {
   const [configModal, setConfigModal] = useState<ConfigModalState | null>(null);
   const [profilePendingRename, setProfilePendingRename] = useState<GameProfile | null>(null);
   const [profilePendingRemoval, setProfilePendingRemoval] = useState<GameProfile | null>(null);
+  const [forceRemovalPrompt, setForceRemovalPrompt] = useState<ForceRemovalPrompt | null>(null);
   const [pendingDependencyPrompt, setPendingDependencyPrompt] =
     useState<PendingDependencyPrompt | null>(null);
   const selectedProfileIdRef = useRef("");
@@ -412,8 +452,10 @@ export function App() {
   const configModalPresence = useFadePresence(configModal);
   const profileRenamePresence = useFadePresence(profilePendingRename);
   const profileRemovalPresence = useFadePresence(profilePendingRemoval);
+  const forceRemovalPresence = useFadePresence(forceRemovalPrompt);
   const dependencyPromptPresence = useFadePresence(pendingDependencyPrompt);
   const profileCreatorPresence = useFadePresence(profileCreatorOpen ? true : null);
+  const cloudImportProgressPresence = useFadePresence(cloudImportProgress);
   const noticePresence = useFadePresence(notice, 140);
   const errorPresence = useFadePresence(error ? error : null, 140);
   const selectedProfile = useMemo(
@@ -774,37 +816,39 @@ export function App() {
   useEffect(() => {
     let unlisten: (() => void) | undefined;
 
-    void getCurrentWebview()
-      .onDragDropEvent((event) => {
-        const payload = event.payload as {
-          type: "over" | "drop" | "leave";
-          paths?: string[];
-        };
+    void Promise.resolve()
+      .then(() =>
+        getCurrentWebview().onDragDropEvent((event) => {
+          const payload = event.payload as {
+            type: "over" | "drop" | "leave";
+            paths?: string[];
+          };
 
-        if (payload.type === "over") {
-          setIsDragOver(true);
-          return;
-        }
-
-        if (payload.type === "leave") {
-          setIsDragOver(false);
-          return;
-        }
-
-        if (payload.type === "drop") {
-          setIsDragOver(false);
-          const importPath = payload.paths?.[0];
-          if (importPath) {
-            void handleArchivePath(importPath);
-          } else {
-            setNotice({
-              kind: "warning",
-              title: "Unsupported file",
-              detail: "Drop a .zip, .7z, .rar, or mod folder."
-            });
+          if (payload.type === "over") {
+            setIsDragOver(true);
+            return;
           }
-        }
-      })
+
+          if (payload.type === "leave") {
+            setIsDragOver(false);
+            return;
+          }
+
+          if (payload.type === "drop") {
+            setIsDragOver(false);
+            const importPath = payload.paths?.[0];
+            if (importPath) {
+              void handleArchivePath(importPath);
+            } else {
+              setNotice({
+                kind: "warning",
+                title: "Unsupported file",
+                detail: "Drop a .zip, .7z, .rar, or mod folder."
+              });
+            }
+          }
+        })
+      )
       .then((handler) => {
         unlisten = handler;
       })
@@ -1221,11 +1265,11 @@ export function App() {
     }
   }
 
-  async function removeProfile(profile: GameProfile) {
+  async function removeProfile(profile: GameProfile, forceForgetModified = false) {
     setError("");
     setStatus("Removing profile");
     try {
-      const result = await api.removeProfile(profile.id);
+      const result = await api.removeProfile(profile.id, forceForgetModified);
       const nextProfiles = profiles.filter((item) => item.id !== profile.id);
       setProfiles(nextProfiles);
 
@@ -1242,15 +1286,24 @@ export function App() {
 
       setStatus("Profile removed");
       setProfilePendingRemoval(null);
+      setForceRemovalPrompt(null);
+      const baseDetail =
+        result.removedModRecords > 0
+          ? `${result.name} was removed with ${result.removedModRecords} UniLoader mod record(s).`
+          : `${result.name} was removed.`;
       setNotice({
         kind: result.warnings.length > 0 ? "warning" : "success",
         title: "Profile removed",
-        detail:
-          result.removedModRecords > 0
-            ? `${result.name} was removed with ${result.removedModRecords} UniLoader mod record(s).`
-            : `${result.name} was removed.`
+        detail: result.warnings.length > 0 ? `${baseDetail} ${result.warnings[0]}` : baseDetail
       });
     } catch (caughtError) {
+      const detail = forceRemovalDetail(caughtError);
+      if (detail && !forceForgetModified) {
+        setProfilePendingRemoval(null);
+        setForceRemovalPrompt({ kind: "profile", profile, detail });
+        setStatus("Removal confirmation required");
+        return;
+      }
       setError(String(caughtError));
       setStatus("Remove failed");
       setNotice({
@@ -1567,6 +1620,15 @@ export function App() {
     }
   }
 
+  function applyImportedProfileResult(result: ProfileImportResult) {
+    setProfiles((current) => [...current, result.profile]);
+    selectProfile(result.profile.id);
+    rememberInstalledMods(result.profile.id, result.installedMods);
+    setInstalledMods(result.installedMods);
+    setAnalysis(null);
+    setDetection(null);
+  }
+
   async function importProfileBundle() {
     setError("");
     setIsTransferringProfile(true);
@@ -1577,12 +1639,7 @@ export function App() {
         setStatus("Import canceled");
         return;
       }
-      setProfiles((current) => [...current, result.profile]);
-      selectProfile(result.profile.id);
-      rememberInstalledMods(result.profile.id, result.installedMods);
-      setInstalledMods(result.installedMods);
-      setAnalysis(null);
-      setDetection(null);
+      applyImportedProfileResult(result);
       setStatus(result.warnings.length > 0 ? "Import needs attention" : "Profile imported");
       setNotice({
         kind: result.warnings.length > 0 ? "warning" : "success",
@@ -1600,6 +1657,98 @@ export function App() {
         detail: String(caughtError)
       });
     } finally {
+      setIsTransferringProfile(false);
+    }
+  }
+
+  async function generateProfileShare(
+    profileId: string
+  ): Promise<ProfileShareGenerateResult | null> {
+    const profile = profiles.find((item) => item.id === profileId);
+    if (!profile) {
+      setNotice({
+        kind: "warning",
+        title: "Select a profile",
+        detail: "Choose the profile you want to package into a 24-hour key."
+      });
+      return null;
+    }
+
+    setError("");
+    setIsTransferringProfile(true);
+    setStatus("Generating profile key");
+    try {
+      const result = await api.generateProfileShare(profile.id);
+      setStatus(result.warnings.length > 0 ? "Key needs attention" : "Profile key ready");
+      setNotice({
+        kind: result.warnings.length > 0 ? "warning" : "success",
+        title: "Profile key generated",
+        detail:
+          result.warnings[0] ??
+          `${result.profileName}: ${result.exportedMods} mod(s) uploaded. This key expires in 24 hours.`
+      });
+      return result;
+    } catch (caughtError) {
+      setError(String(caughtError));
+      setStatus("Key generation failed");
+      setNotice({
+        kind: "error",
+        title: "Could not generate key",
+        detail: String(caughtError)
+      });
+      return null;
+    } finally {
+      setIsTransferringProfile(false);
+    }
+  }
+
+  async function downloadProfileShare(
+    code: string
+  ): Promise<ProfileShareImportResult | null> {
+    const normalizedCode = code.replace(/[^a-z0-9]/gi, "").toUpperCase();
+    if (normalizedCode.length !== 16) {
+      setNotice({
+        kind: "warning",
+        title: "Enter a complete key",
+        detail: "A UniLoader profile key contains 16 letters and numbers."
+      });
+      return null;
+    }
+
+    setError("");
+    setIsTransferringProfile(true);
+    setCloudImportProgress({
+      detail: "Downloading the shared profile and restoring its managed files."
+    });
+    setStatus("Installing shared profile");
+    try {
+      const result = await api.importProfileShare(normalizedCode);
+      applyImportedProfileResult(result.importResult);
+      setActiveView("manager");
+      setStatus(
+        result.importResult.warnings.length > 0
+          ? "Shared profile needs attention"
+          : "Shared profile installed"
+      );
+      setNotice({
+        kind: result.importResult.warnings.length > 0 ? "warning" : "success",
+        title: "Shared profile installed",
+        detail:
+          result.importResult.warnings[0] ??
+          `${result.importResult.profile.name}: ${result.importResult.installedMods.length} mod(s) restored.`
+      });
+      return result;
+    } catch (caughtError) {
+      setError(String(caughtError));
+      setStatus("Shared profile install failed");
+      setNotice({
+        kind: "error",
+        title: "Shared profile install failed",
+        detail: String(caughtError)
+      });
+      return null;
+    } finally {
+      setCloudImportProgress(null);
       setIsTransferringProfile(false);
     }
   }
@@ -2041,7 +2190,8 @@ export function App() {
 
   async function handleModAction(
     action: "enable" | "disable" | "remove",
-    mod: InstalledModRecord
+    mod: InstalledModRecord,
+    forceForgetModified = false
   ) {
     if (!selectedProfile) {
       return;
@@ -2055,7 +2205,7 @@ export function App() {
           ? await api.enableMod(selectedProfile.id, mod.id)
           : action === "disable"
             ? await api.disableMod(selectedProfile.id, mod.id)
-            : await api.removeMod(selectedProfile.id, mod.id);
+            : await api.removeMod(selectedProfile.id, mod.id, forceForgetModified);
       await refreshInstalledMods(selectedProfile.id);
       setStatus(result.status === "removed" ? "Mod removed" : "Mod updated");
       const modName = displayModName(mod);
@@ -2070,6 +2220,18 @@ export function App() {
         detail: `${modName}: ${result.filesChanged.length} file(s) changed.`
       });
     } catch (caughtError) {
+      const detail = forceRemovalDetail(caughtError);
+      if (action === "remove" && detail && !forceForgetModified) {
+        setForceRemovalPrompt({
+          kind: "mod",
+          profileId: selectedProfile.id,
+          mod,
+          source: "library",
+          detail
+        });
+        setStatus("Removal confirmation required");
+        return;
+      }
       setError(String(caughtError));
       setStatus("Action failed");
       setNotice({
@@ -2080,7 +2242,10 @@ export function App() {
     }
   }
 
-  async function removeDiscoverInstalledMod(mod: InstalledModRecord) {
+  async function removeDiscoverInstalledMod(
+    mod: InstalledModRecord,
+    forceForgetModified = false
+  ) {
     const profileId = discoverProfileIdRef.current;
     if (!profileId || mod.runtimeId) {
       return;
@@ -2090,7 +2255,7 @@ export function App() {
     setRemovingDiscoverModId(mod.id);
     setStatus("Removing mod");
     try {
-      const result = await api.removeMod(profileId, mod.id);
+      const result = await api.removeMod(profileId, mod.id, forceForgetModified);
       const refreshes: Promise<void>[] = [refreshDiscoverInstalledMods(profileId)];
       if (profileId === selectedProfileIdRef.current) {
         refreshes.push(refreshInstalledMods(profileId));
@@ -2110,6 +2275,18 @@ export function App() {
         detail: `${displayModName(mod)}: ${result.filesChanged.length} file(s) changed.`
       });
     } catch (caughtError) {
+      const detail = forceRemovalDetail(caughtError);
+      if (detail && !forceForgetModified) {
+        setForceRemovalPrompt({
+          kind: "mod",
+          profileId,
+          mod,
+          source: "discovery",
+          detail
+        });
+        setStatus("Removal confirmation required");
+        return;
+      }
       setError(String(caughtError));
       setStatus("Remove failed");
       setNotice({
@@ -2120,6 +2297,19 @@ export function App() {
     } finally {
       setRemovingDiscoverModId("");
     }
+  }
+
+  function confirmForceRemoval(prompt: ForceRemovalPrompt) {
+    setForceRemovalPrompt(null);
+    if (prompt.kind === "profile") {
+      void removeProfile(prompt.profile, true);
+      return;
+    }
+    if (prompt.source === "discovery") {
+      void removeDiscoverInstalledMod(prompt.mod, true);
+      return;
+    }
+    void handleModAction("remove", prompt.mod, true);
   }
 
   async function openModConfig(mod: InstalledModRecord) {
@@ -2171,6 +2361,7 @@ export function App() {
 
   const profileToRename = profileRenamePresence.value;
   const profileToRemove = profileRemovalPresence.value;
+  const forceRemoval = forceRemovalPresence.value;
   const dependencyPrompt = dependencyPromptPresence.value;
 
   function startTitlebarDrag(event: ReactMouseEvent<HTMLElement>) {
@@ -2687,6 +2878,8 @@ export function App() {
             selectedProfileId={selectedProfileId}
             onExport={(profileId) => void exportProfileBundle(profileId)}
             onImport={() => void importProfileBundle()}
+            onGenerateKey={generateProfileShare}
+            onDownloadFromKey={downloadProfileShare}
             onSelectMode={setTransferMode}
           />
         ) : renderedView === "discover" ? (
@@ -2815,6 +3008,20 @@ export function App() {
         onConfirm={() => void removeProfile(profileToRemove)}
       />
     ) : null}
+    {forceRemoval ? (
+      <ForceRemovalDialog
+        detail={forceRemoval.detail}
+        itemName={
+          forceRemoval.kind === "profile"
+            ? forceRemoval.profile.name
+            : displayModName(forceRemoval.mod)
+        }
+        itemType={forceRemoval.kind}
+        motionClassName={forceRemovalPresence.className}
+        onCancel={() => setForceRemovalPrompt(null)}
+        onConfirm={() => confirmForceRemoval(forceRemoval)}
+      />
+    ) : null}
     {dependencyPrompt ? (
       <DependencyInstallDialog
         missingDependencies={dependencyPrompt.preflight.missingDependencies}
@@ -2823,6 +3030,30 @@ export function App() {
         onCancel={() => setPendingDependencyPrompt(null)}
         onConfirm={() => void confirmDependencyInstall(dependencyPrompt)}
       />
+    ) : null}
+    {cloudImportProgressPresence.value ? (
+      <div
+        className={`modal-backdrop ${cloudImportProgressPresence.className}`}
+        role="presentation"
+      >
+        <section
+          aria-describedby="cloud-install-detail"
+          aria-labelledby="cloud-install-title"
+          aria-live="polite"
+          aria-modal="true"
+          className="cloud-install-modal"
+          role="dialog"
+        >
+          <div className="cloud-install-orbit" aria-hidden="true">
+            <CloudDownload size={30} />
+            <LoaderCircle className="spin-icon" size={54} />
+          </div>
+          <p className="eyebrow">Shared profile</p>
+          <h3 id="cloud-install-title">Installing</h3>
+          <p id="cloud-install-detail">{cloudImportProgressPresence.value.detail}</p>
+          <span>Keep UniLoader open while the profile is verified and applied.</span>
+        </section>
+      </div>
     ) : null}
     </>
   );
@@ -3103,6 +3334,56 @@ function ProfileRemovalDialog({
           </button>
           <button className="danger-button compact-button" onClick={onConfirm} type="button">
             Remove
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+interface ForceRemovalDialogProps {
+  detail: string;
+  itemName: string;
+  itemType: "profile" | "mod";
+  motionClassName: string;
+  onCancel(): void;
+  onConfirm(): void;
+}
+
+function ForceRemovalDialog({
+  detail,
+  itemName,
+  itemType,
+  motionClassName,
+  onCancel,
+  onConfirm
+}: ForceRemovalDialogProps) {
+  return (
+    <div className={`modal-backdrop ${motionClassName}`} onMouseDown={onCancel}>
+      <section
+        aria-label={`Forget ${itemName} anyway`}
+        className="confirm-modal"
+        onMouseDown={(event) => event.stopPropagation()}
+        role="dialog"
+      >
+        <div className="confirm-icon">
+          <AlertTriangle size={22} />
+        </div>
+        <div className="confirm-copy">
+          <p className="eyebrow">Modified Files Found</p>
+          <h3>Forget {itemType === "profile" ? "profile" : "mod"} anyway?</h3>
+          <p>
+            UniLoader will remove every file that still matches its installation receipt, leave
+            modified or unverified files untouched, and forget {itemName}.
+          </p>
+          <p>{detail}</p>
+        </div>
+        <div className="confirm-actions">
+          <button className="secondary-button compact-button" onClick={onCancel} type="button">
+            Cancel
+          </button>
+          <button className="danger-button compact-button" onClick={onConfirm} type="button">
+            Forget Anyway
           </button>
         </div>
       </section>
@@ -4278,7 +4559,9 @@ interface TransferViewProps {
   profiles: GameProfile[];
   selectedProfileId: string;
   onExport(profileId: string): void;
+  onGenerateKey(profileId: string): Promise<ProfileShareGenerateResult | null>;
   onImport(): void;
+  onDownloadFromKey(code: string): Promise<ProfileShareImportResult | null>;
   onSelectMode(mode: TransferMode): void;
 }
 
@@ -4288,10 +4571,16 @@ function TransferView({
   profiles,
   selectedProfileId,
   onExport,
+  onGenerateKey,
   onImport,
+  onDownloadFromKey,
   onSelectMode
 }: TransferViewProps) {
   const [exportProfileId, setExportProfileId] = useState(selectedProfileId);
+  const [shareCodeInput, setShareCodeInput] = useState("");
+  const [generatedShare, setGeneratedShare] =
+    useState<ProfileShareGenerateResult | null>(null);
+  const [copyLabel, setCopyLabel] = useState("Copy Key");
 
   useEffect(() => {
     setExportProfileId((current) =>
@@ -4301,11 +4590,50 @@ function TransferView({
     );
   }, [profiles, selectedProfileId]);
 
+  async function generateKey() {
+    const result = await onGenerateKey(exportProfileId);
+    if (result) {
+      setGeneratedShare(result);
+      setCopyLabel("Copy Key");
+    }
+  }
+
+  async function copyGeneratedKey() {
+    if (!generatedShare) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(generatedShare.code);
+      setCopyLabel("Copied");
+      window.setTimeout(() => setCopyLabel("Copy Key"), 1600);
+    } catch {
+      setCopyLabel("Copy failed");
+    }
+  }
+
+  const modeTitle =
+    mode === "import"
+      ? "Restore Profile Bundle"
+      : mode === "export"
+        ? "Create Profile Bundle"
+        : mode === "generate-key"
+          ? "Create a 24-Hour Key"
+          : "Install From a Key";
+  const modeLabel =
+    mode === "import"
+      ? "Import"
+      : mode === "export"
+        ? "Export"
+        : mode === "generate-key"
+          ? "Generate Key"
+          : "Download From Key";
+
   return (
     <div className="transfer-layout">
       <div className="transfer-hero">
         <p className="eyebrow">Profile transfer</p>
         <h2>Import / Export</h2>
+        <span>Move a profile by file, or share a self-contained copy for 24 hours.</span>
       </div>
 
       <div className="transfer-choice-grid">
@@ -4327,16 +4655,42 @@ function TransferView({
           <strong>Export</strong>
           <span>Bundle one profile with its managed mods and detected config files.</span>
         </button>
+        <button
+          className={mode === "generate-key" ? "transfer-choice active" : "transfer-choice"}
+          onClick={() => onSelectMode("generate-key")}
+          type="button"
+        >
+          <CloudUpload size={24} />
+          <strong>Generate Key</strong>
+          <span>Upload a complete profile bundle and create a key that lasts for 24 hours.</span>
+        </button>
+        <button
+          className={mode === "download-key" ? "transfer-choice active" : "transfer-choice"}
+          onClick={() => onSelectMode("download-key")}
+          type="button"
+        >
+          <KeyRound size={24} />
+          <strong>Download From Key</strong>
+          <span>Enter a shared key to create the matching profile and install its bundled mods.</span>
+        </button>
       </div>
 
       {mode ? (
         <section className="work-panel transfer-step-panel ui-motion-enter" key={mode}>
           <div className="panel-title-row">
             <div>
-              <p className="eyebrow">{mode === "import" ? "Import" : "Export"}</p>
-              <h3>{mode === "import" ? "Restore Profile Bundle" : "Create Profile Bundle"}</h3>
+              <p className="eyebrow">{modeLabel}</p>
+              <h3>{modeTitle}</h3>
             </div>
-            {mode === "import" ? <Download size={20} /> : <Upload size={20} />}
+            {mode === "import" ? (
+              <Download size={20} />
+            ) : mode === "export" ? (
+              <Upload size={20} />
+            ) : mode === "generate-key" ? (
+              <CloudUpload size={20} />
+            ) : (
+              <CloudDownload size={20} />
+            )}
           </div>
 
           {mode === "import" ? (
@@ -4356,7 +4710,7 @@ function TransferView({
                 {isBusy ? "Importing" : "Import Profile"}
               </button>
             </>
-          ) : (
+          ) : mode === "export" ? (
             <>
               <label className="transfer-field">
                 Profile
@@ -4384,6 +4738,114 @@ function TransferView({
               >
                 <Upload size={17} />
                 {isBusy ? "Exporting" : "Export Profile"}
+              </button>
+            </>
+          ) : mode === "generate-key" ? (
+            <>
+              <label className="transfer-field">
+                Profile
+                <select
+                  value={exportProfileId}
+                  onChange={(event) => {
+                    setExportProfileId(event.target.value);
+                    setGeneratedShare(null);
+                  }}
+                >
+                  {profiles.map((profile) => (
+                    <option key={profile.id} value={profile.id}>
+                      {profile.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="transfer-steps">
+                <span>1. UniLoader bundles the selected profile, managed mods, runtimes, and settings.</span>
+                <span>2. The encrypted connection uploads one integrity-checked bundle.</span>
+                <span>3. Share the generated key before it expires 24 hours later.</span>
+              </div>
+              <div className="transfer-permission-note">
+                <ShieldCheck size={17} />
+                <span>Only share mods whose authors permit redistribution.</span>
+              </div>
+              <button
+                className="primary-button transfer-action"
+                disabled={isBusy || profiles.length === 0}
+                onClick={() => void generateKey()}
+                type="button"
+              >
+                <CloudUpload size={17} />
+                {isBusy ? "Uploading Profile" : "Generate Key"}
+              </button>
+              {generatedShare ? (
+                <section className="share-key-result ui-motion-enter" aria-live="polite">
+                  <div className="share-key-result-heading">
+                    <div>
+                      <span>24-hour profile key</span>
+                      <strong>{generatedShare.profileName}</strong>
+                    </div>
+                    <CheckCircle2 size={21} />
+                  </div>
+                  <div className="share-key-code-row">
+                    <code>{generatedShare.code}</code>
+                    <button
+                      className="secondary-button compact-button"
+                      onClick={() => void copyGeneratedKey()}
+                      type="button"
+                    >
+                      <Copy size={15} />
+                      {copyLabel}
+                    </button>
+                  </div>
+                  <div className="share-key-metadata">
+                    <span>
+                      <Clock3 size={14} />
+                      Expires {formatShareExpiry(generatedShare.expiresAt)}
+                    </span>
+                    <span>
+                      <Database size={14} />
+                      {formatFileSize(generatedShare.uploadedBytes)}
+                    </span>
+                    <span>{generatedShare.exportedMods} bundled mod(s)</span>
+                  </div>
+                </section>
+              ) : null}
+            </>
+          ) : (
+            <>
+              <label className="transfer-field">
+                Profile key
+                <input
+                  autoComplete="off"
+                  autoFocus
+                  inputMode="text"
+                  maxLength={19}
+                  onChange={(event) =>
+                    setShareCodeInput(formatProfileShareCodeInput(event.target.value))
+                  }
+                  placeholder="ABCD-EFGH-JKLM-NPQR"
+                  spellCheck={false}
+                  value={shareCodeInput}
+                />
+              </label>
+              <div className="transfer-steps">
+                <span>1. Enter the 24-hour key from your friend.</span>
+                <span>2. UniLoader finds the matching installed Steam game and verifies the bundle.</span>
+                <span>3. The profile, mods, runtimes, and settings are restored automatically.</span>
+              </div>
+              <div className="transfer-permission-note">
+                <Gamepad2 size={17} />
+                <span>The matching Steam game must already be installed on this PC.</span>
+              </div>
+              <button
+                className="primary-button transfer-action"
+                disabled={
+                  isBusy || shareCodeInput.replace(/[^a-z0-9]/gi, "").length !== 16
+                }
+                onClick={() => void onDownloadFromKey(shareCodeInput)}
+                type="button"
+              >
+                <CloudDownload size={17} />
+                {isBusy ? "Installing" : "Download & Install"}
               </button>
             </>
           )}
@@ -4589,6 +5051,29 @@ function formatCompactNumber(value: number): string {
     maximumFractionDigits: value >= 1000 ? 1 : 0,
     notation: value >= 1000 ? "compact" : "standard"
   }).format(value);
+}
+
+function formatProfileShareCodeInput(value: string): string {
+  const normalized = value
+    .toUpperCase()
+    .split("")
+    .filter((character) => "23456789ABCDEFGHJKLMNPQRSTUVWXYZ".includes(character))
+    .join("")
+    .slice(0, 16);
+  return normalized.match(/.{1,4}/g)?.join("-") ?? normalized;
+}
+
+function formatShareExpiry(value: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return "24 hours after creation";
+  }
+  return Intl.DateTimeFormat(undefined, {
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    month: "short"
+  }).format(parsed);
 }
 
 function formatFileSize(bytes: number): string {
