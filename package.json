@@ -3,7 +3,19 @@
   "version": "0.9.20",
   "private": true,
   "description": "UniLoader cross-game mod manager prototype with per-game adapters and dependency planning.",
+  "author": "Chucksterboy",
+  "license": "MIT",
+  "homepage": "https://github.com/Chucksterboy/UniLoader",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Chucksterboy/UniLoader.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Chucksterboy/UniLoader/issues"
+  },
   "scripts": {
+    "assets:audit": "node scripts/audit-bundled-assets.mjs",
+    "assets:sounds": "node scripts/generate-notification-sounds.mjs",
     "dev": "tauri dev",
     "build": "tauri build --features custom-protocol",
     "build:app": "tauri build --features custom-protocol --no-bundle",
@@ -11,7 +23,7 @@
     "preview": "vite preview",
     "test": "pnpm run typecheck && pnpm run test:frontend && cargo test --manifest-path src-tauri/Cargo.toml",
     "test:frontend": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "pnpm run assets:audit && tsc --noEmit"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",

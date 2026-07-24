@@ -90,8 +90,8 @@ const defaultAppSettings: AppSettings = {
 const defaultThemeId = "neon-circuit";
 const supportPageUrl = "https://ko-fi.com/chucksterboy";
 const installSoundUrls = {
-  success: "./sounds/mod-install-success.mp3",
-  failure: "./sounds/mod-install-failed.mp3"
+  success: "./sounds/mod-install-success.wav",
+  failure: "./sounds/mod-install-failed.wav"
 } as const;
 const installSoundVolume = 0.72;
 

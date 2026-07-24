@@ -1,5 +1,11 @@
 # UniLoader
 
+[Download releases](https://github.com/Chucksterboy/UniLoader/releases) |
+[Privacy policy](PRIVACY.md) |
+[Code signing policy](CODE_SIGNING.md) |
+[Bundled asset licenses](ASSET_LICENSES.md) |
+[MIT license](LICENSE)
+
 UniLoader is a desktop mod manager prototype built around a practical universal model:
 
 - One app and profile system.
@@ -67,6 +73,9 @@ The transfer tab exports a selected profile into a `.uniloader-profile` bundle. 
 
 UniLoader displays its current app version in the bottom-left rail. On startup, it checks the latest GitHub Release for `Chucksterboy/UniLoader`. If a newer release exists, a pulsing download indicator appears above the health dot in the left rail.
 
+Official Windows installers and their SHA-256 checksum files are published on
+the [GitHub Releases page](https://github.com/Chucksterboy/UniLoader/releases).
+
 To publish an installer build, push a version tag:
 
 ```powershell
@@ -74,7 +83,8 @@ git tag v0.2.1
 git push origin v0.2.1
 ```
 
-The GitHub Actions release workflow builds the Windows installer as a draft release. Publish the draft release when the installer has been checked.
+The GitHub Actions release workflow validates the project, builds the Windows
+installer, publishes the release, and uploads SHA-256 checksum files.
 
 ## Future Game Support
 
@@ -94,3 +104,26 @@ Keep generic engine/loader detection in Rust, but prefer extending this manifest
 - Back up overwritten files before deploying into a game directory.
 - Resolve dependencies per game profile, while caching downloads globally.
 - Store imported mod sources in UniLoader's profile package library before deployment.
+
+## Privacy
+
+UniLoader is local-first and does not include project-operated telemetry,
+analytics, advertising, accounts, or cloud synchronization. It does connect to
+documented third-party services for updates, mod discovery, artwork, and
+runtime downloads. See the [Privacy Policy](PRIVACY.md) for the complete data
+and network disclosure.
+
+## Code Signing Policy
+
+Official Windows releases follow the project's
+[Code signing policy](CODE_SIGNING.md).
+
+Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
+
+## License
+
+UniLoader is available under the [MIT License](LICENSE). Third-party
+dependencies retain their respective licenses. Game artwork, provider content,
+and mods fetched at runtime are not redistributed under the UniLoader license.
+See [Bundled Asset Licenses](ASSET_LICENSES.md) for the provenance and license
+of the notification sounds and application artwork included in release builds.
