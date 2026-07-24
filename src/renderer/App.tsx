@@ -2842,7 +2842,7 @@ export function App() {
           onClick={() => setActiveView("settings")}
           type="button"
         >
-          <Compass size={18} />
+          <Compass className="vault-nexus-compass" size={18} />
           <span><small>Nexus Mods</small><strong>{appSettings.nexusApiKeyConfigured ? "Connected" : "Connect account"}</strong></span>
         </button>
         <button
@@ -3641,7 +3641,8 @@ function HealthPanel({
   return (
     <div className={`health-panel health-dock ${healthTone} ${motionClassName}`}>
       <div className="health-orb">
-        <Activity size={22} strokeWidth={2.35} />
+        <Activity className="health-wave-track" size={22} strokeWidth={2.35} />
+        <Activity className="health-wave-signal" size={22} strokeWidth={2.35} />
       </div>
       <div className="health-copy">
         <span>Health</span>

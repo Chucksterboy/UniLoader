@@ -1480,10 +1480,12 @@ button:active:not(:disabled) {
 }
 
 .health-orb {
+  position: relative;
   display: grid;
   place-items: center;
   width: 42px;
   height: 42px;
+  overflow: hidden;
   border: 1px solid rgba(125, 202, 255, 0.34);
   border-radius: 8px;
   background:
@@ -1493,10 +1495,43 @@ button:active:not(:disabled) {
 }
 
 .health-orb svg {
+  position: absolute;
   width: 22px;
   height: 22px;
-  filter: drop-shadow(0 0 7px rgba(100, 230, 164, 0.32));
   shape-rendering: geometricPrecision;
+}
+
+.health-wave-track {
+  opacity: 0.24;
+}
+
+.health-wave-signal {
+  clip-path: inset(0 100% 0 0);
+  filter: drop-shadow(0 0 7px currentColor);
+  animation: health-wave-sweep 2.35s cubic-bezier(0.3, 0.05, 0.18, 1) infinite;
+  will-change: clip-path, opacity;
+}
+
+@keyframes health-wave-sweep {
+  0% {
+    clip-path: inset(0 100% 0 0);
+    opacity: 0.28;
+  }
+
+  58% {
+    clip-path: inset(0 0 0 0);
+    opacity: 1;
+  }
+
+  74% {
+    clip-path: inset(0 0 0 0);
+    opacity: 0.92;
+  }
+
+  100% {
+    clip-path: inset(0 0 0 100%);
+    opacity: 0.18;
+  }
 }
 
 .health-panel.success .health-orb {
@@ -5919,6 +5954,23 @@ body {
 
 .vault-footer-service.connected {
   color: #6ed496;
+}
+
+.vault-nexus-compass {
+  transform-origin: center;
+  filter: drop-shadow(0 0 4px rgba(100, 230, 164, 0.24));
+  animation: nexus-compass-rotate 5.6s linear infinite;
+  will-change: transform;
+}
+
+@keyframes nexus-compass-rotate {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .vault-footer-service span {
